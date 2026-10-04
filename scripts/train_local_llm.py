@@ -44,6 +44,7 @@ from src.llm.local.data import (
     iter_hf_pretrain_mix,
     iter_hf_sft,
     iter_hf_sft_mix,
+    iter_local_sft,
     iter_local_texts,
     pack_pairs,
     pack_pretrain,
@@ -191,6 +192,31 @@ def collect_holdout(args: argparse.Namespace, data_cursor: int = 0) -> tuple[lis
     from src.llm.local.data import parse_local_mix as _plm
     from src.llm.local.data import skip_items as _skip
 
+    if args.data == "local" and args.phase == "sft":
+        # 本地 SFT（Belle 格式 jsonl/csv，多目录逗号分隔，可带权重）；
+        # triple 在此套模板转对，与 HF 路径的 pairs 口径一致
+        from src.llm.local.data import SFT_PROMPT as _TPL
+        from src.llm.local.data import parse_local_mix as _plm2
+
+        sdirs = _plm2(args.local_path)
+
+        def _local_pairs():
+            if len(sdirs) == 1:
+                raw = iter_local_sft(sdirs[0][0])
+            else:
+                from src.llm.local.data import interleave_weighted as _ilw2
+
+                raw = _ilw2([iter_local_sft(p) for p, _ in sdirs],
+                            [w for _, w in sdirs])
+            for instruction, inp, output in raw:
+                yield (_TPL.format(instruction=instruction, input=inp or ""),
+                       output)
+
+        sft_pairs = _local_pairs()
+        pairs = list(_take(sft_pairs, HOLDOUT_DOCS))
+        _skip(sft_pairs, data_cursor)
+        print(f"本地 SFT 语料 {args.local_path}：评测 {len(pairs)} 对", flush=True)
+        return pairs, _Counted(sft_pairs)
     if args.data == "local":
         dirs = _plm(args.local_path)
         if len(dirs) == 1 and dirs[0][1] == 1:
@@ -265,7 +291,23 @@ def collect_missing(args, tok) -> list[str]:
             if len(cnt) >= args.extend_max_new * 4:
                 break  # 候选够多早停
 
-    if args.data == "local":
+    if args.phase == "sft":
+        if args.data == "local":
+            from src.llm.local.data import parse_local_mix as _plm
+
+            def local_sft_texts():
+                for p, _ in _plm(args.local_path):
+                    for instruction, inp, output in iter_local_sft(p):
+                        yield instruction + (inp or "") + output
+
+            feed(local_sft_texts(), args.extend_scan_docs)
+        else:
+            def sft_texts():
+                for prompt, response in iter_hf_sft_mix(args.sft_mix, seed=args.seed + 999):
+                    yield prompt + response
+
+            feed(sft_texts(), args.extend_scan_docs)
+    elif args.data == "local":
         from src.llm.local.data import parse_local_mix as _plm
 
         def local_texts_multi():
@@ -273,12 +315,6 @@ def collect_missing(args, tok) -> list[str]:
                 yield from iter_local_texts(p)
 
         feed(local_texts_multi(), args.extend_scan_docs)
-    elif args.phase == "sft":
-        def sft_texts():
-            for prompt, response in iter_hf_sft_mix(args.sft_mix, seed=args.seed + 999):
-                yield prompt + response
-
-        feed(sft_texts(), args.extend_scan_docs)
     else:
         feed(iter_hf_pretrain_mix(args.pretrain_mix, seed=args.seed + 999,
                                   min_score=args.pretrain_min_score),
@@ -532,8 +568,6 @@ def main(argv=None) -> int:
 
     # 分词器：评测文档复用做拟合（省一次采样；SFT 对用 t[-1] 取 response）
     fit_sample = holdout if args.phase == "pretrain" else [t[0] + t[-1] for t in holdout]
-    if args.data == "local" and args.phase == "sft":
-        raise SystemExit("本地 SFT 需要 Belle 格式 jsonl，请用 --data hf（Belle 在线流式）")
     tok = load_tokenizer(args, config, fit_sample)
     eos = SimpleTokenizer.EOS
 

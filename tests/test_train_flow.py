@@ -382,6 +382,49 @@ def test_shuffle_buffer_exact_once():
     assert [b.item() for b in out] != list(range(100))
 
 
+def test_iter_local_sft_jsonl_csv(tmp_path):
+    """本地 SFT 读取：jsonl/csv 的 instruction/input/output 三元组，坏行跳过."""
+    import json as _json
+
+    from src.llm.local.data import iter_local_sft
+
+    (tmp_path / "a.jsonl").write_text(
+        _json.dumps({"instruction": "把下面的句子翻译成英文啊啊啊啊啊啊啊啊",
+                     "input": "", "output": "Hello world ok"}) + "\n"
+        + "not json at all\n"
+        + _json.dumps({"instruction": "", "output": "空指令跳过"}) + "\n",
+        encoding="utf-8")
+    (tmp_path / "b.csv").write_text(
+        "instruction,input,output\n"
+        "解释什么是摸鱼现象啊啊啊啊啊啊啊啊啊,,摸鱼就是上班时间合理休息放松啊啊\n",
+        encoding="utf-8")
+    rows = list(iter_local_sft(tmp_path))
+    assert len(rows) == 2
+    assert rows[0][0].startswith("把下面的句子翻译")
+    assert rows[1] == ("解释什么是摸鱼现象啊啊啊啊啊啊啊啊啊", "",
+                       "摸鱼就是上班时间合理休息放松啊啊")
+    with pytest.raises(RuntimeError, match="无可用文件"):
+        list(iter_local_sft(tmp_path / "nodir"))
+
+
+def test_collect_holdout_sft_local(tmp_path):
+    """本地 SFT：holdout 取对 + 训练流分区精确（模板在此已套好）."""
+    import json as _json
+
+    for i in range(4):
+        (tmp_path / f"s{i}.jsonl").write_text("\n".join(
+            _json.dumps({"instruction": f"第{i}组第{j}条很长的中文指令内容测试啊啊啊啊啊",
+                         "input": "", "output": f"第{i}组第{j}条很长的中文回答内容测试啊啊啊啊"})
+            for j in range(3)) + "\n", encoding="utf-8")
+    args = flow.parse_args(["--phase", "sft", "--data", "local",
+                            "--local-path", str(tmp_path)])
+    holdout, train_gen = flow.collect_holdout(args, data_cursor=0)
+    # 12 对全覆盖：holdout 在前，训练流跳过空位（cursor=0 不跳）
+    rest = list(train_gen)
+    assert len(holdout) + len(rest) == 12
+    assert all(len(p) == 2 and "<助手>" in p[0] for p in holdout + rest)
+
+
 def test_select_topk_loss():
     """RHO 选择：只取高 loss 位均值，保底防空，关闭时等价全均值."""
     from src.llm.local.train import select_topk_loss

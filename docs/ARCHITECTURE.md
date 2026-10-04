@@ -72,6 +72,7 @@ print(backend.chat([{"role": "user", "content": "你好"}])["content"])
 | 预训练回退 | `HuggingFaceFW/fineweb-2:cmn_Hani`（key `fineweb2`） | 全量中文（543B 词），源失败自动切换 |
 | 预训练混合 | `openbmb/Ultra-FineWeb` 中文（key `ultrafineweb`） | MiniCPM5 底料，中英双 split 取中文，字段 `content`+质量分 `score` |
 | SFT | `BelleGroup/train_0.5M_CN`（key `belle`） | 50 万中文指令（instruction/input/output），prompt 掩 loss 只学 output |
+| SFT 本地 | 魔搭落盘 Belle 系数据 | `data/sft-zh/`：COIG（4.4 万条人类校验）+ alpaca-gpt4-zh；`--data local --local-path data/sft-zh`，训练零网络 |
 | SFT 混合 | `openbmb/UltraData-SFT-Agent-2609`（key `agent-general/code/search/tool`） | 4 个 Agent 子集（多轮 messages，对话转样本对）；英文为主，作工具能力补充，中文主力仍是 Belle |
 | 无网回退 | 本地 `.txt/.md/.jsonl/.parquet` 目录 | `--data local`，jsonl 取 text/content/body 字段，parquet 直读 text/content 列 |
 | 本地混合 | 多目录逗号分隔，可带权重 | `--local-path "data/hq-zh:3,data/ultra-zh:1"`，评测从混合头取，各目录精确跳过 |

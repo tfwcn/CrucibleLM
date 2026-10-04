@@ -409,6 +409,43 @@ def iter_hf_sft_mix(
     yield from interleave_weighted(streams, weights)
 
 
+def iter_local_sft(root: str | Path) -> Iterator[tuple[str, str, str]]:
+    """遍历本地 Belle 格式 SFT 文件（.jsonl/.csv，instruction/input/output 列）.
+
+    无网回退 / 魔搭落盘用；字段缺失的行跳过。
+    """
+    import csv as _csv
+
+    root = Path(root)
+    files = sorted(
+        [p for p in root.rglob("*") if p.suffix.lower() in {".jsonl", ".csv"}]
+    )
+    if not files:
+        raise RuntimeError(f"本地 SFT 目录无可用文件：{root}")
+    for path in files:
+        if path.suffix.lower() == ".csv":
+            with open(path, encoding="utf-8", errors="ignore", newline="") as f:
+                for row in _csv.DictReader(f):
+                    instruction = (row.get("instruction") or "").strip()
+                    output = (row.get("output") or "").strip()
+                    if instruction and output:
+                        yield instruction, row.get("input") or "", output
+        else:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    instruction = (obj.get("instruction") or "").strip()
+                    output = (obj.get("output") or "").strip()
+                    if instruction and output:
+                        yield instruction, obj.get("input") or "", output
+
+
 def iter_local_texts(root: str | Path) -> Iterator[str]:
     """遍历本地目录的 .txt/.md/.jsonl/.parquet 文本（无网回退/复现实验用）.
 
