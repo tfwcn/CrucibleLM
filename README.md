@@ -1,7 +1,7 @@
 # CrucibleLM
 
 <p align="center">
-  <img src="docs/images/hero.png" alt="CrucibleLM overview" width="800">
+  <img src="docs/images/hero.webp" alt="CrucibleLM overview" width="800">
 </p>
 
 <p align="center">
