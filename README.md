@@ -48,10 +48,8 @@ CrucibleLM/
 uv venv ~/.venvs/llm-train --python 3.12
 uv pip install --python ~/.venvs/llm-train/bin/python torch datasets modelscope pyarrow
 export PATH="$HOME/.local/bin:$PATH"
-LLMPY=~/.venvs/llm-train/bin/python
-
 # 1. 数据（魔搭 CN CDN，训练全程零网络；约 23GB）
-$LLMPY -c "
+~/.venvs/llm-train/bin/python -c "
 from modelscope import snapshot_download
 snapshot_download('epfml/FineWeb2-HQ', repo_type='dataset',
     allow_patterns=['cmn_Hani/000_0000[0-9].parquet',
@@ -61,13 +59,12 @@ snapshot_download('openbmb/Ultra-FineWeb', repo_type='dataset',
     local_dir='data/ultra-zh')"
 # SFT 数据（173MB）：见 docs/ARCHITECTURE.md 语料表
 # 老师（0.5B，可选，SFT 蒸馏用）：
-$LLMPY -c "
+~/.venvs/llm-train/bin/python -c "
 from modelscope import snapshot_download
 snapshot_download('OpenBMB/MiniCPM4-0.5B', local_dir='data/teacher-0.5b')"
 
-# 2. 预训练 base（约 65k tokens/步，16 秒/步，10k 步约 46 小时）
-tmux new -s llm
-$LLMPY scripts/train_local_llm.py \
+# 2. 预训练 base（约 65k tokens/步，16 秒/步，10k 步约 46 小时；前台直接跑）
+~/.venvs/llm-train/bin/python scripts/train_local_llm.py \
   --phase pretrain --preset base \
   --seq-len 2048 --batch 4 --accum 8 \
   --max-steps 10000 --lr 3e-4 \
@@ -76,7 +73,6 @@ $LLMPY scripts/train_local_llm.py \
   --eval-every 200 --sample-every 200 \
   --extend-vocab --rho-keep 0.5 \
   --replay-ratio 0.15 --consolidate-steps 300 --resume
-# Ctrl-b d 脱离；tmux attach -t llm 回来看
 
 # 3. 监控（另开终端）
 tail -f data/llm-ckpt/train.log   # loss 曲线（JSONL）
@@ -84,7 +80,7 @@ nvidia-smi -l 2                   # 显存（应稳定 ~8GB）
 # 健康标准：eval 稳步降、aux 恒 0.12、单进程；详见 docs/pitfalls/
 
 # 4. SFT（base 收敛后，另起 ckpt 目录，base 原封不动留作回滚）
-$LLMPY scripts/train_local_llm.py \
+~/.venvs/llm-train/bin/python scripts/train_local_llm.py \
   --phase sft --preset base \
   --seq-len 2048 --batch 4 --accum 8 \
   --sft-init data/llm-ckpt/model.pt \
