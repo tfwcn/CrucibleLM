@@ -111,14 +111,9 @@ class LocalChatBackend:
         self.model = model
         self.tokenizer = tokenizer
 
-    @torch.no_grad()
-    def chat(
-        self,
-        messages: list[dict],
-        max_new_tokens: int = 128,
-        temperature: float = 0.0,
-    ) -> dict:
-        """对话生成，返回 {"content","reasoning","tool_calls","finish_reason"}."""
+    def _prepare_ids(self, messages: list[dict], max_new_tokens: int,
+                     ) -> tuple["torch.Tensor", "torch.device"]:
+        """拼 prompt + 编码 + 截断 + 上设备（chat/stream 共用）."""
         # role 标签与 SFT 模板统一用中文（此前采样用英文 <user>/<assistant>，
         # 与 SFT_PROMPT 的 <用户>/<助手> 不一致，已统一）
         role_cn = {"system": "系统", "user": "用户", "assistant": "助手"}
@@ -135,18 +130,44 @@ class LocalChatBackend:
         input_ids = torch.tensor([ids], dtype=torch.long)
         # 切到模型所在设备
         device = next(self.model.parameters()).device
-        input_ids = input_ids.to(device)
+        return input_ids.to(device), device
+
+    @torch.no_grad()
+    def chat(
+        self,
+        messages: list[dict],
+        max_new_tokens: int = 128,
+        temperature: float = 0.0,
+    ) -> dict:
+        """对话生成，返回 {"content","reasoning","tool_calls","finish_reason"}."""
+        input_ids, _ = self._prepare_ids(messages, max_new_tokens)
         gen = self.model.generate(
             input_ids, max_new_tokens=max_new_tokens,
             temperature=temperature, eos_id=SimpleTokenizer.EOS,
         )
-        new_ids = gen[0].tolist()[len(ids):]
+        new_ids = gen[0].tolist()[len(input_ids[0]):]
         return {
             "content": self.tokenizer.decode(new_ids),
             "reasoning": None,
             "tool_calls": None,
             "finish_reason": "stop",
         }
+
+    def stream(
+        self,
+        messages: list[dict],
+        max_new_tokens: int = 128,
+        temperature: float = 0.0,
+    ):
+        """流式生成，逐块 yield 文本（SSE 用；字符级分词保证增量解码精确）."""
+        input_ids, _ = self._prepare_ids(messages, max_new_tokens)
+        inv = {i + 4: ch for i, ch in enumerate(self.tokenizer._chars)}
+        for tid in self.model.stream_tokens(
+                input_ids, max_new_tokens=max_new_tokens,
+                temperature=temperature, eos_id=SimpleTokenizer.EOS):
+            ch = inv.get(tid)
+            if ch:  # 特殊 token（BOS/EOS/UNK）跳过不吐
+                yield ch
 
     def save(self, path: str) -> None:
         """保存权重 + 字符表."""
@@ -162,14 +183,27 @@ class LocalChatBackend:
 
     @classmethod
     def load(cls, path: str, config: SmallLLMConfig) -> "LocalChatBackend":
-        """加载权重 + 字符表."""
+        """加载权重 + 字符表.
+
+        词表按顺序找：path.vocab.json（save 默认）→ 同目录 vocab.json（训练落盘布局）。
+        """
         import json
+        from pathlib import Path as _Path
 
         model = TinyLLM(config)
         model.load_state_dict(torch.load(path + ".pt", map_location="cpu"))
         model.eval()
         tok = SimpleTokenizer(config.vocab_size)
-        with open(path + ".vocab.json", encoding="utf-8") as f:
-            tok._chars = json.load(f)
+        candidates = [path + ".vocab.json",
+                      str(_Path(path).parent / "vocab.json")]
+        for vocab_path in candidates:
+            try:
+                with open(vocab_path, encoding="utf-8") as f:
+                    tok._chars = json.load(f)
+                break
+            except (OSError, json.JSONDecodeError):
+                continue
+        else:
+            raise FileNotFoundError(f"找不到分词表（试过 {candidates}）")
         tok._ids = {ch: i + 4 for i, ch in enumerate(tok._chars)}
         return cls(model, tok)

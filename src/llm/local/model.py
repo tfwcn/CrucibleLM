@@ -187,6 +187,55 @@ class TinyLLM(nn.Module):
             if was_training:
                 self.train()
 
+    def _prefill(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, list]:
+        """Prefill：整段 prompt 一次前向，返回 (末位置 hidden 前的 h, 每层缓存）.
+
+        h 为全序列 hidden（调用方取 h[:, -1:] 算 logits）；pasts 供单步解码续跑。
+        """
+        h = self.embed(input_ids)
+        pasts: list = []
+        for layer in self.layers:
+            h, (p, _) = layer(h)
+            pasts.append(p)
+        return self.final_norm(h), pasts
+
+    def _sample_next(
+        self,
+        h_last: torch.Tensor,
+        temperature: float,
+        top_k: int,
+    ) -> torch.Tensor:
+        """按温度/top-k 采样下一步（贪心 temperature=0），返回 (b, 1) id."""
+        next_logits = self.lm_head(h_last)[:, -1, :]
+        if temperature > 0:
+            next_logits = next_logits / max(temperature, 1e-6)
+            if top_k > 0:
+                kth, _ = torch.topk(next_logits, min(top_k, next_logits.shape[-1]))
+                next_logits = torch.where(
+                    next_logits < kth[..., -1:],
+                    torch.full_like(next_logits, float("-inf")),
+                    next_logits,
+                )
+            return torch.multinomial(F.softmax(next_logits, dim=-1), 1)
+        return next_logits.argmax(-1, keepdim=True)
+
+    def _decode_step(
+        self, nxt: torch.Tensor, pasts: list
+    ) -> tuple[torch.Tensor, list]:
+        """单 token 步进各层：返回 (新 hidden, 新缓存），供流式/批量生成共用."""
+        hh = self.embed(nxt)
+        new_pasts: list = []
+        for layer, p in zip(self.layers, pasts):
+            # 每层 norm 由 block 内部处理，这里直接走 attn+moe 等价路径：
+            # 为复用逻辑，重新拼 block 前向（单 token 开销可忽略）
+            hh_norm = layer.norm1(hh)
+            a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
+            hh = hh + a_out
+            m_out, _ = layer.moe(layer.norm2(hh))
+            hh = hh + m_out
+            new_pasts.append(p2)
+        return self.final_norm(hh), new_pasts
+
     @torch.no_grad()
     def _generate_inner(
         self,
@@ -199,50 +248,45 @@ class TinyLLM(nn.Module):
         """自回归生成内循环（调用方 generate 已处理 eval 模式切换）.
 
         temperature=0 为贪心；>0 时按温度采样（可配 top-k 截断）。
+        与 stream_tokens 同一基元（数学一致，单测锁定）。
         """
-        b = input_ids.shape[0]
-        # Prefill：整段 prompt 一次前向，拿到每层缓存
-        h = self.embed(input_ids)
-        pasts: list = []
-        for layer in self.layers:
-            h, (p, _) = layer(h)
-            pasts.append(p)
-        h = self.final_norm(h)
+        h, pasts = self._prefill(input_ids)
         cur = input_ids
         for _ in range(max_new_tokens):
-            logits = self.lm_head(h[:, -1:])
-            next_logits = logits[:, -1, :]
-            if temperature > 0:
-                next_logits = next_logits / max(temperature, 1e-6)
-                if top_k > 0:
-                    kth, _ = torch.topk(next_logits, min(top_k, next_logits.shape[-1]))
-                    next_logits = torch.where(
-                        next_logits < kth[..., -1:],
-                        torch.full_like(next_logits, float("-inf")),
-                        next_logits,
-                    )
-                nxt = torch.multinomial(F.softmax(next_logits, dim=-1), 1)
-            else:
-                nxt = next_logits.argmax(-1, keepdim=True)
+            nxt = self._sample_next(h[:, -1:], temperature, top_k)
             cur = torch.cat([cur, nxt], dim=1)
             if eos_id is not None and bool((nxt == eos_id).all()):
                 break
-            # Decode：单 token 步进各层
-            hh = self.embed(nxt)
-            new_pasts: list = []
-            for layer, p in zip(self.layers, pasts):
-                # 每层 norm 由 block 内部处理，这里直接走 attn+moe 等价路径：
-                # 为复用逻辑，重新拼 block 前向（单 token 开销可忽略）
-                hh_norm = layer.norm1(hh)
-                a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
-                hh = hh + a_out
-                m_out, _ = layer.moe(layer.norm2(hh))
-                hh = hh + m_out
-                new_pasts.append(p2)
-            pasts = new_pasts
-            h = self.final_norm(hh)
-            _ = b
+            h, pasts = self._decode_step(nxt, pasts)
         return cur
+
+    @torch.no_grad()
+    def stream_tokens(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 64,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        eos_id: int | None = None,
+    ):
+        """逐 token 生成器（SSE 流式/OpenAI stream 用），逐个 yield 新 id（int）.
+
+        与 generate() 同一 prefill+解码路径（数学一致，单测锁定），
+        生成后同样恢复 train/eval 状态。
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            h, pasts = self._prefill(input_ids)
+            for _ in range(max_new_tokens):
+                nxt = self._sample_next(h[:, -1:], temperature, top_k)
+                yield int(nxt[0, 0])
+                if eos_id is not None and bool((nxt == eos_id).all()):
+                    break
+                h, pasts = self._decode_step(nxt, pasts)
+        finally:
+            if was_training:
+                self.train()
 
     @torch.no_grad()
     def encode_full_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:

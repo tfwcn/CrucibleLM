@@ -103,6 +103,40 @@ pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
 
+## 推理
+
+```python
+from src.llm.local import TinyLLM, LocalChatBackend, SmallLLMConfig
+
+# 本地权重 + 分词表（训练产出即用，无需转换）
+backend = LocalChatBackend.load("data/llm-ckpt/model", SmallLLMConfig())
+resp = backend.chat([{"role": "user", "content": "你好"}], max_new_tokens=128)
+print(resp["content"])  # resp 还有 reasoning/tool_calls/finish_reason 字段（OpenAI 兼容形状）
+
+# 采样参数：temperature=0 贪心；>0 按温度采样，top_k 截断（默认无 top-p/重复惩罚，
+# 长文本循环用 temperature 0.7~1.0 + 短 max_new_tokens 缓解）
+resp = backend.chat(messages, max_new_tokens=256, temperature=0.7, top_k=50)
+```
+
+- **增量解码**：`generate()` 自带 KV/状态缓存（MLA 存 latent，线性层 O(1) 状态），prefill 一次、单步续写；
+- **200K 上下文**：`longctx_config()` + 同样 `generate()`（稀疏聚集解码，KV 仅约 0.2GB；200K prefill 一次约分钟级，之后单步正常）；
+- **快道决策**（免生成）：`heads.py` 直觉头——冻结 backbone 取 hidden，一次前向出分类，
+  毫秒~秒级（CPU），详见 docs/ARCHITECTURE.md 推理章节。
+
+## OpenAI 标准 API（`scripts/serve_openai.py`，零第三方依赖）
+
+```bash
+python scripts/serve_openai.py --model data/llm-ckpt/model --port 8000
+# --config data/llm-16L/config.json（迁移结构） --api-key xxx（Bearer 鉴权，可选）
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "你好"}], "stream": true}'
+```
+
+- `POST /v1/chat/completions`（流式 SSE 真增量 + 非流式，支持 `stop` 截断）、
+  `POST /v1/completions`（旧接口）、`GET /v1/models`、`/health`；
+- OpenAI Python SDK 把 `base_url` 指过来即用（`top_k` 透传；暂不支持 `top_p`/`logprobs`，
+  传了会被忽略——`usage` 固定 0，按需再加 token 计数）。
+
 ## 许可证
 
 MIT — 见 [LICENSE](./LICENSE)。

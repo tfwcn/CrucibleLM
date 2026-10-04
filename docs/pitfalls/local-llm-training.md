@@ -50,3 +50,12 @@ prefill+单步解码 vs 全前向逐位一致）。
 并行分支 scores 自带 `×scale`，串行/解码/分块的 `q^T·S` 形式必须显式补上，
 漏掉就是全局 √d 倍的输出偏移，经 norm/router 非线性放大后训推分叉。
 凡新增注意力计算路径，一律跑"与并行分支逐位一致"单测。
+
+## 6. SSE 无长度响应必须显式关连接
+
+`text/event-stream` 响应既无 Content-Length 又无 chunked 时，
+`Connection: keep-alive` 会让"读到 EOF 为止"的客户端（urllib 的 `read()`、
+部分 SDK）永远等待。教训：SSE 写完 `[DONE]` 后置
+`handler.close_connection = True`；单测必须按真 SSE 客户端写法
+（增量读到 `[DONE]`），而不是 `read()` 一把梭——后者测不出 framing bug，
+还会把 framing 问题伪装成"偶发 hang"（时好时坏极具迷惑性）。

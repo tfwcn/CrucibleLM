@@ -107,6 +107,43 @@ pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
 
+## Inference
+
+```python
+from src.llm.local import TinyLLM, LocalChatBackend, SmallLLMConfig
+
+# Local weights + vocab (training outputs work directly, no conversion)
+backend = LocalChatBackend.load("data/llm-ckpt/model", SmallLLMConfig())
+resp = backend.chat([{"role": "user", "content": "你好"}], max_new_tokens=128)
+print(resp["content"])  # resp also has reasoning/tool_calls/finish_reason (OpenAI-shaped)
+
+# Sampling: temperature=0 greedy; >0 temperature sampling with top_k cutoff
+# (no top-p/repetition penalty by default; for looping use temperature 0.7-1.0
+# plus short max_new_tokens)
+resp = backend.chat(messages, max_new_tokens=256, temperature=0.7, top_k=50)
+```
+
+- **Incremental decoding**: `generate()` carries KV/state caches (MLA latent, linear O(1)
+  states), one prefill then single-step decoding;
+- **200K context**: `longctx_config()` + same `generate()` (sparse gather decoding,
+  ~0.2GB KV; one 200K prefill takes minutes, then normal per-step speed);
+- **Fast-lane decisions** (no generation): `heads.py` intuition heads — one forward pass
+  on a frozen backbone, milliseconds on CPU, see inference chapter in docs/ARCHITECTURE.md.
+
+## OpenAI-compatible API (`scripts/serve_openai.py`, zero third-party deps)
+
+```bash
+python scripts/serve_openai.py --model data/llm-ckpt/model --port 8000
+# --config data/llm-16L/config.json (migrated arch) --api-key xxx (optional Bearer auth)
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "你好"}], "stream": true}'
+```
+
+- `POST /v1/chat/completions` (true-incremental SSE streaming + non-streaming, `stop` supported),
+  `POST /v1/completions` (legacy), `GET /v1/models`, `/health`;
+- Point the OpenAI Python SDK at `base_url` and go (`top_k` passed through; `top_p`/`logprobs`
+  not supported yet and silently ignored — `usage` is zeros pending token counting).
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
