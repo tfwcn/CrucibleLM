@@ -178,32 +178,38 @@ def load_tokenizer(args: argparse.Namespace, config: SmallLLMConfig,
     return tok
 
 
-def collect_holdout(args: argparse.Namespace) -> tuple[list, object]:
+def collect_holdout(args: argparse.Namespace, data_cursor: int = 0) -> tuple[list, object]:
     """收集评测文档并返回 (评测文本, 训练文本流）.
 
     HF 流式：先取前 N 个文档做评测+分词拟合，训练流跳过它们；
     本地文件：按文件名切分前后段。
+    data_cursor>0 时训练流再快进跳过这么多（断点续流，见 README）；
+    返回的训练流恒为 CountedIterator（.n 供存盘记录消费数）。
     """
-    if args.data == "local":
-        from src.llm.local.data import _Counted as _Counted
-        from src.llm.local.data import interleave_weighted as _ilw
-        from src.llm.local.data import parse_local_mix as _plm
+    from src.llm.local.data import CountedIterator as _Counted
+    from src.llm.local.data import interleave_weighted as _ilw
+    from src.llm.local.data import parse_local_mix as _plm
+    from src.llm.local.data import skip_items as _skip
 
+    if args.data == "local":
         dirs = _plm(args.local_path)
         if len(dirs) == 1 and dirs[0][1] == 1:
-            # 单目录原逻辑（前半评测、后半训练；文件顺序稳定，不 whole-list 进内存）
+            # 单目录：前半评测、后半训练，外加断点快进（文件顺序稳定）
             holdout_all = _take(iter_local_texts(dirs[0][0]), HOLDOUT_DOCS)
             n_hold = max(2, len(holdout_all) // 2)
             holdout = holdout_all[:n_hold]
 
             def train_gen_single():
                 skipped = iter_local_texts(dirs[0][0])
-                for _ in range(n_hold):
-                    next(skipped, None)
+                _skip(skipped, n_hold + data_cursor)
                 yield from skipped
 
-            print(f"本地语料：评测 {len(holdout)} 文档，训练流延迟遍历（不预加载）", flush=True)
-            return holdout, train_gen_single()
+            if data_cursor:
+                print(f"本地语料：评测 {len(holdout)} 文档，断点快进 {data_cursor}，训练流延迟遍历",
+                      flush=True)
+            else:
+                print(f"本地语料：评测 {len(holdout)} 文档，训练流延迟遍历（不预加载）", flush=True)
+            return holdout, _Counted(train_gen_single())
         # 多目录：混合流取评测，各目录按消费计数精确跳过（不 whole-list 物化）
         counted = [_Counted(iter_local_texts(p)) for p, _ in dirs]
         weights = [w for _, w in dirs]
@@ -214,28 +220,30 @@ def collect_holdout(args: argparse.Namespace) -> tuple[list, object]:
             streams = []
             for (p, _), skip in zip(dirs, counts):
                 it = iter_local_texts(p)
-                for _ in range(skip):
-                    try:
-                        next(it)
-                    except StopIteration:
-                        break
+                _skip(it, skip)
                 streams.append(it)
-            yield from _ilw(streams, weights)
+            mixed = _ilw(streams, weights)
+            _skip(mixed, data_cursor)
+            yield from mixed
 
         print(f"本地混合语料 {args.local_path}：评测 {len(holdout)} 文档"
-              f"（各目录已消费 {counts}），训练流延迟遍历", flush=True)
-        return holdout, train_gen_mixed()
+              f"（各目录已消费 {counts}，断点快进 {data_cursor}），训练流延迟遍历",
+              flush=True)
+        return holdout, _Counted(train_gen_mixed())
     # HF 流式：顺序消费（同一流上先攒评测，再继续做训练，避免两次建流）
     if args.phase == "sft":
-        pairs = list(_take(iter_hf_sft_mix(args.sft_mix, seed=args.seed), HOLDOUT_DOCS))
+        sft_stream = iter_hf_sft_mix(args.sft_mix, seed=args.seed)
+        pairs = list(_take(sft_stream, HOLDOUT_DOCS))
         print(f"SFT 语料（{args.sft_mix}）：评测 {len(pairs)} 对", flush=True)
-        return pairs, iter_hf_sft_mix(args.sft_mix, seed=args.seed + 1)
+        _skip(sft_stream, data_cursor)
+        return pairs, _Counted(sft_stream)
     stream = iter_hf_pretrain_mix(args.pretrain_mix, seed=args.seed,
                                   min_score=args.pretrain_min_score)
     holdout = list(_take(stream, HOLDOUT_DOCS))
     print(f"HF 语料（{args.pretrain_mix}）：评测 {len(holdout)} 文档（同步拟合分词器）",
           flush=True)
-    return holdout, stream
+    _skip(stream, data_cursor)
+    return holdout, _Counted(stream)
 
 
 def collect_missing(args, tok) -> list[str]:
@@ -323,15 +331,18 @@ def dump_hparams(args: argparse.Namespace, config, ckpt_dir: Path) -> dict:
 
 
 def save_ckpt(ckpt_dir: Path, model: TinyLLM, optim, step: int, tokens: int,
-              extra: dict | None = None, keep_last: int = 20) -> Path:
+              extra: dict | None = None, keep_last: int = 20,
+              data_cursor: int = 0) -> Path:
     """存盘：latest（续跑用）+ 版本快照 ckpt-{step}（只留最近 keep_last 个）.
 
     latest 含优化器状态（精确续跑）；快照只存权重 + 元信息（省 2/3 写盘，
     NFS 上一次全量存盘要 several 分钟），从快照恢复需新开动量。
+    data_cursor 为训练文本流已消费数（断点续流用，存进 latest.json）。
     20 个快照约 10GB 磁盘；keep_last<=0 表示全保留。返回本次快照目录。
     """
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    meta = {"step": step, "tokens_seen": tokens, **(extra or {})}
+    meta = {"step": step, "tokens_seen": tokens, "data_cursor": data_cursor,
+            **(extra or {})}
     meta_text = json.dumps(meta)
     # latest：续跑入口（权重+优化器+元信息）
     torch.save(model.state_dict(), ckpt_dir / "model.pt")
@@ -500,12 +511,24 @@ def main(argv=None) -> int:
               f"（{config.n_layers} 层，专家 hidden {config.expert_hidden}）",
               flush=True)
     config.grad_ckpt = args.grad_ckpt
+    # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
+    resume_cursor = 0
+    if args.resume:
+        _latest = Path(args.ckpt_dir) / "latest.json"
+        if _latest.exists():
+            try:
+                resume_cursor = int(json.loads(
+                    _latest.read_text(encoding="utf-8")).get("data_cursor", 0))
+                if resume_cursor:
+                    print(f"断点续流：跳过已消费 {resume_cursor} 文档", flush=True)
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                pass
     # 课程阈值（可调用对象进数据流，每行实时读；无课程时退化为固定值）
     curriculum = parse_curriculum(args.curriculum)
     score_state = {"min": curriculum[0] if curriculum else args.pretrain_min_score}
     if curriculum:
         args.pretrain_min_score = lambda: score_state["min"]  # noqa: E731
-    holdout, train_stream = collect_holdout(args)
+    holdout, train_stream = collect_holdout(args, resume_cursor)
 
     # 分词器：评测文档复用做拟合（省一次采样；SFT 对用 t[-1] 取 response）
     fit_sample = holdout if args.phase == "pretrain" else [t[0] + t[-1] for t in holdout]
@@ -735,18 +758,31 @@ def main(argv=None) -> int:
             if args.save_every and step % args.save_every == 0:
                 snap = save_ckpt(ckpt_dir, model, optim, step, tokens_seen,
                                  {"phase": args.phase, "preset": args.preset},
-                                 keep_last=args.keep_last)
+                                 keep_last=args.keep_last,
+                                 data_cursor=_data_cursor(train_stream))
                 print(f"[ckpt] step={step} -> {snap.name}", flush=True)
     finally:
         logf.close()
     save_ckpt(ckpt_dir, model, optim, step, tokens_seen,
               {"phase": args.phase, "preset": args.preset},
-              keep_last=args.keep_last)
+              keep_last=args.keep_last,
+              data_cursor=_data_cursor(train_stream))
     print(f"训练结束：step={step}，权重 {ckpt_dir}/model.pt，分词表 {ckpt_dir}/vocab.json",
           flush=True)
     print("试用：LocalChatBackend.load("
           f'"{ckpt_dir}/model", config) 后 backend.chat([...])', flush=True)
     return 0
+
+
+# 断点续流余量：在途数据（shuffle 蓄水池 + 预取队列）已计数但未训练，
+# 存盘时回退这部分，宁可少量重见、不丢数据（单遍训练丢数据不可挽回）
+RESUME_SLACK_DOCS = 1024
+
+
+def _data_cursor(train_stream) -> int:
+    """当前消费游标（扣掉在途余量，向下取整到 0）."""
+    n = getattr(train_stream, "n", 0) or 0
+    return max(n - RESUME_SLACK_DOCS, 0)
 
 
 def accumuloss(stats: dict) -> dict:

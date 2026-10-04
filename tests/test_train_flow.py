@@ -223,6 +223,43 @@ def test_collect_holdout_multi_dir_partition(tmp_path):
     assert len(holdout) + len(rest) == 12
 
 
+def test_data_cursor_resume_partition(tmp_path):
+    """断点续流：评测 + 跳过 + 续训三段恰好覆盖全量，无重叠无遗漏."""
+    docs = [f"第{i}篇很长的中文文档内容测试数据用来验证断点续流情况啊啊啊啊啊啊啊啊" for i in range(30)]
+    (tmp_path / "doc.txt").write_text("\n\n".join(docs), encoding="utf-8")
+    args = flow.parse_args(["--data", "local", "--local-path", str(tmp_path)])
+    holdout, train_gen = flow.collect_holdout(args, data_cursor=10)
+    assert hasattr(train_gen, "n")  # CountedIterator 计数中
+    rest = list(train_gen)
+    assert len(holdout) + 10 + len(rest) == 30
+    assert sorted(holdout + rest) == sorted(docs[:len(holdout)] + docs[len(holdout) + 10:])
+    # 消费计数单调：拉取后 .n 增长
+    args2 = flow.parse_args(["--data", "local", "--local-path", str(tmp_path)])
+    _, train2 = flow.collect_holdout(args2)
+    assert train2.n == 0
+    next(train2)
+    assert train2.n == 1
+
+
+def test_save_ckpt_records_data_cursor(tmp_path):
+    """存盘元信息含 data_cursor（续跑断点续流用）."""
+    import json
+
+    torch.manual_seed(0)
+    from src.llm.local.model import TinyLLM
+
+    m = TinyLLM(tiny_test_config())
+    from src.llm.local.train import build_optimizer
+
+    opt = build_optimizer(m)
+    flow.save_ckpt(tmp_path, m, opt, 7, 700, data_cursor=1234)
+    meta = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
+    assert meta["data_cursor"] == 1234 and meta["step"] == 7
+    # 在途余量：大数扣减、小数钳零（宁可重见不丢数据）
+    assert flow._data_cursor(type("C", (), {"n": 2000})()) == 2000 - flow.RESUME_SLACK_DOCS
+    assert flow._data_cursor(type("C", (), {"n": 10})()) == 0
+
+
 def test_replay_buffer_push_sample_evict():
     """回放池：压入/采样形状、元组保持、满淘汰、不足回 None."""
     from src.llm.local.data import ReplayBuffer

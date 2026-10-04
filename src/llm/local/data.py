@@ -224,8 +224,13 @@ def parse_local_mix(value: str) -> list[tuple[str, int]]:
     return out
 
 
-class _Counted:
-    """计数包装：记录迭代器被消费了多少，训练流据此精确跳过评测部分."""
+class CountedIterator:
+    """计数包装：记录迭代器被消费了多少.
+
+    用途有二：训练流跳过评测部分；续跑断点续流（latest.json 存消费数，
+    续跑时跳过。prefetch/shuffle 在计数点下游，kill 时在途的少量数据会
+    重见，误差有界——见 README）。
+    """
 
     def __init__(self, it):
         self.it = iter(it)
@@ -238,6 +243,20 @@ class _Counted:
         v = next(self.it)
         self.n += 1
         return v
+
+
+# 旧名兼容
+_Counted = CountedIterator
+
+
+def skip_items(stream, n: int) -> None:
+    """快进跳过 n 个元素（续跑断点续流，不分词只遍历，耗尽即停）."""
+    it = iter(stream)
+    for _ in range(n):
+        try:
+            next(it)
+        except StopIteration:
+            break
 
 
 def interleave_weighted(

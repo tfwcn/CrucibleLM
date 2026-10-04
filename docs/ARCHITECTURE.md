@@ -150,6 +150,9 @@ $LLMPY scripts/train_local_llm.py --phase pretrain --preset base \
 `LocalChatBackend.load("<ckpt-dir>/model", config)` 对话试用。
 `hparams.json` 存全量超参 + 模型配置 + 派生量（复核历史用），
 `train.log` 每次启动首行 `run_start` 标记段落（续跑多次时按此切分）。
+断点续流：`latest.json` 记 `data_cursor`（训练文本流已消费数），
+`--resume` 自动快进跳过（prefetch/shuffle 在计数点下游，kill 时在途的
+约千级文档会重见，已扣余量，宁可重见不丢数据）。
 `--eval-every/--sample-every/--save-every` 控制评测/中文生成采样/存盘间隔
 （默认每 100 步存一次 `ckpt-{step}/` 版本快照，`--keep-last` 默认只留 20 个，
 约 10GB 磁盘（快照只存权重无优化器状态，精确续跑走 latest）；
