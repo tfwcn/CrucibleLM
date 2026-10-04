@@ -1,6 +1,22 @@
 # CrucibleLM
 
+<p align="center">
+  <img src="docs/images/hero.png" alt="CrucibleLM 总览" width="800">
+</p>
+
+<p align="center">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/torch-2.x-ee4c2c.svg" alt="PyTorch">
+  <img src="https://img.shields.io/badge/params-128M-green.svg" alt="128M 参数">
+  <img src="https://img.shields.io/badge/VRAM-16GB-9cf.svg" alt="16GB 显存">
+</p>
+
 > 融合最新 LLM 架构的实验性小模型：MLA + Hybrid 线性注意力 + 稀疏 + 细粒度 MoE，约 128M 参数，单卡 16G 可从零训练。
+
+- **千分之一成本复现 SOTA 思想**——MLA、Gated-DeltaNet、细粒度 MoE、MTP、Muon，游戏本就能跑
+- **200K 上下文推理就绪**——latent KV 缓存 + 线性递推状态 + 稀疏注意力
+- **完整训练栈**——流式语料、SFT、跨词表蒸馏、评测、OpenAI 兼容服务
 
 [English](./README.md) | [架构详解](./docs/ARCHITECTURE.md) | [训练血泪史](./docs/pitfalls/local-llm-training.md)
 

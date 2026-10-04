@@ -1,6 +1,22 @@
 # CrucibleLM
 
+<p align="center">
+  <img src="docs/images/hero.png" alt="CrucibleLM overview" width="800">
+</p>
+
+<p align="center">
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/torch-2.x-ee4c2c.svg" alt="PyTorch">
+  <img src="https://img.shields.io/badge/params-128M-green.svg" alt="128M params">
+  <img src="https://img.shields.io/badge/VRAM-16GB-9cf.svg" alt="16GB VRAM">
+</p>
+
 > An experimental testbed fusing state-of-the-art LLM architectures (MLA, hybrid linear attention, MoE) into a 128M model trainable on a single 16GB GPU.
+
+- **Reproduce SOTA ideas at 1/1000th scale** — MLA, Gated-DeltaNet, fine-grained MoE, MTP, Muon, all runnable on a gaming laptop
+- **200K-context inference ready** — latent KV cache + linear recurrent states + sparse attention
+- **Full training stack included** — streaming corpora, SFT, cross-tokenizer distillation, eval, OpenAI-compatible serving
 
 [中文说明](./README-cn.md) | [Architecture](./docs/ARCHITECTURE.md) | [Training pitfalls](./docs/pitfalls/local-llm-training.md)
 
