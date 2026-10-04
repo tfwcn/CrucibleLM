@@ -1,16 +1,16 @@
 # CrucibleLM
 
-> An experimental testbed fusing state-of-the-art LLM architectures (MLA, hybrid linear attention, MoE) into a 128M model trainable on a single 16GB GPU.
+> 融合最新 LLM 架构的实验性小模型：MLA + Hybrid 线性注意力 + 稀疏 + 细粒度 MoE，约 128M 参数，单卡 16G 可从零训练。
 
-[中文说明](./README-cn.md) | [架构详解](./docs/ARCHITECTURE.md) | [训练血泪史](./docs/pitfalls/local-llm-training.md)
+[English](./README.md) | [架构详解](./docs/ARCHITECTURE.md) | [训练血泪史](./docs/pitfalls/local-llm-training.md)
 
-## What is this
+## 这是什么
 
-CrucibleLM（坩埚）是一个**融合新架构的实验性小模型**：把 DeepSeek 系（MLA 低秩压缩、细粒度 MoE、MTP）与 Qwen-Next 系（Hybrid 全/线性注意力交替、门控线性层）熔于一炉，在 ~128M 总参数 / ~48M 激活下验证这些技术在小规模上的行为。单卡 16G 可从零训练，200K 上下文推理就绪。
+CrucibleLM（坩埚）是一个**融合新架构的实验性小模型**：把 DeepSeek 系（MLA 低秩压缩、细粒度 MoE、MTP）与 Qwen-Next 系（Hybrid 全/线性注意力交替、门控线性层）熔于一炉，在约 128M 总参数 / 约 48M 激活下验证这些技术在小规模上的行为。单卡 16G 可从零训练，200K 上下文推理就绪。
 
-This is a research testbed, not a production model. Expect rough edges; see pitfalls docs for lessons learned the hard way.
+这是研究试验品，不是生产模型。坑都记在 pitfalls 文档里了。
 
-## Quickstart
+## 快速开始
 
 ```bash
 pip install torch && pip install -e ".[hf]"  # datasets 用于 HF 流式语料
@@ -18,17 +18,7 @@ python scripts/train_local_llm.py --phase pretrain --preset tiny \
     --data local --local-path tests/fixtures/llm-corpus --max-steps 5
 ```
 
-16G 单卡中文预训练（详见 `docs/ARCHITECTURE.md` 训练章节）：
-
-```bash
-python scripts/train_local_llm.py --phase pretrain --preset base \
-    --seq-len 2048 --batch 4 --accum 8 --max-steps 10000 \
-    --grad-ckpt --ckpt-dir data/llm-ckpt \
-    --data local --local-path data/corpus \
-    --eval-every 200 --sample-every 200
-```
-
-## Layout
+## 目录结构
 
 ```
 CrucibleLM/
@@ -39,7 +29,7 @@ CrucibleLM/
 └── data/               # 语料与 checkpoint（gitignored，需自备）
 ```
 
-## Reproduce training（复现训练全流程）
+## 复现训练全流程
 
 环境：单卡 16G（如 RTX 3080 Laptop），Python 3.12，CUDA 版 torch。
 
@@ -48,6 +38,7 @@ CrucibleLM/
 uv venv ~/.venvs/llm-train --python 3.12
 uv pip install --python ~/.venvs/llm-train/bin/python torch datasets modelscope pyarrow
 export PATH="$HOME/.local/bin:$PATH"
+
 # 1. 数据（魔搭 CN CDN，训练全程零网络；约 23GB）
 ~/.venvs/llm-train/bin/python -c "
 from modelscope import snapshot_download
@@ -96,13 +87,22 @@ nvidia-smi -l 2                   # 显存（应稳定 ~8GB）
 `--shuffle-buffer 512`、`--prefetch 4`、AdamW 优化器。续跑直接加 `--resume`
 （权重/优化器/step/数据游标全续）。直连 HF 超时请用 `--hf-endpoint https://hf-mirror.com`。
 
-## Tests
+## 进阶开关（默认全关，详见 docs/ARCHITECTURE.md）
+
+- 长上下文：`longctx_config()` 200K 推理（YaRN×8 + 稀疏 MLA），训练走"短训 + 外推 + 分阶段微调"；
+- 优化器：`--optimizer muon`（约 2x 效率，优化器显存减半）；
+- 学习效率：`--rho-keep`（RHO 选择）、`--curriculum`（课程）、`--ema-*`（EMA 影子）、`--replay-*`（回放池）；
+- 跨词表蒸馏：`--kd-teacher`（MiniCPM 0.5B，锚点 KL）；
+- 架构迁移：`scripts/migrate_model.py`（加深/加宽/裁剪 + `--init-checkpoint` 续训）；
+- 推理侧：直觉头（`heads.py`，冻结 backbone 上的毫瓦级决策器）+ BM25 检索（`retrieval.py`）。
+
+## 单测
 
 ```bash
 pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
 
-## License
+## 许可证
 
-MIT — see [LICENSE](./LICENSE).
+MIT — 见 [LICENSE](./LICENSE)。
