@@ -33,5 +33,6 @@ CrucibleLM（坩埚）——融合最新 LLM 架构的**实验性**小模型：M
 2. **push 前扫敏感信息**：全库 grep `api_key/password/secret/hf_*/sk-` 等模式 + 文件名扫 `.env/.pem/credentials`，零命中才推。
 3. **commit 信息格式**：`feat/fix/docs/test:` 前缀 + 中文一句话，复杂改动正文列"改了什么/为什么/验证结果"。
 4. **push 网络抖动重试**：`GIT_TERMINAL_PROMPT=0 git push`，超时等一会儿再推，commit 在本地是安全的。
+   补充：**不要 push，一律只 commit 到本地**，push 由用户手动执行。
 5. **单仓纪律**：模型开发只在本仓库；历史项目中的旧模型代码已删除归档，禁止两边同时改同一逻辑。
 6. **大改先单测后提交**：`python -m pytest tests/ -q` 全绿才 commit；GPU 相关改动另加真机冒烟（CPU 单测覆盖不到精度/显存问题）。

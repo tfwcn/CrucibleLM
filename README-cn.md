@@ -103,6 +103,28 @@ pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
 
+## 技术一览
+
+| 领域 | 技术 | 作用（一句话） | 位置 |
+|---|---|---|---|
+| 注意力 | MLA 低秩 KV + 解耦 RoPE | KV 缓存约 1/10，200K 上下文的根基 | `mla.py`（DeepSeek 系） |
+| 注意力 | Gated-DeltaNet-lite 线性注意力 | O(N) 计算、O(1) 状态，因果卷积 + 门控 | `linear_attn.py`（Qwen3-Next 系） |
+| 注意力 | Hybrid 交替（1 全 : 3 线性） | 质量与效率平衡 | `block.py` |
+| 注意力 | 轻量稀疏注意力（汇点 + 窗口 + 跨步） | 让 200K 可算，阈值下等价 dense | `sparse_attn.py`（DSA 思想简化） |
+| MoE | 细粒度 MoE + 共享专家 + aux | 128M 参数/每 token 激活 48M | `moe.py`（DeepSeek 系） |
+| 训练目标 | MTP 额外头（预测 t+2） | 训练信号加密，推理关闭 | `model.py`（DeepSeek 系） |
+| 位置 | RoPE + YaRN | 8K 训练外推 200K 推理 | `rope.py` |
+| 归一/激活 | RMSNorm / QK-Norm / SwiGLU | 处处稳定训练 | `mla.py`、`moe.py` |
+| 优化器 | Muon + AdamW 混合（`--optimizer muon`） | 约 2x 效率，优化器显存减半 | `optim.py` |
+| 学习效率 | RHO 选择 / 课程 / EMA 影子 / 回放池 | 难 token 聚焦、先易后难、稳定、巩固 | `train.py`、`data.py` |
+| 蒸馏 | 跨词表锚点 KL（`--kd-teacher`） | 跨词表的 logit 蒸馏 | `distill.py` |
+| 显存 | bf16 AMP / 梯度检查点 / 权重绑定 / expandable_segments | 2048×4 训练塞进 16G（实测约 5GB） | `train.py`、`model.py` |
+| 数据 | 打包 / shuffle / 预取 / 多源混合 / parquet 直读 / 断点续流 / 扩词 | 吞吐 + 分布控制 | `data.py`、scripts |
+| 推理 | 增量解码 + OpenAI 服务 + 直觉头 + BM25 检索 | 对外服务、快速决策、长会话记忆 | `server.py`、`heads.py`、`retrieval.py` |
+| 迁移 | 恒等加深 / 专家加宽 / 裁剪 / SVD（`migrate_model.py`） | 改架构不重训 | `migrate.py` |
+
+逐项详解见 `docs/ARCHITECTURE.md`，血泪教训见 `docs/pitfalls/`。
+
 ## 推理
 
 ```python

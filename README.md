@@ -107,6 +107,28 @@ pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
 
+## Techniques at a glance
+
+| Area | Technique | What it does | Where |
+|---|---|---|---|
+| Attention | MLA low-rank KV + decoupled RoPE | ~10x KV cache cut, the basis for 200K context | `mla.py` (DeepSeek-style) |
+| Attention | Gated-DeltaNet-lite linear attention | O(N) compute, O(1) state, causal conv + gating | `linear_attn.py` (Qwen3-Next-style) |
+| Attention | Hybrid interleave (1 full : 3 linear) | Quality + efficiency balance | `block.py` |
+| Attention | Lightweight sparse attention (sink + window + strided) | Makes 200K+ computable; exact-dense below threshold | `sparse_attn.py` (DSA-inspired) |
+| MoE | Fine-grained MoE + shared expert + aux loss | 128M params / 48M active per token | `moe.py` (DeepSeek-style) |
+| Objective | MTP extra head (predict t+2) | Denser training signal, off at inference | `model.py` (DeepSeek-style) |
+| Position | RoPE + YaRN scaling | Extrapolate 8K training to 200K inference | `rope.py` |
+| Norm | RMSNorm / QK-Norm / SwiGLU | Training stability everywhere | `mla.py`, `moe.py` |
+| Optimizer | Muon + AdamW hybrid (`--optimizer muon`) | ~2x efficiency, half optimizer memory | `optim.py` |
+| Learning | RHO selection / curriculum / EMA shadow / replay buffer | Focus on hard tokens, easy-to-hard, stabilize, consolidate | `train.py`, `data.py` |
+| Distillation | Cross-tokenizer anchor KL (`--kd-teacher`) | Logit distillation across different vocabs | `distill.py` |
+| Memory | bf16 AMP / grad checkpointing / tied embeddings / expandable segments | Fit 2048×4 training into 16GB (~5GB measured) | `train.py`, `model.py` |
+| Data | Packing / shuffle buffer / prefetch / multi-source mix / parquet direct read / resume cursor / vocab extension | Throughput + distribution control | `data.py`, scripts |
+| Inference | Incremental decoding + OpenAI API server + intuition heads + BM25 RAG | Serve, fast decisions, long session memory | `server.py`, `heads.py`, `retrieval.py` |
+| Migration | Identity-layer growth / expert widening / pruning / SVD (`migrate_model.py`) | Change arch without retraining from scratch | `migrate.py` |
+
+Details for each: `docs/ARCHITECTURE.md`. Hard lessons: `docs/pitfalls/`.
+
 ## Inference
 
 ```python
