@@ -1,4 +1,4 @@
-"""Hybrid Transformer 块 — MLA 全注意力层与线性注意力层交替 + MoE."""
+"""Hybrid Transformer 块 — MLA 全注意力层与线性注意力层交替 + MoE + 可选记忆层."""
 
 from __future__ import annotations
 
@@ -6,13 +6,14 @@ import torch
 import torch.nn as nn
 
 from src.llm.local.linear_attn import GatedDeltaLite
+from src.llm.local.memory import ProductKeyMemory
 from src.llm.local.mla import RMSNorm
 from src.llm.local.moe import FineGrainedMoE
 from src.llm.local.sparse_attn import SparseMLAModule
 
 
 class HybridBlock(nn.Module):
-    """单个 Hybrid 块：注意力（MLA/线性二选一）+ 细粒度 MoE."""
+    """单个 Hybrid 块：注意力（MLA/线性二选一）+ 细粒度 MoE + 可选记忆层."""
 
     def __init__(
         self,
@@ -37,6 +38,9 @@ class HybridBlock(nn.Module):
         sparse_stride: int = 512,
         sparse_chunk: int = 2048,
         linear_chunk: int = 2048,
+        use_memory: bool = False,
+        memory_slots: int = 4096,
+        memory_topk: int = 8,
     ):
         super().__init__()
         self.full_attn = full_attn
@@ -56,6 +60,11 @@ class HybridBlock(nn.Module):
         self.moe = FineGrainedMoE(
             d_model, n_experts, top_k, expert_hidden, n_shared, aux_coef,
         )
+        # 记忆层（默认 None：无参数，state_dict 兼容；开后残差并联在 MoE 之后）
+        self.memory: ProductKeyMemory | None = (
+            ProductKeyMemory(d_model, memory_slots, memory_topk, dropout)
+            if use_memory else None
+        )
 
     def forward(
         self,
@@ -70,4 +79,8 @@ class HybridBlock(nn.Module):
         a_out, new_past = self.attn(self.norm1(h), past, return_state)  # type: ignore[arg-type]
         h = h + a_out
         m_out, aux = self.moe(self.norm2(h))
-        return h + m_out, (new_past, aux)
+        h = h + m_out
+        if self.memory is not None:
+            # 记忆层自带 norm + 残差，直接叠加
+            h = self.memory(h)
+        return h, (new_past, aux)

@@ -13,6 +13,8 @@ from src.llm.local.mla import RMSNorm
 
 def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
     """按配置构建单个 Hybrid 块（模型与迁移工具共用，避免参数漂移）."""
+    use_memory = (config.memory_every > 0
+                  and layer_idx % config.memory_every == 0)
     return HybridBlock(
         d_model=config.d_model,
         n_heads=config.n_heads,
@@ -35,6 +37,9 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         sparse_stride=config.sparse_stride,
         sparse_chunk=config.sparse_chunk,
         linear_chunk=config.linear_chunk,
+        use_memory=use_memory,
+        memory_slots=config.memory_slots,
+        memory_topk=config.memory_topk,
     )
 
 
@@ -73,6 +78,13 @@ class TinyLLM(nn.Module):
             # 权重绑定：省一块词表矩阵（约 6M 参数）
             self.lm_head.weight = self.embed.weight
         self.mtp = MTPHead(config) if config.mtp_depth > 0 else None
+        # RETRO 融合（默认 None：无参数，state_dict 兼容；开后处理 mem 输入）
+        self.retro: nn.Module | None = None
+        if config.retro_enabled:
+            from src.llm.local.retro import RetroFusion
+
+            self.retro = RetroFusion(
+                config.d_model, config.retro_heads, config.dropout)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -96,12 +108,16 @@ class TinyLLM(nn.Module):
         input_ids: torch.Tensor,
         targets: torch.Tensor | None = None,
         return_token_losses: bool = False,
+        mem: torch.Tensor | None = None,
+        mem_mask: torch.Tensor | None = None,
     ) -> dict:
         """前向：训练时传 targets 返回组合 loss，推理时只返回 logits.
 
         loss = 主 CE(t+1) + mtp_weight * MTP CE(t+2) + 各层 aux_loss 之和。
         return_token_losses=True 时附带逐 token 主 loss（RHO 选择用，
         ignore 位为 0 且反向无梯度，自然不会被选中）。
+        mem/mem_mask: 检索记忆 (b, M, d)/(b, M)，仅 retro_enabled 时生效；
+        retro 开启但 mem 为空（评测/生成路径）则跳过融合，测 backbone 本体。
         """
         if input_ids.shape[1] > self.config.max_seq_len:
             raise ValueError(
@@ -119,6 +135,15 @@ class TinyLLM(nn.Module):
                 h, (_, aux) = layer(h, None, False)
                 aux_total = aux_total + aux
         h = self.final_norm(h)
+        if self.retro is not None:
+            if mem is None:
+                # 评测/生成路径无检索：跳过融合（测的是 backbone 本体；
+                # retro 增益由专用评测度量，不在此）
+                pass
+            else:
+                h = self.retro(h, mem, mem_mask)
+        elif mem is not None:
+            raise ValueError("传了 mem 但 retro_enabled=False")
         logits = self.lm_head(h)
         out: dict = {"logits": logits, "aux_loss": aux_total.detach()}
         if targets is None:
@@ -320,9 +345,17 @@ class TinyLLM(nn.Module):
             + (c.top_k + c.n_shared) * per_expert
             + c.d_model * c.n_experts  # 路由矩阵全量参与
         )
+        # 记忆层激活：每 token top-k 个槽（keys 查表 + values 加权）
+        n_mem_layers = sum(1 for layer in self.layers
+                           if getattr(layer, "memory", None) is not None)
+        mem_active = n_mem_layers * c.memory_topk * c.d_model * 2
+        # RETRO 融合：整块参与（单点，开后计入）
+        retro_active = (sum(p.numel() for p in self.retro.parameters())
+                        if self.retro is not None else 0)
         active = (
             self.embed.weight.numel()
             + per_layer_active * c.n_layers
+            + mem_active + retro_active
             + self.final_norm.weight.numel()
             + (0 if c.tie_embeddings else self.lm_head.weight.numel())
         )

@@ -105,6 +105,17 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="EMA 一致性 loss 权重")
     p.add_argument("--ema-decay", type=float, default=0.999,
                    help="EMA 动量")
+    # 检索增强（RETRO-lite）与记忆层：默认关，四开足
+    p.add_argument("--retro-db", default="",
+                   help="RETRO 检索库路径（BM25 索引落盘前请先跑 build_retrieval；空=关闭）")
+    p.add_argument("--retro-k", type=int, default=2, help="每段检索取 top-K 文档")
+    p.add_argument("--enable-retro", action="store_true",
+                   help="模型侧开启 RETRO 融合（需 --retro-db 提供，仅在 mid-training 起用）")
+    p.add_argument("--enable-memory", action="store_true",
+                   help="开启 Product-Key 记忆层（每 memory_every 层一个）")
+    p.add_argument("--memory-every", type=int, default=4, help="记忆层插入间隔（N 层一个）")
+    p.add_argument("--memory-slots", type=int, default=4096, help="记忆槽位数")
+    p.add_argument("--memory-topk", type=int, default=8, help="每 token 激活槽数")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -470,7 +481,7 @@ def _forward_batch(model: TinyLLM, batch, device, distiller=None,
                    kd_alpha: float = 0.0, id_to_char: dict | None = None,
                    rho_keep: float = 0.0, ema_model=None,
                    ema_weight: float = 0.0, rho_ref: str = "none",
-                   do_kd: bool = True) -> dict:
+                   do_kd: bool = True, mem=None, mem_mask=None) -> dict:
     """单个 micro-batch 前向（预训练与 SFT 统一入口，SFT 带 -100 掩码）.
 
     distiller 非空时加锚点 KL（跨词表蒸馏）：老师内部 no_grad 只出分布，
@@ -484,10 +495,10 @@ def _forward_batch(model: TinyLLM, batch, device, distiller=None,
 
     if isinstance(batch, tuple):
         x, y = (t.to(device) for t in batch)
-        out = model(x, targets=y, return_token_losses=True)
+        out = model(x, targets=y, return_token_losses=True, mem=mem, mem_mask=mem_mask)
     else:
         x = batch.to(device)
-        out = model(x, targets=x, return_token_losses=True)
+        out = model(x, targets=x, return_token_losses=True, mem=mem, mem_mask=mem_mask)
     if rho_keep > 0:
         if rho_ref == "teacher" and do_kd and distiller is not None and id_to_char is not None:
             from src.llm.local.distill import select_by_excess
@@ -549,6 +560,24 @@ def main(argv=None) -> int:
               f"（{config.n_layers} 层，专家 hidden {config.expert_hidden}）",
               flush=True)
     config.grad_ckpt = args.grad_ckpt
+    # 检索/记忆：显式 flag 才覆盖 config（默认零变化）
+    if args.enable_retro:
+        config.retro_enabled = True
+    if args.enable_memory:
+        config.memory_every = max(args.memory_every, 1)
+        config.memory_slots = args.memory_slots
+        config.memory_topk = args.memory_topk
+        # 槽数要拆两个 √M 子码本，非完全平方数提前拦下（否则构造时 assert 崩栈）
+        side = int(config.memory_slots ** 0.5)
+        if side * side != config.memory_slots:
+            raise SystemExit(
+                f"--memory-slots 须为完全平方数（√M×√M 子码本），"
+                f"当前 {config.memory_slots}；可取 1024/4096/16384")
+        if config.memory_topk < 1:
+            raise SystemExit("--memory-topk 至少为 1")
+        print(f"记忆层已开：每 {config.memory_every} 层一个，"
+              f"槽数 {config.memory_slots}（子码本 {side}×{side}），top-{config.memory_topk}",
+              flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0
     if args.resume:
@@ -645,7 +674,7 @@ def main(argv=None) -> int:
         json.dumps(tok._chars, ensure_ascii=False), encoding="utf-8")
     # 蒸馏老师（可选）：frozen 锚点 KL，id->字映射供解码对齐
     distiller = None
-    id_to_char: dict = {}
+    id_to_char: dict = {i + 4: ch for i, ch in enumerate(tok._chars)}
     if args.kd_teacher:
         from src.llm.local.distill import (
             AnchorDistiller, build_anchor_mapping, load_teacher)
@@ -667,6 +696,24 @@ def main(argv=None) -> int:
             p.requires_grad_(False)
         print(f"EMA 影子已建（每 {args.ema_every} 步动量 {args.ema_decay} 同步）",
               flush=True)
+
+    # RETRO 检索（可选）：预构建 BM25 索引，训练时按 batch 检出 top-K 融合
+    retro_index = None
+    if args.retro_db:
+        import pickle
+
+        from src.llm.local.retrieval import BM25Retriever
+
+        try:
+            with open(args.retro_db, "rb") as f:
+                retro_index = pickle.load(f)
+        except (OSError, pickle.UnpicklingError, EOFError) as e:
+            print(f"警告：RETRO 库加载失败（{e}），已禁用", flush=True)
+        if isinstance(retro_index, BM25Retriever):
+            print(f"RETRO 检索库已载：{len(retro_index)} 文档", flush=True)
+        else:
+            print("警告：retro_db 不是 BM25Retriever，已禁用", flush=True)
+            retro_index = None
 
     log_path = ckpt_dir / "train.log"
     logf = open(log_path, "a", encoding="utf-8")
@@ -729,17 +776,34 @@ def main(argv=None) -> int:
                     break
                 do_kd = (micro_i % kd_every == 0)
                 kd_w = args.kd_alpha * kd_every if do_kd else 0.0
+                # RETRO：按 batch 检出 top-K 融合（仅 --enable-retro 且索引就绪）
+                mem, mem_mask = None, None
+                if retro_index is not None and args.enable_retro:
+                    from src.llm.local.retro import (
+                        build_batch_mem, retrieve_for_texts)
+
+                    texts = []
+                    x_rows = batch[0] if isinstance(batch, tuple) else batch
+                    for row in x_rows:
+                        chars = "".join(
+                            id_to_char.get(int(i), '') for i in row.tolist() if int(i) > 3)
+                        texts.append(chars[-1000:])
+                    hits = retrieve_for_texts(retro_index, texts, k=args.retro_k)
+                    mem, mem_mask = build_batch_mem(
+                        model.embed, tok, hits, args.retro_k)
+                    mem = mem.to(device)
+                    mem_mask = mem_mask.to(device)
                 if use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         out = _forward_batch(model, batch, device,
                                              distiller, kd_w, id_to_char,
                                              args.rho_keep, ema_model, args.ema_weight,
-                                             args.rho_ref, do_kd)
+                                             args.rho_ref, do_kd, mem, mem_mask)
                 else:
                     out = _forward_batch(model, batch, device,
                                          distiller, kd_w, id_to_char,
                                          args.rho_keep, ema_model, args.ema_weight,
-                                         args.rho_ref, do_kd)
+                                         args.rho_ref, do_kd, mem, mem_mask)
                 tokens_seen += batch[0].numel() if isinstance(batch, tuple) else batch.numel()
                 (out["loss"] / args.accum).backward()
                 accum_stats = {k: float(v.detach()) if torch.is_tensor(v) else v

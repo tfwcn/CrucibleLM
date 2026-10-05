@@ -113,6 +113,12 @@ out, use `--hf-endpoint https://hf-mirror.com`.
   `--replay-*` (replay buffer);
 - Cross-tokenizer distillation: `--kd-teacher` (MiniCPM 0.5B, anchor KL);
 - Architecture migration: `scripts/migrate_model.py` (deepen/widen/prune + `--init-checkpoint`);
+- Memory layer: `--enable-memory --memory-slots/--memory-topk/--memory-every`
+  (Product-Key memory, zero-initialized values so it starts as an exact identity);
+- RETRO-lite: `--enable-retro --retro-db <pickle>` (BM25-retrieved chunks fused as a
+  prefix memory segment; build the index with `scripts/build_retrieval.py`);
+- Session state: `SessionCache` (persist MLA latents, linear states and conv tails
+  across turns and processes; library-side, used by the serving path);
 - Inference side: intuition heads (`heads.py`, milliwatt decision heads on a frozen backbone)
   + BM25 retrieval (`retrieval.py`).
 
@@ -139,6 +145,8 @@ python -m pytest tests/ -q
 | Learning | RHO selection / curriculum / EMA shadow / replay buffer | Focus on hard tokens, easy-to-hard, stabilize, consolidate | `train.py`, `data.py` |
 | Distillation | Cross-tokenizer anchor KL (`--kd-teacher`) | Logit distillation across different vocabs | `distill.py` |
 | Memory | bf16 AMP / grad checkpointing / tied embeddings / expandable segments | Fit 2048×4 training into 16GB (~5GB measured) | `train.py`, `model.py` |
+| Retrieval-augmented | Product-Key memory layer + RETRO-lite fusion (default-off) | Optional external memory without breaking the identity start | `memory.py`, `retro.py` |
+| State | `SessionCache` persist/restore (MLA latents + linear states + conv tails) | Resume long context across turns and processes | `session_cache.py` |
 | Data | Packing / shuffle buffer / prefetch / multi-source mix / parquet direct read / resume cursor / vocab extension | Throughput + distribution control | `data.py`, scripts |
 | Inference | Incremental decoding + OpenAI API server + intuition heads + BM25 RAG | Serve, fast decisions, long session memory | `server.py`, `heads.py`, `retrieval.py` |
 | Migration | Identity-layer growth / expert widening / pruning / SVD (`migrate_model.py`) | Change arch without retraining from scratch | `migrate.py` |

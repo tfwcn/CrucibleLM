@@ -895,6 +895,32 @@ def test_linear_decode_matches_train():
     assert torch.allclose(full[:, 19:20], step, atol=1e-5), (full[:, 19:20] - step).abs().max()
 
 
+def test_linear_conv_tail_survives_stepwise_decode():
+    """回归：逐 token 解码时卷积尾部必须覆盖 buf+current 末段.
+
+    曾把尾部截在拼接 buf 之前，导致 buf 每步被左补零覆盖成 [0, x_t]，
+    第 3 个 token 起左感受野丢一个真实 token（S 状态偏差 ~1.9）。
+    """
+    from src.llm.local.linear_attn import GatedDeltaLite
+
+    torch.manual_seed(0)
+    m = GatedDeltaLite(d_model=64, n_heads=4)
+    m.eval()
+    h = torch.randn(1, 8, 64)
+    past = None
+    outs = []
+    with torch.no_grad():
+        full, full_past = m(h)
+        for i in range(h.shape[1]):
+            out, past = m(h[:, i : i + 1], past)
+            outs.append(out)
+    # 状态与卷积尾都逐位一致（不只是末位输出）
+    for name, got, want in zip(("state", "k_buf", "v_buf"), past, full_past):
+        assert torch.allclose(got, want, atol=1e-5), f"{name}: {(got - want).abs().max()}"
+    stepwise = torch.cat(outs, dim=1)
+    assert torch.allclose(full, stepwise, atol=1e-5), (full - stepwise).abs().max()
+
+
 def test_longctx_config():
     """200K 预设：长度与 YaRN 就位，rope 缓存可建."""
     from src.llm.local.config import longctx_config

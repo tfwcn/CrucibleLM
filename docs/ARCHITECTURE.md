@@ -188,6 +188,26 @@ model = TinyLLM(longctx_config())  # 推理：generate() 支持 200K（含稀疏
 Muon 存盘与 AdamW 不互通，切换优化器删 `optim.pt` 重开动量即可（权重不受影响）；
 Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
 
+## 记忆层与 RETRO（`memory.py` / `retro.py`，可选，默认关）
+
+三条外挂能力，默认全关，逐个 flag 放开，互不依赖：
+
+- **Product-Key 记忆层**（`--enable-memory --memory-every N --memory-slots M
+  --memory-topk K`）：每 N 层插一个记忆层，把 hidden 投到 M 个 slot 上取 top-K 读出。
+  `value` 零初始化 → **恒等起点**，开开关不破坏已有权重（单测锁死"初始化前后输出一致"）。
+  key 用 B 方案初始化：`init_memory_from_activations()` 对语料 hidden 做 k-means 聚类，
+  簇心当 key；不做 logit 蒸馏，那是另一套配方。
+- **RETRO-lite 检索融合**（`--enable-retro --retro-db <pickle> --retro-k K
+  --retro-heads H`）：每个 chunk 用 BM25 检索 top-K 邻居，拼成前缀 mem 段送进模型。
+  `RetroFusion` 的 `w_o` 零初始化，同样恒等起点；索引由 `scripts/build_retrieval.py`
+  切块构建，`BM25Retriever.save/load` 走 pickle。
+- **会话增量状态落盘**（`session_cache.py` 的 `SessionCache`）：存 MLA latent +
+  线性层状态 + 短卷积尾，`save()/load()` 跨进程恢复，turn 之间不丢长上下文。
+  库侧组件（推理路径专用，不进训练循环）；服务进程按会话 id 复用待接线。
+  与上面两条正交，可叠加。
+
+开关全关时旧 checkpoint 逐位兼容，`build_block` 是模型/迁移/训练共用的唯一构造入口。
+
 ## 学习效率：RHO 选择 + 课程 + EMA（`--rho-keep/--curriculum/--ema-*`）
 
 - **RHO**（`--rho-keep 0.5`）：主 loss 只反向最高的 50% token（ignore 位恒 0 自然落选，
@@ -238,6 +258,8 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 - **特征**：`TinyLLM.encode_full_hidden` + 按真实长度 gather（padding 安全）；
   `encode_last_hidden` 仅定长/单条用。CPU 实测：512 上下文 0.6 秒/1.1GB，
   无 GPU 服务器常驻 1 worker 约 1~2GB。
+- **会话缓存**：`SessionCache.extend()` 存/读 MLA latent + 线性状态 + 卷积尾，
+  `save()/load()` 可跨进程恢复，短 turn 增量续跑。
 
 ## 架构迁移工具箱（`migrate.py` + `scripts/migrate_model.py`，改结构不重交学费）
 
@@ -261,7 +283,7 @@ python scripts/migrate_model.py --src data/llm-ckpt --out data/llm-16L --add-lay
 精确迁移直接续，近似迁移先小步验证（loss 回到旧终点附近再全速）；
 `build_block` 为模型与迁移共用的唯一构造入口，防参数漂移。
 
-## 单测
+    ## 单测
 
 ```bash
 python -m pytest tests/test_local_llm.py -v  # 需要 torch，无 torch 自动跳过

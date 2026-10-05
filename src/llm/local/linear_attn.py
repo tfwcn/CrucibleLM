@@ -59,15 +59,14 @@ class GatedDeltaLite(nn.Module):
         if k <= 1:
             return conv(xt).transpose(1, 2), xt[:, :, :0]
         # 新尾部恒 (k-1) 长：输入不足时左补零（序列开头本就无历史）；
-        # 恒定长度保证下次拼接后必满足 kernel 长度
-        tail = xt[:, :, -(k - 1):]
-        if tail.shape[-1] < k - 1:
-            tail = F.pad(tail, (k - 1 - tail.shape[-1], 0))
-        new_buf = tail.detach() if torch.is_grad_enabled() else tail
+        # 恒定长度保证下次拼接后必满足 kernel 长度。
+        # 注意：尾部必须覆盖上次 buf+current 的末段，否则下一步左文缺损。
         if buf is not None:
-            xt = torch.cat([buf.to(xt.device, xt.dtype), xt], dim=-1)
+            xt_full = torch.cat([buf.to(xt.device, xt.dtype), xt], dim=-1)
         else:
-            xt = F.pad(xt, (k - 1, 0))
+            xt_full = F.pad(xt, (k - 1, 0))  # 开头补零
+        new_buf = xt_full[:, :, -(k - 1):].detach() if torch.is_grad_enabled() else xt_full[:, :, -(k - 1):]
+        xt = xt_full
         return conv(xt).transpose(1, 2), new_buf
 
     def _project(

@@ -59,6 +59,13 @@ class SmallLLMConfig:
     sparse_chunk: int = 2048  # 预填充分块（显存/速度折中）
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
+    # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
+    retro_enabled: bool = False
+    retro_heads: int = 8
+    # 记忆层：0=关闭（无参数，checkpoint 通用）；>0=每 N 个 block 加一个 ProductKeyMemory
+    memory_every: int = 0
+    memory_slots: int = 4096  # 槽位数（64×64 子码本）
+    memory_topk: int = 8  # 每 token 激活槽数
 
     @property
     def head_dim(self) -> int:

@@ -65,3 +65,21 @@ class BM25Retriever:
                 scores[doc_id] = scores.get(doc_id, 0.0) + idf * f * (self.k1 + 1) / denom
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         return ranked[:k]
+
+    def save(self, path: str) -> None:
+        """整体 pickle 落盘（文档原文 + 索引，可直接载入）."""
+        import pickle
+
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @classmethod
+    def load(cls, path: str) -> "BM25Retriever":
+        """从 pickle 载回（与 save 配套）."""
+        import pickle
+
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, cls):
+            raise TypeError(f"{path} 不是 BM25Retriever")
+        return obj

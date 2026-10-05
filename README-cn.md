@@ -110,6 +110,12 @@ nvidia-smi -l 2                   # 显存（应稳定 ~8GB）
 - 学习效率：`--rho-keep`（RHO 选择）、`--curriculum`（课程）、`--ema-*`（EMA 影子）、`--replay-*`（回放池）；
 - 跨词表蒸馏：`--kd-teacher`（MiniCPM 0.5B，锚点 KL）；
 - 架构迁移：`scripts/migrate_model.py`（加深/加宽/裁剪 + `--init-checkpoint` 续训）；
+- 记忆层：`--enable-memory --memory-slots/--memory-topk/--memory-every`（Product-Key
+  记忆层，value 零初始化，恒等起点，开关不破坏已有权重）；
+- 检索融合：`--enable-retro --retro-db <pickle>`（RETRO-lite，BM25 捞回片段拼成前缀
+  mem 段；索引用 `scripts/build_retrieval.py` 构建）；
+- 会话落盘：`SessionCache`（MLA latent / 线性状态 / 卷积尾跨 turn、跨进程存取，
+  库侧组件，服务进程按会话 id 复用）；
 - 推理侧：直觉头（`heads.py`，冻结 backbone 上的毫瓦级决策器）+ BM25 检索（`retrieval.py`）。
 
 ## 单测
@@ -135,6 +141,8 @@ python -m pytest tests/ -q
 | 学习效率 | RHO 选择 / 课程 / EMA 影子 / 回放池 | 难 token 聚焦、先易后难、稳定、巩固 | `train.py`、`data.py` |
 | 蒸馏 | 跨词表锚点 KL（`--kd-teacher`） | 跨词表的 logit 蒸馏 | `distill.py` |
 | 显存 | bf16 AMP / 梯度检查点 / 权重绑定 / expandable_segments | 2048×4 训练塞进 16G（实测约 5GB） | `train.py`、`model.py` |
+| 检索增强 | Product-Key 记忆层 + RETRO-lite 融合（默认关） | 外挂记忆但保持恒等起点 | `memory.py`、`retro.py` |
+| 状态 | `SessionCache` 存取（MLA latent + 线性状态 + 卷积尾） | turn/进程之间续长上下文 | `session_cache.py` |
 | 数据 | 打包 / shuffle / 预取 / 多源混合 / parquet 直读 / 断点续流 / 扩词 | 吞吐 + 分布控制 | `data.py`、scripts |
 | 推理 | 增量解码 + OpenAI 服务 + 直觉头 + BM25 检索 | 对外服务、快速决策、长会话记忆 | `server.py`、`heads.py`、`retrieval.py` |
 | 迁移 | 恒等加深 / 专家加宽 / 裁剪 / SVD（`migrate_model.py`） | 改架构不重训 | `migrate.py` |
