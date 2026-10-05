@@ -1,11 +1,11 @@
 """Product-Key 记忆层 — CPU 可放的稀疏知识表（Meta Memory Layers / DeepSeek Engram 思想）.
 
 结构：查询切两半，分别在两个 √M 子码本里 top-k，再笛卡尔组合重排取 top-k，
-只把 k 个 value 行搬上计算设备加权求和。查找本身 O(√M)，天然适合放 CPU：
-搬运量恒为 k 行，与表大小无关。
+只把 k 个 value 行 gather 上计算设备加权求和。查找本身 O(√M)，搬运量恒为
+k 行，与表大小无关。
 
-- 表放 CPU（`to("cpu")` 的 Parameter，优化器按参维护状态，autograd 经
-  index_select/index_add 回传，无需手写）；
+- 表参数随模型设备走（构造时先放 CPU，`model.to(device)` 会整体搬运；
+  稀疏收益在于每步只 gather 命中的 k 行做加权，不在表大小）；
 - value 全零初始化 = 精确恒等（输出恒为输入），开局不破坏已训权重；
 - B 方案初始化（见 `init_memory_from_activations`）：backbone 冻结跑校准集，
   hidden 做 k-means，类中心劈半当子码本，value 保持零（恒等起点最安全）。
@@ -84,7 +84,11 @@ def _kmeans_pp(
 ) -> torch.Tensor:
     """极简 k-means（CPU，B 方案初始化用；大数据请换 faiss）。"""
     g = torch.Generator().manual_seed(seed)
-    idx = torch.randperm(data.shape[0], generator=g)[:n_clusters]
+    if data.shape[0] < n_clusters:
+        # 校准样本比槽还少时有放回采样（否则 randperm 切片不够，copy_ 炸形状）
+        idx = torch.randint(0, data.shape[0], (n_clusters,), generator=g)
+    else:
+        idx = torch.randperm(data.shape[0], generator=g)[:n_clusters]
     centers = data[idx].clone()
     for _ in range(iters):
         dist = torch.cdist(data, centers, p=2)

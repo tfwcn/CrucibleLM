@@ -65,3 +65,12 @@ prefill+单步解码 vs 全前向逐位一致）。
 `handler.close_connection = True`；单测必须按真 SSE 客户端写法
 （增量读到 `[DONE]`），而不是 `read()` 一把梭——后者测不出 framing bug，
 还会把 framing 问题伪装成"偶发 hang"（时好时坏极具迷惑性）。
+
+## 7. 解码路径手拼 block 前向时，新加的子层必须同步跟进
+
+`model._decode_step` 为复用逻辑手拼了 `attn+moe`（省一次 block 调度），
+记忆层加进 `HybridBlock`（MoE 之后）时解码侧漏跟：零初始化阶段恒等看不出，
+value 训出非零后增量解码与全前向分叉约 0.69（logits 量级）。
+教训：凡在 block 里加子层，同步改 `_decode_step`，并加"value 非零后
+prefill+解码 vs 全前向逐位一致"单测——恒等起点的模块，bug 只在训出
+非零后现形，默认的恒等单测盖不住。

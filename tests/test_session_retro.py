@@ -120,3 +120,51 @@ def test_memory_enabled_state_dict_compatible():
     # 此处用 load 的非严格语义对比差异键仅 memory）
     missing, unexpected = m1.load_state_dict(m0.state_dict(), strict=False)
     assert not unexpected and all("memory" in k for k in missing)
+
+
+def test_memory_decode_matches_full_forward_when_trained():
+    """回归：_decode_step 必须同步走记忆层.
+
+    零初始化时 memory 恒等，漏掉也看不出来；value 训出非零后，
+    prefill+单步解码必须仍与全前向逐位一致（曾差 ~0.69）。
+    """
+    torch.manual_seed(0)
+    cfg = tiny_test_config()
+    cfg.memory_every = 2
+    m = TinyLLM(cfg).eval()
+    with torch.no_grad():
+        for layer in m.layers:
+            if layer.memory is not None:
+                layer.memory.values.normal_(std=0.1)
+    x = torch.randint(0, 256, (1, 10))
+    with torch.no_grad():
+        full = m(x)["logits"]
+        h, pasts = m._prefill(x[:, :9])
+        h2, _ = m._decode_step(x[:, 9:10], pasts)
+        step_logits = m.lm_head(h2)
+    assert torch.allclose(full[:, 9:10], step_logits, atol=1e-5)
+
+
+def test_retro_all_masked_rows_stay_finite_identity():
+    """全行被 mask（无有效记忆）时不許出 NaN，退化为零增量恒等."""
+    from src.llm.local.retro import RetroFusion
+
+    torch.manual_seed(0)
+    rf = RetroFusion(64, 4).eval()
+    h = torch.randn(1, 5, 64)
+    mem = torch.randn(1, 3, 64)
+    mask = torch.zeros(1, 3, dtype=torch.bool)
+    with torch.no_grad():
+        o = rf(h, mem, mask)
+    assert torch.isfinite(o).all()
+    assert torch.allclose(o, h, atol=1e-6)
+
+
+def test_memory_init_with_fewer_samples_than_slots():
+    """校准样本比 side 还少时不崩（有放回采样），且仍保持恒等起点."""
+    torch.manual_seed(0)
+    pk = ProductKeyMemory(32, n_slots=64, top_k=4)  # side=8, 只给 5 个样本
+    info = init_memory_from_activations(pk, torch.randn(5, 32))
+    assert info["n_samples"] == 5 and info["inertia"] >= 0
+    x = torch.randn(1, 3, 32)
+    assert torch.allclose(pk(x), x, atol=1e-6)

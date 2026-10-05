@@ -258,6 +258,10 @@ class TinyLLM(nn.Module):
             hh = hh + a_out
             m_out, _ = layer.moe(layer.norm2(hh))
             hh = hh + m_out
+            if layer.memory is not None:
+                # 记忆层也在 block 前向里（MoE 之后残差并联）：解码必须同步走，
+                # 否则 value 训出非零后增量解码与全前向分叉（单测锁定）
+                hh = layer.memory(hh)
             new_pasts.append(p2)
         return self.final_norm(hh), new_pasts
 

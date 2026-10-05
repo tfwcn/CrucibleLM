@@ -58,6 +58,11 @@ class RetroFusion(nn.Module):
             scores = scores.masked_fill(
                 ~mem_mask.view(b, 1, 1, m), float("-inf"))
         probs = F.softmax(scores.float(), dim=-1).to(scores.dtype)
+        if mem_mask is not None:
+            # 全行被 mask（无有效记忆）时 softmax 全 -inf 会出 NaN：
+            # 先乘掩码再把 NaN 置零，无记忆行退化为零增量（恒等）
+            probs = torch.nan_to_num(
+                probs * mem_mask.view(b, 1, 1, m), nan=0.0)
         if self.training and self.dropout > 0:
             probs = F.dropout(probs, p=self.dropout)
         o = torch.einsum("bhts,bshd->bthd", probs, v).reshape(b, t, d)
