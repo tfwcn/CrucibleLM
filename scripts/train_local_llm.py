@@ -22,6 +22,7 @@ SFT（接预训练权重，只学 output，prompt 掩掉）：
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import random
@@ -40,6 +41,7 @@ from src.llm.local.data import (
     PrefetchIterator,
     ShuffleBuffer,
     fit_tokenizer_on_stream,
+    interleave_batches,
     iter_hf_pretrain,
     iter_hf_pretrain_mix,
     iter_hf_sft,
@@ -137,6 +139,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="质量分下限（仅有 score 字段的源生效，如 ultrafineweb）")
     p.add_argument("--sft-mix", default="belle:1",
                    help="SFT 混合配比，如 belle:2,agent-general:1（可选 belle/agent-general/agent-code/agent-search/agent-tool）")
+    p.add_argument("--sft-replay-dir", default="",
+                   help="SFT 阶段掺 pretrain 回放的语料目录（空=关闭；防第二遍刷 SFT 过拟合）")
+    p.add_argument("--sft-replay-ratio", type=float, default=0.0,
+                   help="回放 batch 占比（0~1，如 0.15；主流耗尽即停，回放不计 cursor）")
+    p.add_argument("--sft-replay-pool", type=int, default=8192,
+                   help="回放池文档数（取目录前 N 篇打乱后循环，防 20GB 全载入内存）")
     p.add_argument("--hf-endpoint", default="",
                    help="HF 镜像源（默认读 HF_ENDPOINT 环境变量；"
                    "国内直连超时请传 https://hf-mirror.com，代码内生效不依赖 shell 传递）")
@@ -415,6 +423,21 @@ def save_ckpt(ckpt_dir: Path, model: TinyLLM, optim, step: int, tokens: int,
     return snap
 
 
+def save_best(ckpt_dir: Path, model, step: int, val: float) -> Path:
+    """冠军快照：val 新低时另存 best/（权重 + 元信息，永不轮转）.
+
+    存的是调用方给的模型（EMA 开时传影子，冠军即 EMA 权重）；
+    只存权重（无 optim.pt），供 --sft-init / --init-checkpoint 起新轮用。
+    """
+    best = ckpt_dir / "best"
+    best.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), best / "model.pt")
+    (best / "meta.json").write_text(
+        json.dumps({"step": step, "val_loss": val}, ensure_ascii=False),
+        encoding="utf-8")
+    return best
+
+
 def load_weights_overlap(model: TinyLLM, path, map_location=None) -> None:
     """按行续接旧权重：形状一致直接拷；embed/lm_head 允许行数变多（旧行拷贝）."""
     state = torch.load(path, map_location=map_location)
@@ -461,8 +484,13 @@ def load_ckpt(ckpt_dir: Path, model: TinyLLM, optim=None,
 
 
 @torch.no_grad()
-def evaluate(model: TinyLLM, make_eval, n_batches: int, device) -> float:
-    """评测集平均 loss（SFT 掩码同样生效；评测流每次重建避免耗尽）."""
+def evaluate(model: TinyLLM, make_eval, n_batches: int, device,
+               restore_train: bool = True) -> float:
+    """评测集平均 loss（SFT 掩码同样生效；评测流每次重建避免耗尽）.
+
+    restore_train=False 时保持 eval 模式（EMA 影子评测用；影子无 dropout
+    需求，翻成 train 反而引入噪声）。
+    """
     model.eval()
     total, count = 0.0, 0
     try:
@@ -477,7 +505,10 @@ def evaluate(model: TinyLLM, make_eval, n_batches: int, device) -> float:
             count += 1
     except StopIteration:
         pass  # 评测样本不足时按已有批次平均
-    model.train()
+    if restore_train:
+        model.train()
+    else:
+        model.eval()
     return total / max(count, 1)
 
 
@@ -627,15 +658,43 @@ def main(argv=None) -> int:
                 pack_pretrain(iter(holdout), encode, args.seq_len, eos), args.batch)
     else:
         sft_stream = train_stream  # collect_holdout 已按阶段返回对应流
-        train_blocks = pack_pairs(sft_stream, encode, args.seq_len, eos)
+        sft_blocks = pack_pairs(sft_stream, encode, args.seq_len, eos)
 
         def make_eval() -> PackedBatcher:
             return PackedBatcher(
                 pack_pairs(iter(holdout), encode, args.seq_len, eos), args.batch)
-    # block 级 shuffle（只打乱训练流；评测流 make_eval 保持确定性）
-    if args.shuffle_buffer > 0:
+
+        if args.shuffle_buffer > 0:
+            sft_blocks = ShuffleBuffer(sft_blocks, args.shuffle_buffer, args.seed)
+        sft_trains = PackedBatcher(sft_blocks, args.batch)
+        trains = sft_trains
+        # SFT 掺 pretrain 回放（batch 级混，主流耗尽即停；回放无限循环不计 cursor）
+        if args.sft_replay_dir and args.sft_replay_ratio > 0:
+            if not 0.0 <= args.sft_replay_ratio < 1.0:
+                raise SystemExit("--sft-replay-ratio 须在 [0,1) 内")
+            if args.sft_replay_pool < 1:
+                raise SystemExit("--sft-replay-pool 至少为 1")
+            pool = list(_take(iter_local_texts(args.sft_replay_dir),
+                              args.sft_replay_pool))
+            if not pool:
+                raise SystemExit(f"--sft-replay-dir 无可用文档：{args.sft_replay_dir}")
+            random.Random(args.seed).shuffle(pool)
+            rep_blocks = pack_pretrain(itertools.cycle(pool), encode,
+                                       args.seq_len, eos)
+            if args.shuffle_buffer > 0:
+                rep_blocks = ShuffleBuffer(rep_blocks, args.shuffle_buffer,
+                                           args.seed + 1)
+            rep_trains = PackedBatcher(rep_blocks, args.batch)
+            denom, num = 20, min(19, max(1, round(args.sft_replay_ratio * 20)))
+            trains = interleave_batches(sft_trains, rep_trains, denom - num, num)
+            print(f"SFT 回放已开：{len(pool)} 篇 pretrain 循环，"
+                  f"batch 占比约 {num}/{denom}", flush=True)
+    # block 级 shuffle（只打乱 pretrain 训练流；SFT 分支上面自理；
+    # 评测流 make_eval 保持确定性）
+    if args.phase == "pretrain" and args.shuffle_buffer > 0:
         train_blocks = ShuffleBuffer(train_blocks, args.shuffle_buffer, args.seed)
-    trains = PackedBatcher(train_blocks, args.batch)
+    if args.phase == "pretrain":
+        trains = PackedBatcher(train_blocks, args.batch)
     # 后台预取（打包在后台线程做，主循环只消费；device 传输仍在主线程）
     if args.prefetch > 0:
         trains = PrefetchIterator(trains, args.prefetch)
@@ -744,7 +803,8 @@ def main(argv=None) -> int:
                                         "grad_ckpt", "pretrain_mix", "sft_mix",
                                         "rho_keep", "rho_ref", "kd_teacher",
                                         "kd_alpha", "replay_ratio",
-                                        "consolidate_steps", "extend_vocab")
+                                        "consolidate_steps", "extend_vocab",
+                                        "sft_replay_ratio", "ema_every")
                                        if k in hparams}},
                           ensure_ascii=False) + "\n")
     logf.flush()
@@ -757,6 +817,16 @@ def main(argv=None) -> int:
     rng = random.Random(args.seed)
     t0 = time.time()
     step = start_step
+    # 冠军追踪：同目录续跑时继承历史最佳（best/meta.json），避免更差的覆盖冠军
+    best_val = float("inf")
+    _best_meta = ckpt_dir / "best" / "meta.json"
+    if _best_meta.exists():
+        try:
+            best_val = float(json.loads(
+                _best_meta.read_text(encoding="utf-8")).get("val_loss", float("inf")))
+            print(f"历史最佳 val={best_val:.4f}（best/ 保留）", flush=True)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
     # 巩固期起始 lr（lr 不升：钳制在起始值内）
     lr0 = [g["lr"] for g in optim.param_groups]
     try:
@@ -882,10 +952,26 @@ def main(argv=None) -> int:
                 logf.flush()
             if args.eval_every and step % args.eval_every == 0:
                 val = evaluate(model, make_eval, args.eval_batches, device)
-                print(f"[eval] step={step} val_loss={val:.4f}", flush=True)
-                logf.write(json.dumps({"step": step, "val_loss": val},
-                                      ensure_ascii=False) + "\n")
+                record_val: dict = {"step": step, "val_loss": val}
+                champ_model, champ_val = model, val
+                if ema_model is not None:
+                    # EMA 影子同步评（restore_train=False 保 eval 模式），
+                    # 冠军按影子值选、存影子权重（平滑冠军）
+                    ema_val = evaluate(ema_model, make_eval, args.eval_batches,
+                                       device, restore_train=False)
+                    record_val["ema_val_loss"] = ema_val
+                    champ_model, champ_val = ema_model, ema_val
+                msg = f"[eval] step={step} val_loss={val:.4f}"
+                if "ema_val_loss" in record_val:
+                    msg += f" ema_val={record_val['ema_val_loss']:.4f}"
+                print(msg, flush=True)
+                logf.write(json.dumps(record_val, ensure_ascii=False) + "\n")
                 logf.flush()
+                if champ_val < best_val:
+                    best_val = champ_val
+                    save_best(ckpt_dir, champ_model, step, champ_val)
+                    print(f"[best] step={step} val={champ_val:.4f} -> best/",
+                          flush=True)
             if args.sample_every and step % args.sample_every == 0:
                 resp = backend.chat([{"role": "user", "content": "介绍一下你自己。"}],
                                     max_new_tokens=64)

@@ -993,3 +993,41 @@ def test_generate_restores_train_mode():
     gen = m.generate(x, max_new_tokens=4)
     assert gen.shape == (1, 12)
     assert m.training, "generate 后模型仍应处于 train 模式"
+
+
+def test_interleave_batches_main_driven():
+    """回放混流：主流耗尽即停（含无限 replay），主 batch 保序，配比约权重复."""
+    import itertools
+
+    from src.llm.local.data import interleave_batches
+
+    main = [("m", i) for i in range(20)]
+    replay = itertools.cycle([("r", i) for i in range(5)])
+    out = list(interleave_batches(iter(main), replay, 17, 3))
+    got_main = [i for tag, i in out if tag == "m"]
+    assert got_main == list(range(20)), "主 batch 必须全量保序"
+    frac = sum(1 for tag, _ in out if tag == "r") / len(out)
+    assert abs(frac - 3 / 20) < 0.06, frac
+
+
+def test_interleave_batches_no_replay_passthrough():
+    """回放权重 0 时直通主流（filter 语义，防配比 bug 吃数据）."""
+    from src.llm.local.data import interleave_batches
+
+    main = list(range(7))
+    assert list(interleave_batches(iter(main), iter([]), 17, 0)) == main
+
+
+def test_save_best_roundtrip(tmp_path):
+    """冠军快照：落盘可严格载回，meta 含 step/val（长训冠军永不轮转）."""
+    import json
+
+    torch.manual_seed(0)
+    m = TinyLLM(tiny_test_config())
+    flow.save_best(tmp_path, m, 200, 2.425)
+    meta = json.loads((tmp_path / "best" / "meta.json").read_text(encoding="utf-8"))
+    assert meta == {"step": 200, "val_loss": 2.425}
+    m2 = TinyLLM(tiny_test_config())
+    m2.load_state_dict(torch.load(tmp_path / "best" / "model.pt"))
+    for (n1, p1), (n2, p2) in zip(m.named_parameters(), m2.named_parameters()):
+        assert n1 == n2 and torch.equal(p1, p2)

@@ -282,6 +282,32 @@ def interleave_weighted(
             alive[idx] = False
 
 
+def interleave_batches(
+    main: Iterator, replay: Iterator, w_main: int = 17, w_replay: int = 3,
+) -> Iterator:
+    """按权重轮询取 batch，主流耗尽即停（replay 侧可无限循环，不决定终止）.
+
+    SFT 掺 pretrain 回放用：主 SFT 流决定 epoch 长度，回放只做正则防过拟合；
+    回放流不计 data_cursor（刻意重复，见训练脚本）。
+    """
+    assert w_main >= 1 and w_replay >= 0
+    if w_replay == 0:
+        yield from main
+        return
+    pattern = [0] * w_main + [1] * w_replay
+    iters = [iter(main), iter(replay)]
+    pos = 0
+    while True:
+        idx = pattern[pos % len(pattern)]
+        pos += 1
+        try:
+            yield next(iters[idx])
+        except StopIteration:
+            if idx == 0:
+                return
+            iters[1] = iter(replay)
+
+
 def iter_hf_pretrain_mix(
     mix: str = DEFAULT_PRETRAIN_MIX,
     buffer_size: int = 10000,

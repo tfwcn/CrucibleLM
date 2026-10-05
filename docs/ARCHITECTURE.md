@@ -246,6 +246,16 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   字段的源生效（ultrafineweb），HQ 自动跳过；阈值实时读，日志记 `cur_min_score`。
 - **EMA**（`--ema-every 100 --ema-weight 0.05`）：bf16 影子 + logits-MSE 一致性，
   稳定器（专治站点切换鼓包），多约 0.3GB 显存和一次前向。
+  开 EMA 后评测同步测影子（`ema_val_loss`，影子保持 eval 模式），
+  冠军按影子值选、存影子权重（平滑冠军，过拟合抖动期白捡精度）。
+- **冠军快照**（自动）：每次 eval 出现新低就另存 `best/`（权重 + meta，
+  永不轮转，供下轮 `--sft-init best/model.pt`）；同目录续跑继承历史最佳，
+  更差的不覆盖冠军。`--keep-last` 只管步数快照，冠军独立。
+- **SFT 掺 pretrain 回放**（`--sft-replay-dir data/hq-zh --sft-replay-ratio 0.15
+  --sft-replay-pool 8192`）：batch 级混（主流耗尽即停，回放无限循环；
+  两种 block 同 batcher 但批次同构，混的是 batch 不是 block）。
+  回放只做正则防过拟合，不计 data_cursor（刻意重复）；评测仍是纯 SFT。
+  池子只取前 N 篇打乱（防 20GB 全载入内存）。第二遍刷 SFT 必开。
 - **回放**（`--replay-ratio 0.15 --replay-capacity 8192`）：每步最难 1 块入池
   （FIFO），按比例重放旧难样本（海马体式巩固）；SFT 连 label 一起存；
   日志记 `replay`（本步是否命中）与 `replay_size`。
