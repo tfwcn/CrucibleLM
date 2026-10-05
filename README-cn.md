@@ -64,7 +64,11 @@ snapshot_download('epfml/FineWeb2-HQ', repo_type='dataset',
 snapshot_download('openbmb/Ultra-FineWeb', repo_type='dataset',
     allow_patterns=['data/ultrafineweb_zh/ultrafineweb-zh-part-00[1-4]-of-256.parquet'],
     local_dir='data/ultra-zh')"
-# SFT 数据（173MB）：见 docs/ARCHITECTURE.md 语料表
+# SFT 数据（173MB，魔搭落盘 COIG + alpaca-gpt4-zh，见 docs/ARCHITECTURE.md 语料表）。
+# 扩充（Belle 0.5M，51.9 万→去重后 42 万，HF 镜像直下，约 260MB）：
+~/.venvs/llm-train/bin/python scripts/convert_sft.py \
+  --dataset BelleGroup/train_0.5M_CN --out data/sft-belle --dedup-dir data/sft-zh
+# 之后 --local-path 改成 "data/sft-zh:3,data/sft-belle:1" 混合训练
 # 老师（0.5B，可选，SFT 蒸馏用）：
 ~/.venvs/llm-train/bin/python -c "
 from modelscope import snapshot_download

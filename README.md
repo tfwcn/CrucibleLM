@@ -64,7 +64,11 @@ snapshot_download('epfml/FineWeb2-HQ', repo_type='dataset',
 snapshot_download('openbmb/Ultra-FineWeb', repo_type='dataset',
     allow_patterns=['data/ultrafineweb_zh/ultrafineweb-zh-part-00[1-4]-of-256.parquet'],
     local_dir='data/ultra-zh')"
-# SFT data (173MB): see corpus table in docs/ARCHITECTURE.md
+# SFT data (173MB, ModelScope COIG + alpaca-gpt4-zh, see corpus table in docs/ARCHITECTURE.md).
+# Expansion (Belle 0.5M, 519K rows -> 420K after dedup, via HF mirror, ~260MB):
+~/.venvs/llm-train/bin/python scripts/convert_sft.py \
+  --dataset BelleGroup/train_0.5M_CN --out data/sft-belle --dedup-dir data/sft-zh
+# Then train with --local-path "data/sft-zh:3,data/sft-belle:1"
 # Teacher (0.5B, optional, for SFT distillation):
 ~/.venvs/llm-train/bin/python -c "
 from modelscope import snapshot_download
