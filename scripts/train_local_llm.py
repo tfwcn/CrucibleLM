@@ -720,10 +720,11 @@ def main(argv=None) -> int:
         from src.llm.local.retrieval import BM25Retriever
 
         try:
-            with open(args.retro_db, "rb") as f:
-                retro_index = pickle.load(f)
-        except (OSError, pickle.UnpicklingError, EOFError) as e:
+            retro_index = BM25Retriever.load(args.retro_db)
+        except (OSError, pickle.UnpicklingError, EOFError,
+                TypeError, AttributeError) as e:
             print(f"警告：RETRO 库加载失败（{e}），已禁用", flush=True)
+            retro_index = None
         if isinstance(retro_index, BM25Retriever):
             print(f"RETRO 检索库已载：{len(retro_index)} 文档", flush=True)
         else:
@@ -805,7 +806,8 @@ def main(argv=None) -> int:
                         chars = "".join(
                             id_to_char.get(int(i), '') for i in row.tolist() if int(i) > 3)
                         texts.append(chars[-1000:])
-                    hits = retrieve_for_texts(retro_index, texts, k=args.retro_k)
+                    hits = retrieve_for_texts(retro_index, texts, k=args.retro_k,
+                                                  max_terms=12)
                     if args.retro_every > 0:
                         chunk_ids, chunk_mask = build_batch_chunk_ids(
                             tok, hits, args.retro_k, args.retro_len)

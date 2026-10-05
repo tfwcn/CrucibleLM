@@ -220,6 +220,10 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   自检索的 loss 虚低由专用评测度量，勿与 backbone val 比大小；
   当前推荐用法是 B（mid-training 增广 + 尾段关掉冷却），A（真 RAG 上线）
   等检索升级 + mem 消融诊断（真 mem vs 随机 mem 有 loss 差）后再做。
+- **检索工程**：`BM25Retriever` 带倒排（token→文档表），`query` 只取 idf
+  最高的 64 个词做候选、单遍打分 + 堆取 top-K；33 万文档下全扫描 5.4s/查
+  → 64 词 2.4s → 训练用 12 词 0.76s（top-1 与全量一致，增广够用）。
+  老索引无倒排时 `load` 就地重建。SFT 目录（instruction 列）建库加 `--sft`。
 - **会话增量状态落盘**（`session_cache.py` 的 `SessionCache`）：存 MLA latent +
   线性层状态 + 短卷积尾，`save()/load()` 跨进程恢复，turn 之间不丢长上下文。
   库侧组件（推理路径专用，不进训练循环）；服务进程按会话 id 复用待接线。

@@ -99,11 +99,16 @@ def encode_memories_mean(
 
 def retrieve_for_texts(
     retriever, texts: list[str], k: int = 2, max_chars: int = 2000,
+    max_terms: int = 64,
 ) -> list[list[str]]:
-    """每段输入捞 top-K 文档文本（截断防爆），返回与 texts 对齐的列表."""
+    """每段输入捞 top-K 文档文本（截断防爆），返回与 texts 对齐的列表.
+
+    max_terms 透传给 BM25（训练吞吐：12 词约 0.8s/查、top-1 与全量一致；
+    离线精排用默认 64）。
+    """
     out: list[list[str]] = []
     for text in texts:
-        hits = retriever.query(text[-max_chars:], k=k)
+        hits = retriever.query(text[-max_chars:], k=k, max_terms=max_terms)
         out.append([doc for doc, _ in hits])
     return out
 

@@ -15,21 +15,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
-def iter_chunks(root: str, chunk: int = 600, overlap: int = 100):
-    """按段落切块，块大小约 chunk，重叠 overlap（防跨块知识断裂）."""
-    from src.llm.local.data import iter_local_texts
+def iter_chunks(root: str, chunk: int = 600, overlap: int = 100, sft: bool = False):
+    """按段落切块，块大小约 chunk，重叠 overlap（防跨块知识断裂）.
 
+    sft=True 时走 iter_local_sft（instruction/input/output 拼文本），
+    否则走 iter_local_texts（纯文 .txt/.md/.jsonl/parquet）。
+    """
+    from src.llm.local.data import iter_local_sft, iter_local_texts
+
+    if sft:
+        for instruction, inp, output in iter_local_sft(root):
+            text = f"{instruction}\n{inp}\n{output}" if inp else f"{instruction}\n{output}"
+            for ch in _split_text(text, chunk, overlap):
+                yield ch
+        return
     for text in iter_local_texts(root):
-        paras = [p.strip() for p in text.split("\n") if len(p.strip()) > 20]
-        buf = ""
-        for p in paras:
-            if len(buf) + len(p) > chunk and buf:
-                yield buf
-                buf = buf[-overlap:] + p
-            else:
-                buf = buf + ("\n" if buf else "") + p
-        if buf:
+        for ch in _split_text(text, chunk, overlap):
+            yield ch
+
+
+def _split_text(text: str, chunk: int, overlap: int):
+    """单文本按段落切块（块约 chunk 字符，重叠 overlap）."""
+    paras = [p.strip() for p in text.split("\n") if len(p.strip()) > 20]
+    buf = ""
+    for p in paras:
+        if len(buf) + len(p) > chunk and buf:
             yield buf
+            buf = buf[-overlap:] + p
+        else:
+            buf = buf + ("\n" if buf else "") + p
+    if buf:
+        yield buf
 
 
 def main(argv=None) -> int:
@@ -41,12 +57,14 @@ def main(argv=None) -> int:
     p.add_argument("--out", required=True, help="输出路径（.bm25）")
     p.add_argument("--chunk", type=int, default=600, help="块大小（字符）")
     p.add_argument("--overlap", type=int, default=100, help="块间重叠（字符）")
+    p.add_argument("--sft", action="store_true",
+                   help="SFT 目录（instruction/input/output 拼文本，而非纯文）")
     p.add_argument("--limit", type=int, default=0, help="最多块数（0=全量）")
     args = p.parse_args(argv)
 
     r = BM25Retriever()
     n = 0
-    for i, ch in enumerate(iter_chunks(args.data, args.chunk, args.overlap)):
+    for i, ch in enumerate(iter_chunks(args.data, args.chunk, args.overlap, args.sft)):
         if args.limit and n >= args.limit:
             break
         r.add(str(n), ch)

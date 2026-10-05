@@ -115,3 +115,36 @@ def test_chunk_without_interleaved_raises():
     ids, mask = _fake_chunks()
     with pytest.raises(ValueError):
         m(x, chunk_ids=ids, chunk_mask=mask)
+
+
+def test_postings_query_matches_full_scan():
+    """倒排剪枝不改变排序（查询词 <64 个时与全扫描逐位一致）."""
+    import random
+
+    from src.llm.local.retrieval import BM25Retriever
+
+    rng = random.Random(0)
+    vocab = [chr(0x4E00 + i) for i in range(60)]
+    r = BM25Retriever()
+    for i in range(50):
+        r.add(str(i), "".join(rng.choice(vocab) for _ in range(40)))
+    q = "".join(rng.choice(vocab) for _ in range(30))
+    assert len(set(q)) < 64
+    fast = r.query(q, k=5)
+    del r.postings  # 删倒排，回落全扫描当朴素参照
+    slow = r.query(q, k=5)
+    assert [d for d, _ in fast] == [d for d, _ in slow]
+    for (_, s1), (_, s2) in zip(fast, slow):
+        assert abs(s1 - s2) < 1e-9
+
+
+def test_index_without_postings_still_queries():
+    """老索引（无倒排属性）直接 query 不崩（全扫描回落）."""
+    from src.llm.local.retrieval import BM25Retriever
+
+    r = BM25Retriever()
+    r.add("a", "梯度下降学习率调度")
+    r.add("b", "数据库索引查询优化")
+    del r.postings
+    hits = r.query("梯度下降", k=2)
+    assert hits and hits[0][0] == "a"
