@@ -211,6 +211,15 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   切块构建，`BM25Retriever.save/load` 走 pickle。
   无有效记忆的行退化为零增量（全 mask 防 NaN）；评测/生成路径不传 mem，
   量的是 backbone 本体（retro 增益需专用评测，见下）。
+- **RETRO V2 交错**（`--retro-every N --retro-len L`，默认 0=保持 v1 单点）：
+  每 N 层交错一个同构融合块，吃 token 级 chunk mem，可逐字抄（v1 均值向量
+  只能给话题方向）。chunk 由 `build_batch_chunk_ids` 产出 id + mask，
+  模型侧 frozen embedding 查表编码（no_grad，不吃梯度；autocast 下自动同精度）。
+  同样零初始化恒等，`_decode_step` 已同步（w_o 非零后 prefill+解码 vs 全前向
+  单测锁定）。注意 chunk mem 不做因果 mask、同源未过滤，是"开卷"语义：
+  自检索的 loss 虚低由专用评测度量，勿与 backbone val 比大小；
+  当前推荐用法是 B（mid-training 增广 + 尾段关掉冷却），A（真 RAG 上线）
+  等检索升级 + mem 消融诊断（真 mem vs 随机 mem 有 loss 差）后再做。
 - **会话增量状态落盘**（`session_cache.py` 的 `SessionCache`）：存 MLA latent +
   线性层状态 + 短卷积尾，`save()/load()` 跨进程恢复，turn 之间不丢长上下文。
   库侧组件（推理路径专用，不进训练循环）；服务进程按会话 id 复用待接线。

@@ -6,6 +6,13 @@ cross-attention 融合块，memory = 检索文本的 embedding 均值。
 信号弱但管线全通（检索→编码→融合→loss），质量验证靠 eval harness；
 v2 升级项：frozen 编码器 / kNN-LM 式插值（见 README）。
 
+V2（已实现）：`retro_every>0` 时每 N 层交错一个同构融合块，吃 token 级
+chunk mem（`build_batch_chunk_ids` 产出 id + mask，模型侧 frozen embedding
+查表编码，可逐字抄）；`retro_every=0` 保持 v1 单点均值行为。
+注意：chunk mem 不做因果 mask（含当前位置之后的 token），同源 chunk
+未过滤——v1/v2 都是"开卷"语义，自检索的 loss 虚低由专用评测度量，
+勿与 backbone val 直接比大小。
+
 默认关闭（config.retro_enabled=False 时模块不存在，state_dict 兼容）。
 """
 
@@ -126,3 +133,31 @@ def build_batch_mem(
         rows.append(vecs)
         out_mask.append([True] * k)
     return torch.stack(rows, dim=0), torch.tensor(out_mask, dtype=torch.bool)
+
+
+def build_batch_chunk_ids(
+    tokenizer,
+    hits: list[list[str]],
+    k: int,
+    chunk_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """V2 交错融合的输入：(b, K, L) 文档 token id + (b, K, L) 有效掩码.
+
+    每命中文档截断到 chunk_len，pad id=0 补齐并标 False（空文档整行 False，
+    融合侧靠全 mask 置零退化为恒等，不出 NaN）。模型侧用 frozen embedding
+    查表编码（no_grad，不吃梯度），与主干同设备/同精度由调用方保证。
+    """
+    rows: list[list[int]] = []
+    masks: list[list[bool]] = []
+    for doc_list in hits:
+        docs = doc_list[:k]
+        ids_list = [tokenizer.encode(d, add_bos=False)[:chunk_len] for d in docs]
+        while len(ids_list) < k:
+            ids_list.append([])
+        row = [ids + [0] * (chunk_len - len(ids)) for ids in ids_list]
+        mask = [[True] * len(ids) + [False] * (chunk_len - len(ids))
+                for ids in ids_list]
+        rows.append(row)
+        masks.append(mask)
+    return (torch.tensor(rows, dtype=torch.long),
+            torch.tensor(masks, dtype=torch.bool))

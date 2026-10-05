@@ -114,7 +114,8 @@ nvidia-smi -l 2                   # 显存（应稳定 ~8GB）
   记忆层，value 零初始化，恒等起点，开关不破坏已有权重；开训前先用
   `scripts/init_memory.py` 跑 B 方案校准产出起始权重，再 `--sft-init` 载入）；
 - 检索融合：`--enable-retro --retro-db <pickle>`（RETRO-lite，BM25 捞回片段拼成前缀
-  mem 段；索引用 `scripts/build_retrieval.py` 构建）；
+  mem 段；索引用 `scripts/build_retrieval.py` 构建）；V2 交错用
+  `--retro-every N --retro-len L`（每 N 层融合 token 级 chunk，frozen 编码）；
 - 会话落盘：`SessionCache`（MLA latent / 线性状态 / 卷积尾跨 turn、跨进程存取，
   库侧组件，服务进程按会话 id 复用）；
 - 推理侧：直觉头（`heads.py`，冻结 backbone 上的毫瓦级决策器）+ BM25 检索（`retrieval.py`）。

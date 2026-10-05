@@ -9,11 +9,12 @@ from src.llm.local.linear_attn import GatedDeltaLite
 from src.llm.local.memory import ProductKeyMemory
 from src.llm.local.mla import RMSNorm
 from src.llm.local.moe import FineGrainedMoE
+from src.llm.local.retro import RetroFusion
 from src.llm.local.sparse_attn import SparseMLAModule
 
 
 class HybridBlock(nn.Module):
-    """单个 Hybrid 块：注意力（MLA/线性二选一）+ 细粒度 MoE + 可选记忆层."""
+    """单个 Hybrid 块：注意力（MLA/线性二选一）+ 细粒度 MoE + 可选记忆层 + 可选 RETRO 交错融合."""
 
     def __init__(
         self,
@@ -41,6 +42,8 @@ class HybridBlock(nn.Module):
         use_memory: bool = False,
         memory_slots: int = 4096,
         memory_topk: int = 8,
+        use_retro: bool = False,
+        retro_heads: int = 8,
     ):
         super().__init__()
         self.full_attn = full_attn
@@ -65,16 +68,24 @@ class HybridBlock(nn.Module):
             ProductKeyMemory(d_model, memory_slots, memory_topk, dropout)
             if use_memory else None
         )
+        # RETRO 交错融合（默认 None；开后在记忆层之后再残差并联，同构零初始化恒等）
+        self.retro: RetroFusion | None = (
+            RetroFusion(d_model, retro_heads, dropout)
+            if use_retro else None
+        )
 
     def forward(
         self,
         h: torch.Tensor,
         past: tuple | torch.Tensor | None = None,
         return_state: bool = True,
+        retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
         """前向：past 为解码缓存（MLA 传 latent 元组，线性层传状态矩阵）.
 
         return_state=False 时注意力层不返回缓存（训练路径）。
+        retro_mem=(mem_h, mem_mask)：V2 交错融合的 frozen chunk 编码；
+        None 或本层无融合块时跳过（backbone 本体，评测/生成路径）。
         """
         a_out, new_past = self.attn(self.norm1(h), past, return_state)  # type: ignore[arg-type]
         h = h + a_out
@@ -83,4 +94,7 @@ class HybridBlock(nn.Module):
         if self.memory is not None:
             # 记忆层自带 norm + 残差，直接叠加
             h = self.memory(h)
+        if self.retro is not None and retro_mem is not None:
+            mh, mm = retro_mem
+            h = self.retro(h, mh, mm)
         return h, (new_past, aux)

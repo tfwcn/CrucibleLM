@@ -15,6 +15,8 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
     """按配置构建单个 Hybrid 块（模型与迁移工具共用，避免参数漂移）."""
     use_memory = (config.memory_every > 0
                   and layer_idx % config.memory_every == 0)
+    use_retro = (config.retro_enabled and config.retro_every > 0
+                 and layer_idx % config.retro_every == 0)
     return HybridBlock(
         d_model=config.d_model,
         n_heads=config.n_heads,
@@ -40,6 +42,8 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         use_memory=use_memory,
         memory_slots=config.memory_slots,
         memory_topk=config.memory_topk,
+        use_retro=use_retro,
+        retro_heads=config.retro_heads,
     )
 
 
@@ -80,7 +84,7 @@ class TinyLLM(nn.Module):
         self.mtp = MTPHead(config) if config.mtp_depth > 0 else None
         # RETRO 融合（默认 None：无参数，state_dict 兼容；开后处理 mem 输入）
         self.retro: nn.Module | None = None
-        if config.retro_enabled:
+        if config.retro_enabled and config.retro_every <= 0:
             from src.llm.local.retro import RetroFusion
 
             self.retro = RetroFusion(
@@ -110,14 +114,20 @@ class TinyLLM(nn.Module):
         return_token_losses: bool = False,
         mem: torch.Tensor | None = None,
         mem_mask: torch.Tensor | None = None,
+        chunk_ids: torch.Tensor | None = None,
+        chunk_mask: torch.Tensor | None = None,
     ) -> dict:
         """前向：训练时传 targets 返回组合 loss，推理时只返回 logits.
 
         loss = 主 CE(t+1) + mtp_weight * MTP CE(t+2) + 各层 aux_loss 之和。
         return_token_losses=True 时附带逐 token 主 loss（RHO 选择用，
         ignore 位为 0 且反向无梯度，自然不会被选中）。
-        mem/mem_mask: 检索记忆 (b, M, d)/(b, M)，仅 retro_enabled 时生效；
-        retro 开启但 mem 为空（评测/生成路径）则跳过融合，测 backbone 本体。
+        mem/mem_mask: v1 单点检索记忆 (b, M, d)/(b, M)，仅 retro_enabled
+        且 retro_every=0 时生效；retro 开启但 mem 为空（评测/生成路径）
+        则跳过融合，测 backbone 本体。
+        chunk_ids/chunk_mask: v2 交错融合的 (b, K, L)/(b, K, L) 文档 token，
+        仅 retro_every>0 的层生效；模型侧 frozen embedding 查表编码
+        （no_grad，不吃梯度；autocast 下自动同精度）。
         """
         if input_ids.shape[1] > self.config.max_seq_len:
             raise ValueError(
@@ -126,13 +136,26 @@ class TinyLLM(nn.Module):
             )
         h = self.embed(input_ids)
         aux_total = torch.zeros((), device=h.device, dtype=h.dtype)
+        # V2 交错 mem：frozen 查表一次编码，供各融合层共享（无梯度）
+        retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None
+        if chunk_ids is not None:
+            if not self._has_interleaved_retro():
+                raise ValueError("传了 chunk_ids 但交错融合未开（retro_every=0）")
+            with torch.no_grad():
+                b, kk, ll = chunk_ids.shape
+                mem_h = self.embed(chunk_ids.reshape(b, kk * ll)).reshape(
+                    b, kk * ll, -1)
+            retro_mem = (mem_h, chunk_mask.reshape(b, kk * ll)
+                         if chunk_mask is not None else None)
+        elif self._has_interleaved_retro():
+            pass  # 评测/生成无检索：各层跳过，测 backbone 本体
         for layer in self.layers:
             # 梯度检查点只在训练时生效（推理/生成走正常路径，保留解码缓存）；
             # 训练不返回解码缓存（return_state=False），省状态循环与两次投影
             if self.config.grad_ckpt and self.training:
-                h, aux_total = self._layer_ckpt(layer, h, aux_total)
+                h, aux_total = self._layer_ckpt(layer, h, aux_total, retro_mem)
             else:
-                h, (_, aux) = layer(h, None, False)
+                h, (_, aux) = layer(h, None, False, retro_mem)
                 aux_total = aux_total + aux
         h = self.final_norm(h)
         if self.retro is not None:
@@ -143,7 +166,7 @@ class TinyLLM(nn.Module):
             else:
                 h = self.retro(h, mem, mem_mask)
         elif mem is not None:
-            raise ValueError("传了 mem 但 retro_enabled=False")
+            raise ValueError("传了 v1 mem 但单点融合未开（retro_enabled=False 或 retro_every>0 走交错）")
         logits = self.lm_head(h)
         out: dict = {"logits": logits, "aux_loss": aux_total.detach()}
         if targets is None:
@@ -175,14 +198,19 @@ class TinyLLM(nn.Module):
         out["loss"] = loss
         return out
 
+    def _has_interleaved_retro(self) -> bool:
+        """是否有 V2 交错融合层（retro_enabled 且 retro_every>0）."""
+        return bool(self.config.retro_enabled and self.config.retro_every > 0)
+
     def _layer_ckpt(
-        self, layer: HybridBlock, h: torch.Tensor, aux_total: torch.Tensor
+        self, layer: HybridBlock, h: torch.Tensor, aux_total: torch.Tensor,
+        retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """单层梯度检查点：重算换显存（训练 past=None，不用解码缓存）."""
         from torch.utils.checkpoint import checkpoint
 
         def fn(hh: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            out, (_, aux) = layer(hh, None, False)
+            out, (_, aux) = layer(hh, None, False, retro_mem)
             return out, aux
 
         h_new, aux = checkpoint(fn, h, use_reentrant=False)
@@ -212,15 +240,19 @@ class TinyLLM(nn.Module):
             if was_training:
                 self.train()
 
-    def _prefill(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, list]:
+    def _prefill(
+        self, input_ids: torch.Tensor,
+        retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+    ) -> tuple[torch.Tensor, list]:
         """Prefill：整段 prompt 一次前向，返回 (末位置 hidden 前的 h, 每层缓存）.
 
         h 为全序列 hidden（调用方取 h[:, -1:] 算 logits）；pasts 供单步解码续跑。
+        retro_mem：V2 交错融合的 frozen chunk 编码（生成带检索时传，与 decode 同值）。
         """
         h = self.embed(input_ids)
         pasts: list = []
         for layer in self.layers:
-            h, (p, _) = layer(h)
+            h, (p, _) = layer(h, retro_mem=retro_mem)
             pasts.append(p)
         return self.final_norm(h), pasts
 
@@ -245,7 +277,8 @@ class TinyLLM(nn.Module):
         return next_logits.argmax(-1, keepdim=True)
 
     def _decode_step(
-        self, nxt: torch.Tensor, pasts: list
+        self, nxt: torch.Tensor, pasts: list,
+        retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
     ) -> tuple[torch.Tensor, list]:
         """单 token 步进各层：返回 (新 hidden, 新缓存），供流式/批量生成共用."""
         hh = self.embed(nxt)
@@ -262,6 +295,10 @@ class TinyLLM(nn.Module):
                 # 记忆层也在 block 前向里（MoE 之后残差并联）：解码必须同步走，
                 # 否则 value 训出非零后增量解码与全前向分叉（单测锁定）
                 hh = layer.memory(hh)
+            if layer.retro is not None and retro_mem is not None:
+                # V2 交错融合同样同步（block 前向末节；w_o 非零后漏掉即分叉）
+                mh, mm = retro_mem
+                hh = layer.retro(hh, mh, mm)
             new_pasts.append(p2)
         return self.final_norm(hh), new_pasts
 
@@ -353,9 +390,13 @@ class TinyLLM(nn.Module):
         n_mem_layers = sum(1 for layer in self.layers
                            if getattr(layer, "memory", None) is not None)
         mem_active = n_mem_layers * c.memory_topk * c.d_model * 2
-        # RETRO 融合：整块参与（单点，开后计入）
+        # RETRO 融合：整块参与（单点开后计入；交错按层数累加）
         retro_active = (sum(p.numel() for p in self.retro.parameters())
                         if self.retro is not None else 0)
+        retro_active += sum(
+            sum(p.numel() for p in layer.retro.parameters())
+            for layer in self.layers
+            if getattr(layer, "retro", None) is not None)
         active = (
             self.embed.weight.numel()
             + per_layer_active * c.n_layers

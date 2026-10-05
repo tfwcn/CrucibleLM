@@ -62,6 +62,10 @@ class SmallLLMConfig:
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
     retro_enabled: bool = False
     retro_heads: int = 8
+    # V2 交错：0=v1 单点（final_norm 后融合均值 mem）；>0=每 N 层一个融合块，
+    # 吃 token 级 chunk mem（frozen embedding 编码，可逐字抄）
+    retro_every: int = 0
+    retro_chunk_len: int = 64  # 每检索文档取多少 token（padding 补齐，mask 标 False）
     # 记忆层：0=关闭（无参数，checkpoint 通用）；>0=每 N 个 block 加一个 ProductKeyMemory
     memory_every: int = 0
     memory_slots: int = 4096  # 槽位数（64×64 子码本）

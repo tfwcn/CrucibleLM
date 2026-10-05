@@ -119,6 +119,8 @@ out, use `--hf-endpoint https://hf-mirror.com`.
   before training, then `--sft-init <calibrated>/model.pt`);
 - RETRO-lite: `--enable-retro --retro-db <pickle>` (BM25-retrieved chunks fused as a
   prefix memory segment; build the index with `scripts/build_retrieval.py`);
+  V2 interleave with `--retro-every N --retro-len L` (per-layer fusion over
+  token-level chunks, frozen-embedding encoded);
 - Session state: `SessionCache` (persist MLA latents, linear states and conv tails
   across turns and processes; library-side, used by the serving path);
 - Inference side: intuition heads (`heads.py`, milliwatt decision heads on a frozen backbone)

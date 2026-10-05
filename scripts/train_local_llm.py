@@ -109,6 +109,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--retro-db", default="",
                    help="RETRO 检索库路径（BM25 索引落盘前请先跑 build_retrieval；空=关闭）")
     p.add_argument("--retro-k", type=int, default=2, help="每段检索取 top-K 文档")
+    p.add_argument("--retro-len", type=int, default=64,
+                   help="V2 交错：每文档取多少 token（仅 retro_every>0 时用）")
+    p.add_argument("--retro-every", type=int, default=0,
+                   help="V2 交错：每 N 层一个融合块；0=v1 单点（final_norm 后融合均值）")
     p.add_argument("--enable-retro", action="store_true",
                    help="模型侧开启 RETRO 融合（需 --retro-db 提供，仅在 mid-training 起用）")
     p.add_argument("--enable-memory", action="store_true",
@@ -481,7 +485,8 @@ def _forward_batch(model: TinyLLM, batch, device, distiller=None,
                    kd_alpha: float = 0.0, id_to_char: dict | None = None,
                    rho_keep: float = 0.0, ema_model=None,
                    ema_weight: float = 0.0, rho_ref: str = "none",
-                   do_kd: bool = True, mem=None, mem_mask=None) -> dict:
+                   do_kd: bool = True, mem=None, mem_mask=None,
+                   chunk_ids=None, chunk_mask=None) -> dict:
     """单个 micro-batch 前向（预训练与 SFT 统一入口，SFT 带 -100 掩码）.
 
     distiller 非空时加锚点 KL（跨词表蒸馏）：老师内部 no_grad 只出分布，
@@ -495,10 +500,12 @@ def _forward_batch(model: TinyLLM, batch, device, distiller=None,
 
     if isinstance(batch, tuple):
         x, y = (t.to(device) for t in batch)
-        out = model(x, targets=y, return_token_losses=True, mem=mem, mem_mask=mem_mask)
+        out = model(x, targets=y, return_token_losses=True, mem=mem, mem_mask=mem_mask,
+                    chunk_ids=chunk_ids, chunk_mask=chunk_mask)
     else:
         x = batch.to(device)
-        out = model(x, targets=x, return_token_losses=True, mem=mem, mem_mask=mem_mask)
+        out = model(x, targets=x, return_token_losses=True, mem=mem, mem_mask=mem_mask,
+                    chunk_ids=chunk_ids, chunk_mask=chunk_mask)
     if rho_keep > 0:
         if rho_ref == "teacher" and do_kd and distiller is not None and id_to_char is not None:
             from src.llm.local.distill import select_by_excess
@@ -563,6 +570,14 @@ def main(argv=None) -> int:
     # 检索/记忆：显式 flag 才覆盖 config（默认零变化）
     if args.enable_retro:
         config.retro_enabled = True
+        config.retro_every = max(args.retro_every, 0)
+        config.retro_chunk_len = args.retro_len
+        if config.retro_every > 0:
+            if config.retro_chunk_len < 1:
+                raise SystemExit("--retro-len 至少为 1")
+            print(f"RETRO V2 交错已开：每 {config.retro_every} 层一个融合块，"
+                  f"每文档 {config.retro_chunk_len} token（frozen 编码）",
+                  flush=True)
     if args.enable_memory:
         config.memory_every = max(args.memory_every, 1)
         config.memory_slots = args.memory_slots
@@ -776,11 +791,13 @@ def main(argv=None) -> int:
                     break
                 do_kd = (micro_i % kd_every == 0)
                 kd_w = args.kd_alpha * kd_every if do_kd else 0.0
-                # RETRO：按 batch 检出 top-K 融合（仅 --enable-retro 且索引就绪）
-                mem, mem_mask = None, None
+                # RETRO：按 batch 检出 top-K 融合（仅 --enable-retro 且索引就绪）；
+                # retro_every>0 走 V2 交错（chunk token id，模型侧 frozen 编码），
+                # =0 走 v1 单点（均值向量 mem）
+                mem, mem_mask, chunk_ids, chunk_mask = None, None, None, None
                 if retro_index is not None and args.enable_retro:
                     from src.llm.local.retro import (
-                        build_batch_mem, retrieve_for_texts)
+                        build_batch_chunk_ids, build_batch_mem, retrieve_for_texts)
 
                     texts = []
                     x_rows = batch[0] if isinstance(batch, tuple) else batch
@@ -789,21 +806,29 @@ def main(argv=None) -> int:
                             id_to_char.get(int(i), '') for i in row.tolist() if int(i) > 3)
                         texts.append(chars[-1000:])
                     hits = retrieve_for_texts(retro_index, texts, k=args.retro_k)
-                    mem, mem_mask = build_batch_mem(
-                        model.embed, tok, hits, args.retro_k)
-                    mem = mem.to(device)
-                    mem_mask = mem_mask.to(device)
+                    if args.retro_every > 0:
+                        chunk_ids, chunk_mask = build_batch_chunk_ids(
+                            tok, hits, args.retro_k, args.retro_len)
+                        chunk_ids = chunk_ids.to(device)
+                        chunk_mask = chunk_mask.to(device)
+                    else:
+                        mem, mem_mask = build_batch_mem(
+                            model.embed, tok, hits, args.retro_k)
+                        mem = mem.to(device)
+                        mem_mask = mem_mask.to(device)
                 if use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         out = _forward_batch(model, batch, device,
                                              distiller, kd_w, id_to_char,
                                              args.rho_keep, ema_model, args.ema_weight,
-                                             args.rho_ref, do_kd, mem, mem_mask)
+                                             args.rho_ref, do_kd, mem, mem_mask,
+                                             chunk_ids, chunk_mask)
                 else:
                     out = _forward_batch(model, batch, device,
                                          distiller, kd_w, id_to_char,
                                          args.rho_keep, ema_model, args.ema_weight,
-                                         args.rho_ref, do_kd, mem, mem_mask)
+                                         args.rho_ref, do_kd, mem, mem_mask,
+                                         chunk_ids, chunk_mask)
                 tokens_seen += batch[0].numel() if isinstance(batch, tuple) else batch.numel()
                 (out["loss"] / args.accum).backward()
                 accum_stats = {k: float(v.detach()) if torch.is_tensor(v) else v
