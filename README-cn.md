@@ -107,6 +107,8 @@ nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约
 关键默认值（不写即生效）：`--save-every 100` 存盘 + `--keep-last 20` 只留 20 个快照、
 `--shuffle-buffer 512`、`--prefetch 4`、AdamW 优化器。续跑直接加 `--resume`
 （权重/优化器/step/数据游标全续）。直连 HF 超时请用 `--hf-endpoint https://hf-mirror.com`。
+长命令已收进 `configs/*.yaml`：`python scripts/run_train.py configs/sft5.yaml` 前台跑
+（`--dry-run` 只打印命令；`lr=1e-5` 这种 `key=value` 临时覆盖；配置自动存档到 `ckpt-dir/run.yaml`，复现认这个文件）。
 
 ## 进阶开关（默认全关，详见 docs/ARCHITECTURE.md）
 

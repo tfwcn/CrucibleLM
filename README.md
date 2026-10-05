@@ -108,6 +108,9 @@ Key defaults (active when not specified): `--save-every 100` checkpoints + `--ke
 snapshots, `--shuffle-buffer 512`, `--prefetch 4`, AdamW optimizer. Resume anytime with
 `--resume` (weights/optimizer/steps/data cursor all restored). If direct HF access times
 out, use `--hf-endpoint https://hf-mirror.com`.
+Long commands live in `configs/*.yaml`: `python scripts/run_train.py configs/sft5.yaml`
+runs in the foreground (`--dry-run` prints only; `key=value` overrides inline;
+the config is archived to `ckpt-dir/run.yaml`, which is the file to trust for repro).
 
 ## Advanced switches (all default-off, see docs/ARCHITECTURE.md)
 
