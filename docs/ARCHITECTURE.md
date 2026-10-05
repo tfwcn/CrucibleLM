@@ -195,12 +195,22 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
 - **Product-Key 记忆层**（`--enable-memory --memory-every N --memory-slots M
   --memory-topk K`）：每 N 层插一个记忆层，把 hidden 投到 M 个 slot 上取 top-K 读出。
   `value` 零初始化 → **恒等起点**，开开关不破坏已有权重（单测锁死"初始化前后输出一致"）。
-  key 用 B 方案初始化：`init_memory_from_activations()` 对语料 hidden 做 k-means 聚类，
-  簇心当 key；不做 logit 蒸馏，那是另一套配方。
+  key 用 B 方案初始化：`scripts/init_memory.py` 冻结 backbone 跑校准集
+  （SFT 模板拼文本，默认 512 段），逐层收集记忆层输入 hidden 做 k-means，
+  簇心当 key（`init_memory_from_activations()`，value 保持零）。
+  用法：先 `init_memory.py --src <旧model.pt> --out <新目录>` 产出可严格载入的
+  起始权重，再 `--sft-init <新目录/model.pt> --enable-memory` 开训；
+  `--memory-slots` 须为完全平方数（√M×√M 子码本），否则启动时直接报错。
+  注意：`model._decode_step` 手拼了 attn+moe，记忆层必须同步跟进
+  （零初始化阶段恒等看不出来，value 训出非零后才分叉，教训见 pitfalls 第 7 条）；
+  表参数随模型设备走（构造时先放 CPU，`model.to(device)` 会整体搬运）。
+  不做 logit 蒸馏，那是另一套配方。
 - **RETRO-lite 检索融合**（`--enable-retro --retro-db <pickle> --retro-k K
   --retro-heads H`）：每个 chunk 用 BM25 检索 top-K 邻居，拼成前缀 mem 段送进模型。
   `RetroFusion` 的 `w_o` 零初始化，同样恒等起点；索引由 `scripts/build_retrieval.py`
   切块构建，`BM25Retriever.save/load` 走 pickle。
+  无有效记忆的行退化为零增量（全 mask 防 NaN）；评测/生成路径不传 mem，
+  量的是 backbone 本体（retro 增益需专用评测，见下）。
 - **会话增量状态落盘**（`session_cache.py` 的 `SessionCache`）：存 MLA latent +
   线性层状态 + 短卷积尾，`save()/load()` 跨进程恢复，turn 之间不丢长上下文。
   库侧组件（推理路径专用，不进训练循环）；服务进程按会话 id 复用待接线。

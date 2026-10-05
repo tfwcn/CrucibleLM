@@ -114,7 +114,9 @@ out, use `--hf-endpoint https://hf-mirror.com`.
 - Cross-tokenizer distillation: `--kd-teacher` (MiniCPM 0.5B, anchor KL);
 - Architecture migration: `scripts/migrate_model.py` (deepen/widen/prune + `--init-checkpoint`);
 - Memory layer: `--enable-memory --memory-slots/--memory-topk/--memory-every`
-  (Product-Key memory, zero-initialized values so it starts as an exact identity);
+  (Product-Key memory, zero-initialized values so it starts as an exact identity;
+  initialize keys from frozen-backbone activations with `scripts/init_memory.py`
+  before training, then `--sft-init <calibrated>/model.pt`);
 - RETRO-lite: `--enable-retro --retro-db <pickle>` (BM25-retrieved chunks fused as a
   prefix memory segment; build the index with `scripts/build_retrieval.py`);
 - Session state: `SessionCache` (persist MLA latents, linear states and conv tails
