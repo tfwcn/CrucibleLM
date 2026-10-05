@@ -201,10 +201,14 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   用法：先 `init_memory.py --src <旧model.pt> --out <新目录>` 产出可严格载入的
   起始权重，再 `--sft-init <新目录/model.pt> --enable-memory` 开训；
   `--memory-slots` 须为完全平方数（√M×√M 子码本），否则启动时直接报错。
-  注意：`model._decode_step` 手拼了 attn+moe，记忆层必须同步跟进
+  注意两点：一是 `vocab_size` 保持预设容量（SFT 扩词复用空行不改形状，
+  校准脚本绝不能按词表实际字符数缩表，否则 embedding 覆写不上还静默成功，
+  曾实测覆写丢失）；二是 `model._decode_step` 手拼了 attn+moe，记忆层必须同步跟进
   （零初始化阶段恒等看不出来，value 训出非零后才分叉，教训见 pitfalls 第 7 条）；
   表参数随模型设备走（构造时先放 CPU，`model.to(device)` 会整体搬运）。
   不做 logit 蒸馏，那是另一套配方。
+  双开组合起点：mem 校准权重 + retro 全零键 overlap 拼成 both-init
+  （缺键必须全是 retro，`--sft-init` 严格载入且与单记忆版 logits 差 0.0 才开训）。
 - **RETRO-lite 检索融合**（`--enable-retro --retro-db <pickle> --retro-k K
   --retro-heads H`）：每个 chunk 用 BM25 检索 top-K 邻居，拼成前缀 mem 段送进模型。
   `RetroFusion` 的 `w_o` 零初始化，同样恒等起点；索引由 `scripts/build_retrieval.py`
