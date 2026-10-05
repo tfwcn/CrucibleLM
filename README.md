@@ -118,7 +118,6 @@ the config is archived to `ckpt-dir/run.yaml`, which is the file to trust for re
 |---|---|---|---|
 | base pretrain | `pretrain-base.yaml` | hq+ultra -> `data/llm-ckpt` | foundation (vanilla proven) |
 | full single-pass SFT | `sft-full.yaml` | base -> `data/llm-sft` | **latest flow** (next section) |
-| sft5 | `configs-local/sft5.yaml` (local experiment, not committed) | sft4-ckpt200 -> `data/llm-sft5` | live (refs historical weights, local only) |
 
 The staged trial history (sft1->sft2->sft4) served its purpose and is removed;
 dig git history for archaeology. One conclusion survived: **with RHO + replay +

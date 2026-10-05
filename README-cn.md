@@ -116,7 +116,6 @@ nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约
 |---|---|---|---|
 | base 预训练 | `pretrain-base.yaml` | hq+ultra → `data/llm-ckpt` | 地基（vanilla 跑通） |
 | SFT 全量单遍 | `sft-full.yaml` | base → `data/llm-sft` | **最新流程**（下节） |
-| sft5 | `configs-local/sft5.yaml`（本机实验，不入库） | sft4-ckpt200 → `data/llm-sft5` | 进行中（引用历史产物，仅本机可跑） |
 
 分阶段试错史（sft1→sft2→sft4）已验证结论、使命结束，配置从库里删除，
 需要考古看 git 历史。结论只有一条：**RHO + 回放 + EMA 到位后，
