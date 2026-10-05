@@ -1031,3 +1031,20 @@ def test_save_best_roundtrip(tmp_path):
     m2.load_state_dict(torch.load(tmp_path / "best" / "model.pt"))
     for (n1, p1), (n2, p2) in zip(m.named_parameters(), m2.named_parameters()):
         assert n1 == n2 and torch.equal(p1, p2)
+
+
+def test_run_train_argv_mapping():
+    """启动器映射：YAML 键转 CLI（开关/值/跳过），未知键报错."""
+    import run_train
+
+    argv = run_train._argv_from_cfg({
+        "phase": "sft", "max_steps": 100, "enable_memory": True,
+        "enable_retro": False, "lr": None, "description": "x",
+    })
+    assert argv == ["--phase", "sft", "--max-steps", "100", "--enable-memory"]
+    try:
+        run_train._argv_from_cfg({"max_stepz": 1})
+    except SystemExit as e:
+        assert "max_stepz" in str(e)
+    else:
+        raise AssertionError("未知键应报错")
