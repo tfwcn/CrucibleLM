@@ -1,0 +1,36 @@
+# SFT 全量单遍（最新流程）：base 出发，一次开全优化组合 + Belle 混合
+# 前提：先跑第 4 步校准产出 data/llm-sft-both-init-base/model.pt
+# 用法：python scripts/run_train.py configs/sft-full.yaml
+description: optimal single-pass sft from base, all combos on
+
+phase: sft
+preset: base
+seq_len: 2048
+batch: 4
+accum: 8
+sft_init: data/llm-sft-both-init-base/model.pt
+max_steps: 2000
+lr: 1.0e-4
+warmup: 20
+grad_ckpt: true
+ckpt_dir: data/llm-sft
+vocab: data/llm-ckpt/vocab.json
+data: local
+local_path: "data/sft-zh:3,data/sft-belle:1"
+extend_vocab: true
+eval_every: 50
+sample_every: 100
+kd_teacher: data/teacher-0.5b
+kd_alpha: 0.5
+kd_every: 8
+rho_keep: 0.5
+rho_ref: teacher
+ema_every: 10
+sft_replay_dir: data/hq-zh
+sft_replay_ratio: 0.15
+enable_memory: true
+enable_retro: true
+retro_db: data/retro-sft.pkl
+retro_k: 2
+retro_every: 4
+retro_len: 64

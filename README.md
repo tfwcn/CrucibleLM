@@ -116,18 +116,19 @@ the config is archived to `ckpt-dir/run.yaml`, which is the file to trust for re
 
 | Stage | Config | From -> to | Status |
 |---|---|---|---|
-| base pretrain | `pretrain-base.yaml` | hq+ultra -> `data/llm-ckpt` | done (5300 steps, eval 4.60) |
-| SFT stage 1 | `sft1.yaml` | llm-ckpt -> `data/llm-sft` | done (956 steps, eval 2.65) |
-| SFT stage 2 | `sft2.yaml` | llm-sft -> `data/llm-sft2` | intermediate (ckpt-200 feeds memory calibration) |
-| memory+RETRO | `sft4.yaml` | both-init -> `data/llm-sft4` | champion ckpt-200 (val 2.425) |
-| full combo | `sft5.yaml` | sft4-ckpt200 -> `data/llm-sft5` | current (with Belle 3:1 mix) |
+| base pretrain | `pretrain-base.yaml` | hq+ultra -> `data/llm-ckpt` | foundation (vanilla proven) |
+| full single-pass SFT | `sft-full.yaml` | base -> `data/llm-sft` | **latest flow** (next section) |
+| sft5 | `sft5.yaml` | sft4-ckpt200 -> `data/llm-sft5` | live experiment (refs historical weights) |
 
-## Reproduce from scratch (latest architecture, in order)
+The staged trial history (sft1->sft2->sft4) served its purpose and is removed;
+dig git history for archaeology. One conclusion survived: **with RHO + replay +
+EMA in place, staging is just manual curriculum — one fully-loaded pass is
+equivalent and faster**, hence the two-stage latest flow.
 
-Individual commands are above; this is the full chain (each step's output feeds the next):
+## Reproduce from scratch (latest flow, two stages)
 
 ```bash
-# 0. Offline prep, run once (Belle conversion; sft-zh self-provided, see corpus table)
+# 0. Offline prep, run once (Belle conversion + retrieval index; sft-zh self-provided, see corpus table)
 python scripts/convert_sft.py --dataset BelleGroup/train_0.5M_CN \
   --out data/sft-belle --dedup-dir data/sft-zh
 python scripts/build_retrieval.py --data data/sft-zh --sft \
@@ -136,16 +137,10 @@ python scripts/build_retrieval.py --data data/sft-zh --sft \
 # 1. base pretrain (vanilla backbone, no add-ons; ~46 hours)
 python scripts/run_train.py configs/pretrain-base.yaml
 
-# 2. SFT stage 1 (baseline, no add-ons)
-python scripts/run_train.py configs/sft1.yaml
-
-# 3. SFT stage 2 (only to step 200 for weights; ~2 hours)
-python scripts/run_train.py configs/sft2.yaml max_steps=250
-# Stop (Ctrl+C) once ckpt-000200 is saved; only it is used downstream
-
-# 4. Memory calibration (scheme B, frozen backbone, ~10 minutes)
-python scripts/init_memory.py --src data/llm-sft2/ckpt-000200/model.pt \
-  --vocab data/llm-sft/vocab.json --data data/sft-zh --out data/llm-sft-mem-init
+# 2. Memory calibration (scheme B: frozen base weights over SFT-template texts, ~10 minutes)
+# Keys only need representative clusters (values stay zero); the base backbone suffices
+python scripts/init_memory.py --src data/llm-ckpt/model.pt \
+  --vocab data/llm-ckpt/vocab.json --data data/sft-zh --out data/llm-sft-mem-init
 # Combined init (calibrated memory + zero retro keys; proceed only on 0.0 identity gap):
 ~/.venvs/llm-train/bin/python -c "
 import torch
@@ -157,23 +152,20 @@ m = TinyLLM(cfg)
 missing, unexpected = m.load_state_dict(
     torch.load('data/llm-sft-mem-init/model.pt', map_location='cpu'), strict=False)
 assert not unexpected and missing and all('retro' in k for k in missing)
-torch.save(m.state_dict(), 'data/llm-sft-both-init/model.pt')
+torch.save(m.state_dict(), 'data/llm-sft-both-init-base/model.pt')
 print('both-init ok')"
 
-# 5. sft4 (memory+RETRO, to step 200 for the champion; ~2 hours)
-python scripts/run_train.py configs/sft4.yaml max_steps=250
-# Stop once ckpt-000200 is saved
-
-# 6. sft5 (full combo + Belle 3:1, full run; ~10 hours)
-python scripts/run_train.py configs/sft5.yaml
-# Champion lands in data/llm-sft5/best/ automatically; check meta.json
+# 3. Full single-pass SFT (`configs/sft-full.yaml`, ~20 hours; champion lands in best/)
+python scripts/run_train.py configs/sft-full.yaml
 ```
 
-Notes: pretrain deliberately uses the vanilla backbone (5300 steps proven stable;
-add-ons start from an exact identity, so adding them at SFT is equivalent and saves
-10k steps of retrieval/memory overhead; scheme-B calibration needs a trained
-backbone anyway). Starting fully loaded from step 0 works too (all switches are
-opt-in flags), but that path has no validation run behind it — experimental.
+Notes: pretrain deliberately uses the vanilla backbone (proven stable; add-ons start
+from an exact identity, so adding them at SFT is equivalent and saves 10k steps of
+retrieval overhead; scheme-B calibration needs a trained backbone anyway).
+SFT runs once: RHO-teacher backprops hard tokens only, 15% hq replay guards against
+overfitting, EMA shadow eval + champion snapshots cover the rest — the three mechanisms
+replace manual staged curriculum. Starting fully loaded from step 0 works too
+(all switches are opt-in flags), but that path has no validation run — experimental.
 
 ## Advanced switches (all default-off, see docs/ARCHITECTURE.md)
 

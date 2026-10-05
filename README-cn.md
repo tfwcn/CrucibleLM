@@ -114,18 +114,18 @@ nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约
 
 | 阶段 | 配置 | 起点 → 产出 | 状态 |
 |---|---|---|---|
-| base 预训练 | `pretrain-base.yaml` | hq+ultra → `data/llm-ckpt` | 已完（5300 步，eval 4.60） |
-| SFT 一阶段 | `sft1.yaml` | llm-ckpt → `data/llm-sft` | 已完（956 步，eval 2.65） |
-| SFT 二阶段 | `sft2.yaml` | llm-sft → `data/llm-sft2` | 中间权重（ckpt-200 用于记忆校准） |
-| 记忆+RETRO | `sft4.yaml` | both-init → `data/llm-sft4` | 冠军 ckpt-200（val 2.425） |
-| 全优化组合 | `sft5.yaml` | sft4-ckpt200 → `data/llm-sft5` | 当前轮（含 Belle 新数据 3:1） |
+| base 预训练 | `pretrain-base.yaml` | hq+ultra → `data/llm-ckpt` | 地基（vanilla 跑通） |
+| SFT 全量单遍 | `sft-full.yaml` | base → `data/llm-sft` | **最新流程**（下节） |
+| sft5 | `sft5.yaml` | sft4-ckpt200 → `data/llm-sft5` | 进行中的实验轮（引用历史产物） |
 
-## 从零复刻（最新架构全流程，按顺序跑）
+分阶段试错史（sft1→sft2→sft4）已验证结论、使命结束，配置从库里删除，
+需要考古看 git 历史。结论只有一条：**RHO + 回放 + EMA 到位后，
+分阶段≈手工课程，单遍全开等价且省时间**，所以最新流程只有两段。
 
-前面是单阶段命令，这里是整条链（每一步的产物都是下一步的输入）：
+## 从零复刻（最新流程，共两段）
 
 ```bash
-# 0. 离线准备（一次跑完：Belle 转格式；sft-zh 需自备，见语料表）
+# 0. 离线准备（一次跑完：Belle 转格式 + 检索索引；sft-zh 自备，见语料表）
 python scripts/convert_sft.py --dataset BelleGroup/train_0.5M_CN \
   --out data/sft-belle --dedup-dir data/sft-zh
 python scripts/build_retrieval.py --data data/sft-zh --sft \
@@ -134,16 +134,10 @@ python scripts/build_retrieval.py --data data/sft-zh --sft \
 # 1. base 预训练（vanilla 骨架，不开外挂；约 46 小时）
 python scripts/run_train.py configs/pretrain-base.yaml
 
-# 2. SFT 一阶段（基线，无外挂）
-python scripts/run_train.py configs/sft1.yaml
-
-# 3. SFT 二阶段（只跑到 200 步取权重，不用跑完；约 2 小时）
-python scripts/run_train.py configs/sft2.yaml max_steps=250
-# 到 ckpt-000200 落盘即停（Ctrl+C），后面只用它
-
-# 4. 记忆校准（B 方案，冻结 backbone，约 10 分钟）
-python scripts/init_memory.py --src data/llm-sft2/ckpt-000200/model.pt \
-  --vocab data/llm-sft/vocab.json --data data/sft-zh --out data/llm-sft-mem-init
+# 2. 记忆校准（B 方案：base 权重冻结跑 SFT 模板文本，约 10 分钟）
+# keys 只需代表性聚类（value 恒零），base backbone 足够，不必等 SFT
+python scripts/init_memory.py --src data/llm-ckpt/model.pt \
+  --vocab data/llm-ckpt/vocab.json --data data/sft-zh --out data/llm-sft-mem-init
 # 组合起点（记忆校准 + 全零 retro，恒等校验差 0.0 才继续）：
 ~/.venvs/llm-train/bin/python -c "
 import torch
@@ -155,19 +149,18 @@ m = TinyLLM(cfg)
 missing, unexpected = m.load_state_dict(
     torch.load('data/llm-sft-mem-init/model.pt', map_location='cpu'), strict=False)
 assert not unexpected and missing and all('retro' in k for k in missing)
-torch.save(m.state_dict(), 'data/llm-sft-both-init/model.pt')
+torch.save(m.state_dict(), 'data/llm-sft-both-init-base/model.pt')
 print('both-init ok')"
 
-# 5. sft4（记忆+RETRO，跑到 200 步取冠军；约 2 小时）
-python scripts/run_train.py configs/sft4.yaml max_steps=250
-# 到 ckpt-000200 落盘即停
-
-# 6. sft5（全优化组合 + Belle 3:1，跑完；约 10 小时）
-python scripts/run_train.py configs/sft5.yaml
-# 冠军自动进 data/llm-sft5/best/，看 meta.json 认领
+# 3. SFT 全量单遍（`configs/sft-full.yaml`，约 20 小时；冠军自动进 best/）
+python scripts/run_train.py configs/sft-full.yaml
 ```
 
-说明：预训练故意用 vanilla 骨架（5300 步已验证稳定；外挂零初始化恒等，SFT 阶段再加等价且省 10k 步的检索/记忆开销；B 校准本来就需要训好的 backbone）。想从 step 0 就全开也可以（所有开关默认关、flag 打开即用），但那条路没跑通过验证，属实验性质。
+说明：预训练故意用 vanilla 骨架（稳定已验证；外挂零初始化恒等，SFT 阶段再加等价，
+还省 10k 步的检索开销；B 校准本来就需要训好的 backbone）。
+SFT 只跑一遍：RHO-teacher 只反向难 token、15% hq 回放防过拟合、
+EMA 影子评测 + 冠军快照兜底——分阶段的手工课程已被这三个机制替代。
+从 step 0 全开技术上可行（flag 都有），但没验证过，属实验性质。
 
 ## 进阶开关（默认全关，详见 docs/ARCHITECTURE.md）
 
