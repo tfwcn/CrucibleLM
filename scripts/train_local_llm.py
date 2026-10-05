@@ -77,6 +77,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="蒸馏老师权重目录（空=关闭；如 data/teacher-0.5b，跨词表锚点 KL）")
     p.add_argument("--kd-alpha", type=float, default=0.5, help="蒸馏 loss 权重")
     p.add_argument("--kd-temp", type=float, default=2.0, help="蒸馏温度")
+    p.add_argument("--kd-every", type=int, default=1,
+                   help="每 N 个 micro-step 算一次老师（降频省时间；>1 时 kd 项自动放大 N 倍保期望；1=每个都算）")
     p.add_argument("--extend-vocab", action="store_true",
                    help="扫描语料缺字追加进词表（旧 id 不动；容量内复用空行，超限扩行并新开动量）")
     p.add_argument("--extend-scan-docs", type=int, default=2000,
@@ -467,11 +469,13 @@ def evaluate(model: TinyLLM, make_eval, n_batches: int, device) -> float:
 def _forward_batch(model: TinyLLM, batch, device, distiller=None,
                    kd_alpha: float = 0.0, id_to_char: dict | None = None,
                    rho_keep: float = 0.0, ema_model=None,
-                   ema_weight: float = 0.0, rho_ref: str = "none") -> dict:
+                   ema_weight: float = 0.0, rho_ref: str = "none",
+                   do_kd: bool = True) -> dict:
     """单个 micro-batch 前向（预训练与 SFT 统一入口，SFT 带 -100 掩码）.
 
     distiller 非空时加锚点 KL（跨词表蒸馏）：老师内部 no_grad 只出分布，
     学生侧经 logits 直连主干，与 CE 共图累加，无需 detach。
+    do_kd=False 跳过老师前向（降频省时间，调用方按 --kd-every 控制）。
     rho_keep>0 时主 loss 只取 top 部分（MTP/aux 全量，aux 必须看全路由）；
     rho_ref=teacher 时按超额 loss（学生−老师）选，需 distiller，否则回落自参照。
     ema_model 非空时加 logits-MSE 一致性（影子 no_grad，不占梯度）。
@@ -485,7 +489,7 @@ def _forward_batch(model: TinyLLM, batch, device, distiller=None,
         x = batch.to(device)
         out = model(x, targets=x, return_token_losses=True)
     if rho_keep > 0:
-        if rho_ref == "teacher" and distiller is not None and id_to_char is not None:
+        if rho_ref == "teacher" and do_kd and distiller is not None and id_to_char is not None:
             from src.llm.local.distill import select_by_excess
 
             pair_losses = distiller.teacher_token_losses(x, id_to_char)
@@ -494,14 +498,12 @@ def _forward_batch(model: TinyLLM, batch, device, distiller=None,
             sel = ((out["token_losses"] * mask).sum()
                    / mask.sum().clamp_min(1))
         else:
-            if rho_ref == "teacher":
-                print("警告：--rho-ref teacher 需要 --kd-teacher，回落自参照",
-                      flush=True)
+            # 无老师或 KD 降频跳过的 micro：回落自参照（零老师开销）
             sel, _ = select_topk_loss(out["token_losses"], rho_keep)
         # 精确扣除主 loss 梯度贡献（同张量相减），再加选中部分
         out["loss"] = out["loss"] - out["_main_mean"] + sel
         out["main_loss"] = sel.detach()
-    if distiller is not None and kd_alpha > 0 and id_to_char is not None:
+    if distiller is not None and kd_alpha > 0 and id_to_char is not None and do_kd:
         kd = distiller.batch_kl(x, out["logits"], id_to_char)
         out["loss"] = out["loss"] + kd_alpha * kd
         out["kd_loss"] = kd.detach()
@@ -706,12 +708,16 @@ def main(argv=None) -> int:
                 peak = args.muon_lr if g.get("optimizer") == "muon" else args.lr
                 scheduled = lr_schedule(step, args.max_steps, args.warmup, peak)
                 g["lr"] = min(scheduled, lr0[gi]) if consolidating else scheduled
-            # 梯度累积：每个 micro-step 取新 batch（回放命中时从池子取）
+            # 梯度累积：每个 micro-step 取新 batch（回放命中时从池子取）；
+            # KD 降频：只在 micro 下标整除 kd_every 时跑老师（省 7/8 老师前向），
+            # kd 项放大 kd_every 倍保期望（--kd-every 1 即旧行为）。
+            kd_every = max(args.kd_every, 1)
             optim.zero_grad(set_to_none=True)
             accum_stats: dict = {}
             used = 0
             from_replay = False
-            for _ in range(args.accum):
+            kd_seen: list[float] = []  # KD 只在部分 micro 跑，跨 micro 收集以便日志
+            for micro_i in range(args.accum):
                 replay_hit = None
                 if replay_buf is not None and len(replay_buf) >= args.batch:
                     if rng.random() < replay_ratio:
@@ -721,21 +727,25 @@ def main(argv=None) -> int:
                     from_replay = from_replay or replay_hit is not None
                 except StopIteration:
                     break
+                do_kd = (micro_i % kd_every == 0)
+                kd_w = args.kd_alpha * kd_every if do_kd else 0.0
                 if use_amp:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         out = _forward_batch(model, batch, device,
-                                             distiller, args.kd_alpha, id_to_char,
+                                             distiller, kd_w, id_to_char,
                                              args.rho_keep, ema_model, args.ema_weight,
-                                             args.rho_ref)
+                                             args.rho_ref, do_kd)
                 else:
                     out = _forward_batch(model, batch, device,
-                                         distiller, args.kd_alpha, id_to_char,
+                                         distiller, kd_w, id_to_char,
                                          args.rho_keep, ema_model, args.ema_weight,
-                                         args.rho_ref)
+                                         args.rho_ref, do_kd)
                 tokens_seen += batch[0].numel() if isinstance(batch, tuple) else batch.numel()
                 (out["loss"] / args.accum).backward()
                 accum_stats = {k: float(v.detach()) if torch.is_tensor(v) else v
                                for k, v in out.items() if k.endswith("loss")}
+                if "kd_loss" in out:
+                    kd_seen.append(float(out["kd_loss"]))
                 used += 1
             if used == 0:
                 print("数据流耗尽，提前结束", flush=True)
@@ -771,6 +781,9 @@ def main(argv=None) -> int:
             if replay_buf is not None:
                 record["replay"] = from_replay
                 record["replay_size"] = len(replay_buf)
+            if kd_seen:
+                # KD 降频时只有部分 micro 有值，取均值（accumuloss 只保留了最后 micro 的键）
+                record["kd_loss"] = sum(kd_seen) / len(kd_seen)
             if step % 10 == 0 or step == 1:
                 print(f"step={step} loss={record.get('loss', float('nan')):.4f} "
                       f"tokens={tokens_seen} lr={record['lr']:.2e}", flush=True)

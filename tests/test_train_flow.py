@@ -292,6 +292,35 @@ def test_forward_batch_rho_teacher_fallback():
     assert torch.isfinite(out["loss"]) and "main_loss" in out
 
 
+def test_forward_batch_kd_subsample():
+    """KD 降频：do_kd=False 不调老师（calls 为 0、无 kd_loss 键）."""
+
+    class StubDistiller:
+        def __init__(self):
+            self.calls = 0
+
+        def batch_kl(self, x, logits, id_to_char):
+            self.calls += 1
+            return logits.float().mean() * 0 + 1.0
+
+        def teacher_token_losses(self, x, id_to_char):
+            self.calls += 1
+            return []
+
+    torch.manual_seed(0)
+    m = TinyLLM(tiny_test_config())
+    x = torch.randint(0, 256, (2, 16))
+    d = StubDistiller()
+    id_to_char = {i: "字" for i in range(256)}
+    out = flow._forward_batch(m, x, "cpu", distiller=d, kd_alpha=0.5,
+                              id_to_char=id_to_char, do_kd=True)
+    assert d.calls == 1 and "kd_loss" in out and torch.isfinite(out["loss"])
+    out2 = flow._forward_batch(m, x, "cpu", distiller=d, kd_alpha=0.5,
+                               id_to_char=id_to_char, do_kd=False)
+    assert d.calls == 1 and "kd_loss" not in out2
+    assert torch.isfinite(out2["loss"])
+
+
 def test_dump_hparams(tmp_path):
     """超参落盘：CLI 参数全量可 JSON 序列化，派生量正确."""
     import json
