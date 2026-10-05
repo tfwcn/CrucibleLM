@@ -1,0 +1,25 @@
+# sft3：记忆层单开验证（B 校准起点，半 LR；跑 20 步后停，无结论，仅存档）
+# 用法：python scripts/run_train.py configs/sft3.yaml
+description: memory-only validation run, superseded by sft4
+
+phase: sft
+preset: base
+seq_len: 2048
+batch: 4
+accum: 8
+sft_init: data/llm-sft-mem-init/model.pt
+max_steps: 1000
+lr: 5.0e-5
+warmup: 20
+grad_ckpt: true
+ckpt_dir: data/llm-sft3
+vocab: data/llm-sft/vocab.json
+data: local
+local_path: data/sft-zh
+extend_vocab: true
+eval_every: 100
+sample_every: 100
+kd_teacher: data/teacher-0.5b
+kd_alpha: 0.5
+kd_every: 8
+enable_memory: true

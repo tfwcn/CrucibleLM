@@ -110,6 +110,17 @@ nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约
 长命令已收进 `configs/*.yaml`：`python scripts/run_train.py configs/sft5.yaml` 前台跑
 （`--dry-run` 只打印命令；`lr=1e-5` 这种 `key=value` 临时覆盖；配置自动存档到 `ckpt-dir/run.yaml`，复现认这个文件）。
 
+## 训练阶段配置（`configs/`，启动器直跑）
+
+| 阶段 | 配置 | 起点 → 产出 | 状态 |
+|---|---|---|---|
+| base 预训练 | `pretrain-base.yaml` | hq+ultra → `data/llm-ckpt` | 已完（5300 步，eval 4.60） |
+| SFT 一阶段 | `sft1.yaml` | llm-ckpt → `data/llm-sft` | 已完（956 步，eval 2.65） |
+| SFT 二阶段 | `sft2.yaml` | llm-sft → `data/llm-sft2` | 已停（最低 2.476@200） |
+| 记忆层验证 | `sft3.yaml` | mem-init → `data/llm-sft3` | 已停（20 步，无结论） |
+| 记忆+RETRO | `sft4.yaml` | both-init → `data/llm-sft4` | 冠军 ckpt-200（val 2.425） |
+| 全优化组合 | `sft5.yaml` | sft4-ckpt200 → `data/llm-sft5` | 当前轮（含 Belle 新数据 3:1） |
+
 ## 进阶开关（默认全关，详见 docs/ARCHITECTURE.md）
 
 - 长上下文：`longctx_config()` 200K 推理（YaRN×8 + 稀疏 MLA），训练走"短训 + 外推 + 分阶段微调"；

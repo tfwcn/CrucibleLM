@@ -1,0 +1,22 @@
+# base 预训练：hq + ultra，二阶段前的底座（已跑完，step 5300，eval 4.60）
+# 用法：python scripts/run_train.py configs/pretrain-base.yaml
+description: base pretrain hq+ultra
+
+phase: pretrain
+preset: base
+seq_len: 2048
+batch: 4
+accum: 8
+max_steps: 10000
+lr: 3.0e-4
+grad_ckpt: true
+ckpt_dir: data/llm-ckpt
+data: local
+local_path: "data/hq-zh:3,data/ultra-zh:1"
+eval_every: 200
+sample_every: 200
+extend_vocab: true
+rho_keep: 0.5
+replay_ratio: 0.15
+consolidate_steps: 300
+resume: true
