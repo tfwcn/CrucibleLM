@@ -116,8 +116,7 @@ nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约
 |---|---|---|---|
 | base 预训练 | `pretrain-base.yaml` | hq+ultra → `data/llm-ckpt` | 已完（5300 步，eval 4.60） |
 | SFT 一阶段 | `sft1.yaml` | llm-ckpt → `data/llm-sft` | 已完（956 步，eval 2.65） |
-| SFT 二阶段 | `sft2.yaml` | llm-sft → `data/llm-sft2` | 已停（最低 2.476@200） |
-| 记忆层验证 | `sft3.yaml` | mem-init → `data/llm-sft3` | 已停（20 步，无结论） |
+| SFT 二阶段 | `sft2.yaml` | llm-sft → `data/llm-sft2` | 中间权重（ckpt-200 用于记忆校准） |
 | 记忆+RETRO | `sft4.yaml` | both-init → `data/llm-sft4` | 冠军 ckpt-200（val 2.425） |
 | 全优化组合 | `sft5.yaml` | sft4-ckpt200 → `data/llm-sft5` | 当前轮（含 Belle 新数据 3:1） |
 

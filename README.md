@@ -118,8 +118,7 @@ the config is archived to `ckpt-dir/run.yaml`, which is the file to trust for re
 |---|---|---|---|
 | base pretrain | `pretrain-base.yaml` | hq+ultra -> `data/llm-ckpt` | done (5300 steps, eval 4.60) |
 | SFT stage 1 | `sft1.yaml` | llm-ckpt -> `data/llm-sft` | done (956 steps, eval 2.65) |
-| SFT stage 2 | `sft2.yaml` | llm-sft -> `data/llm-sft2` | stopped (best 2.476@200) |
-| memory validation | `sft3.yaml` | mem-init -> `data/llm-sft3` | stopped (20 steps, no conclusion) |
+| SFT stage 2 | `sft2.yaml` | llm-sft -> `data/llm-sft2` | intermediate (ckpt-200 feeds memory calibration) |
 | memory+RETRO | `sft4.yaml` | both-init -> `data/llm-sft4` | champion ckpt-200 (val 2.425) |
 | full combo | `sft5.yaml` | sft4-ckpt200 -> `data/llm-sft5` | current (with Belle 3:1 mix) |
 
