@@ -52,7 +52,8 @@ CrucibleLM/
 ```bash
 # 0. 环境（独立 venv，别污染系统）
 uv venv ~/.venvs/llm-train --python 3.12
-uv pip install --python ~/.venvs/llm-train/bin/python torch datasets modelscope pyarrow
+uv pip install --python ~/.venvs/llm-train/bin/python torch datasets modelscope pyarrow transformers
+# 说明：transformers 只给 KD 老师用（--kd-teacher）；不蒸馏可不装
 export PATH="$HOME/.local/bin:$PATH"
 
 # 1. 数据（魔搭 CN CDN，训练全程零网络；约 23GB）
@@ -87,7 +88,7 @@ snapshot_download('OpenBMB/MiniCPM4-0.5B', local_dir='data/teacher-0.5b')"
 
 # 3. 监控（另开终端）
 tail -f data/llm-ckpt/train.log   # loss 曲线（JSONL）
-nvidia-smi -l 2                   # 显存（应稳定 ~8GB）
+nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约 10GB）
 # 健康标准：eval 稳步降、aux 恒 0.12、单进程；详见 docs/pitfalls/
 
 # 4. SFT（base 收敛后，另起 ckpt 目录，base 原封不动留作回滚）
@@ -167,7 +168,7 @@ print(resp["content"])  # resp 还有 reasoning/tool_calls/finish_reason 字段�
 
 # 采样参数：temperature=0 贪心；>0 按温度采样，top_k 截断（默认无 top-p/重复惩罚，
 # 长文本循环用 temperature 0.7~1.0 + 短 max_new_tokens 缓解）
-resp = backend.chat(messages, max_new_tokens=256, temperature=0.7, top_k=50)
+resp = backend.chat([{"role": "user", "content": "你好"}], max_new_tokens=256, temperature=0.7, top_k=50)
 ```
 
 - **增量解码**：`generate()` 自带 KV/状态缓存（MLA 存 latent，线性层 O(1) 状态），prefill 一次、单步续写；

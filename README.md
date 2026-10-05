@@ -18,7 +18,7 @@
 - **200K-context inference ready** — latent KV cache + linear recurrent states + sparse attention
 - **Full training stack included** — streaming corpora, SFT, cross-tokenizer distillation, eval, OpenAI-compatible serving
 
-[中文说明](./README-cn.md) | [Architecture](./docs/ARCHITECTURE.md) | [Training pitfalls](./docs/pitfalls/local-llm-training.md)
+[Chinese](./README-cn.md) | [Architecture](./docs/ARCHITECTURE.md) | [Training pitfalls](./docs/pitfalls/local-llm-training.md)
 
 ## What is this
 
@@ -52,7 +52,8 @@ Hardware: single 16GB GPU (e.g. RTX 3080 Laptop), Python 3.12, CUDA torch.
 ```bash
 # 0. Env (isolated venv)
 uv venv ~/.venvs/llm-train --python 3.12
-uv pip install --python ~/.venvs/llm-train/bin/python torch datasets modelscope pyarrow
+uv pip install --python ~/.venvs/llm-train/bin/python torch datasets modelscope pyarrow transformers
+# Note: transformers is only needed for the KD teacher (--kd-teacher); skip it if you don't distill
 export PATH="$HOME/.local/bin:$PATH"
 
 # 1. Data (ModelScope CN CDN, zero network during training; ~23GB)
@@ -87,7 +88,7 @@ snapshot_download('OpenBMB/MiniCPM4-0.5B', local_dir='data/teacher-0.5b')"
 
 # 3. Monitor (separate terminal)
 tail -f data/llm-ckpt/train.log   # loss curves (JSONL)
-nvidia-smi -l 2                   # VRAM (stable ~8GB expected)
+nvidia-smi -l 2                   # VRAM (stable ~5GB pretrain; ~10GB with KD teacher)
 # Healthy signs: eval declining, aux pinned at 0.12, single process; see docs/pitfalls/
 
 # 4. SFT (after base converges; separate ckpt dir, base kept as rollback)
@@ -168,13 +169,13 @@ from src.llm.local import TinyLLM, LocalChatBackend, SmallLLMConfig
 
 # Local weights + vocab (training outputs work directly, no conversion)
 backend = LocalChatBackend.load("data/llm-ckpt/model", SmallLLMConfig())
-resp = backend.chat([{"role": "user", "content": "你好"}], max_new_tokens=128)
+resp = backend.chat([{"role": "user", "content": "Hello"}], max_new_tokens=128)
 print(resp["content"])  # resp also has reasoning/tool_calls/finish_reason (OpenAI-shaped)
 
 # Sampling: temperature=0 greedy; >0 temperature sampling with top_k cutoff
 # (no top-p/repetition penalty by default; for looping use temperature 0.7-1.0
 # plus short max_new_tokens)
-resp = backend.chat(messages, max_new_tokens=256, temperature=0.7, top_k=50)
+resp = backend.chat([{"role": "user", "content": "Hello"}], max_new_tokens=256, temperature=0.7, top_k=50)
 ```
 
 - **Incremental decoding**: `generate()` carries KV/state caches (MLA latent, linear O(1)
@@ -190,7 +191,7 @@ resp = backend.chat(messages, max_new_tokens=256, temperature=0.7, top_k=50)
 python scripts/serve_openai.py --model data/llm-ckpt/model --port 8000
 # --config data/llm-16L/config.json (migrated arch) --api-key xxx (optional Bearer auth)
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"messages": [{"role": "user", "content": "你好"}], "stream": true}'
+  -d '{"messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
 
 - `POST /v1/chat/completions` (true-incremental SSE streaming + non-streaming, `stop` supported),
