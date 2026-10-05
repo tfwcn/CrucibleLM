@@ -292,11 +292,11 @@ def select_by_excess(
     if k >= len(scored):
         for _, idx in scored:
             mask[idx] = True
-        return mask
+        return mask.view(student_losses.shape)
     with torch.no_grad():
         vals = torch.tensor([s for s, _ in scored])
         thr = torch.topk(vals, k).values.min().item()
     for s, idx in scored:
         if s >= thr:
             mask[idx] = True
-    return mask
+    return mask.view(student_losses.shape)

@@ -138,6 +138,18 @@ def test_select_by_excess():
     assert select_by_excess(s, [], 0.5).all()
 
 
+def test_select_by_excess_batch_shape():
+    """回归：batch>1 时返回同形掩码（曾返回展平，(b,T)*(b*T) 广播炸）."""
+    from src.llm.local.distill import select_by_excess
+
+    s = torch.tensor([[1.0, 9.0, 2.0, 8.0],
+                      [3.0, 1.0, 7.0, 0.5]])
+    pairs = [[(1, 8.0)], [(2, 6.0)]]
+    mask = select_by_excess(s, pairs, keep_ratio=0.5, min_keep=1)
+    assert mask.shape == s.shape
+    assert ((s * mask).sum() / mask.sum().clamp_min(1)).isfinite()
+
+
 def test_teacher_token_losses_fake():
     """老师 token loss：位置有效、值有限（fake 老师离线测）."""
     d = _distiller()
