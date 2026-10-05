@@ -108,7 +108,7 @@ Key defaults (active when not specified): `--save-every 100` checkpoints + `--ke
 snapshots, `--shuffle-buffer 512`, `--prefetch 4`, AdamW optimizer. Resume anytime with
 `--resume` (weights/optimizer/steps/data cursor all restored). If direct HF access times
 out, use `--hf-endpoint https://hf-mirror.com`.
-Long commands live in `configs/*.yaml`: `python scripts/run_train.py configs/sft5.yaml`
+Long commands live in `configs/*.yaml`: `python scripts/run_train.py configs/sft-full.yaml`
 runs in the foreground (`--dry-run` prints only; `key=value` overrides inline;
 the config is archived to `ckpt-dir/run.yaml`, which is the file to trust for repro).
 
@@ -118,7 +118,7 @@ the config is archived to `ckpt-dir/run.yaml`, which is the file to trust for re
 |---|---|---|---|
 | base pretrain | `pretrain-base.yaml` | hq+ultra -> `data/llm-ckpt` | foundation (vanilla proven) |
 | full single-pass SFT | `sft-full.yaml` | base -> `data/llm-sft` | **latest flow** (next section) |
-| sft5 | `sft5.yaml` | sft4-ckpt200 -> `data/llm-sft5` | live experiment (refs historical weights) |
+| sft5 | `configs-local/sft5.yaml` (local experiment, not committed) | sft4-ckpt200 -> `data/llm-sft5` | live (refs historical weights, local only) |
 
 The staged trial history (sft1->sft2->sft4) served its purpose and is removed;
 dig git history for archaeology. One conclusion survived: **with RHO + replay +

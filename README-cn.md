@@ -107,7 +107,7 @@ nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约
 关键默认值（不写即生效）：`--save-every 100` 存盘 + `--keep-last 20` 只留 20 个快照、
 `--shuffle-buffer 512`、`--prefetch 4`、AdamW 优化器。续跑直接加 `--resume`
 （权重/优化器/step/数据游标全续）。直连 HF 超时请用 `--hf-endpoint https://hf-mirror.com`。
-长命令已收进 `configs/*.yaml`：`python scripts/run_train.py configs/sft5.yaml` 前台跑
+长命令已收进 `configs/*.yaml`：`python scripts/run_train.py configs/sft-full.yaml` 前台跑
 （`--dry-run` 只打印命令；`lr=1e-5` 这种 `key=value` 临时覆盖；配置自动存档到 `ckpt-dir/run.yaml`，复现认这个文件）。
 
 ## 训练阶段配置（`configs/`，启动器直跑）
@@ -116,7 +116,7 @@ nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约
 |---|---|---|---|
 | base 预训练 | `pretrain-base.yaml` | hq+ultra → `data/llm-ckpt` | 地基（vanilla 跑通） |
 | SFT 全量单遍 | `sft-full.yaml` | base → `data/llm-sft` | **最新流程**（下节） |
-| sft5 | `sft5.yaml` | sft4-ckpt200 → `data/llm-sft5` | 进行中的实验轮（引用历史产物） |
+| sft5 | `configs-local/sft5.yaml`（本机实验，不入库） | sft4-ckpt200 → `data/llm-sft5` | 进行中（引用历史产物，仅本机可跑） |
 
 分阶段试错史（sft1→sft2→sft4）已验证结论、使命结束，配置从库里删除，
 需要考古看 git 历史。结论只有一条：**RHO + 回放 + EMA 到位后，

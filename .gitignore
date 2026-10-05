@@ -10,3 +10,6 @@ data/
 dist/
 build/
 *.egg-info/
+
+# 本机实验配置（引用历史产物，不入库）
+configs-local/
