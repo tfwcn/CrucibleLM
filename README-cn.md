@@ -120,6 +120,55 @@ nvidia-smi -l 2                   # 显存（预训练约 5GB；开 KD 老师约
 | 记忆+RETRO | `sft4.yaml` | both-init → `data/llm-sft4` | 冠军 ckpt-200（val 2.425） |
 | 全优化组合 | `sft5.yaml` | sft4-ckpt200 → `data/llm-sft5` | 当前轮（含 Belle 新数据 3:1） |
 
+## 从零复刻（最新架构全流程，按顺序跑）
+
+前面是单阶段命令，这里是整条链（每一步的产物都是下一步的输入）：
+
+```bash
+# 0. 离线准备（一次跑完：Belle 转格式；sft-zh 需自备，见语料表）
+python scripts/convert_sft.py --dataset BelleGroup/train_0.5M_CN \
+  --out data/sft-belle --dedup-dir data/sft-zh
+python scripts/build_retrieval.py --data data/sft-zh --sft \
+  --out data/retro-sft.pkl --chunk 200 --overlap 20   # SFT 目录加 --sft（拼三元组文本）
+
+# 1. base 预训练（vanilla 骨架，不开外挂；约 46 小时）
+python scripts/run_train.py configs/pretrain-base.yaml
+
+# 2. SFT 一阶段（基线，无外挂）
+python scripts/run_train.py configs/sft1.yaml
+
+# 3. SFT 二阶段（只跑到 200 步取权重，不用跑完；约 2 小时）
+python scripts/run_train.py configs/sft2.yaml max_steps=250
+# 到 ckpt-000200 落盘即停（Ctrl+C），后面只用它
+
+# 4. 记忆校准（B 方案，冻结 backbone，约 10 分钟）
+python scripts/init_memory.py --src data/llm-sft2/ckpt-000200/model.pt \
+  --vocab data/llm-sft/vocab.json --data data/sft-zh --out data/llm-sft-mem-init
+# 组合起点（记忆校准 + 全零 retro，恒等校验差 0.0 才继续）：
+~/.venvs/llm-train/bin/python -c "
+import torch
+from src.llm.local.config import SmallLLMConfig
+from src.llm.local.model import TinyLLM
+cfg = SmallLLMConfig(); cfg.memory_every = 4
+cfg.retro_enabled = True; cfg.retro_every = 4; cfg.retro_chunk_len = 64
+m = TinyLLM(cfg)
+missing, unexpected = m.load_state_dict(
+    torch.load('data/llm-sft-mem-init/model.pt', map_location='cpu'), strict=False)
+assert not unexpected and missing and all('retro' in k for k in missing)
+torch.save(m.state_dict(), 'data/llm-sft-both-init/model.pt')
+print('both-init ok')"
+
+# 5. sft4（记忆+RETRO，跑到 200 步取冠军；约 2 小时）
+python scripts/run_train.py configs/sft4.yaml max_steps=250
+# 到 ckpt-000200 落盘即停
+
+# 6. sft5（全优化组合 + Belle 3:1，跑完；约 10 小时）
+python scripts/run_train.py configs/sft5.yaml
+# 冠军自动进 data/llm-sft5/best/，看 meta.json 认领
+```
+
+说明：预训练故意用 vanilla 骨架（5300 步已验证稳定；外挂零初始化恒等，SFT 阶段再加等价且省 10k 步的检索/记忆开销；B 校准本来就需要训好的 backbone）。想从 step 0 就全开也可以（所有开关默认关、flag 打开即用），但那条路没跑通过验证，属实验性质。
+
 ## 进阶开关（默认全关，详见 docs/ARCHITECTURE.md）
 
 - 长上下文：`longctx_config()` 200K 推理（YaRN×8 + 稀疏 MLA），训练走"短训 + 外推 + 分阶段微调"；

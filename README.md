@@ -122,6 +122,59 @@ the config is archived to `ckpt-dir/run.yaml`, which is the file to trust for re
 | memory+RETRO | `sft4.yaml` | both-init -> `data/llm-sft4` | champion ckpt-200 (val 2.425) |
 | full combo | `sft5.yaml` | sft4-ckpt200 -> `data/llm-sft5` | current (with Belle 3:1 mix) |
 
+## Reproduce from scratch (latest architecture, in order)
+
+Individual commands are above; this is the full chain (each step's output feeds the next):
+
+```bash
+# 0. Offline prep, run once (Belle conversion; sft-zh self-provided, see corpus table)
+python scripts/convert_sft.py --dataset BelleGroup/train_0.5M_CN \
+  --out data/sft-belle --dedup-dir data/sft-zh
+python scripts/build_retrieval.py --data data/sft-zh --sft \
+  --out data/retro-sft.pkl --chunk 200 --overlap 20   # --sft for SFT dirs (joins triples)
+
+# 1. base pretrain (vanilla backbone, no add-ons; ~46 hours)
+python scripts/run_train.py configs/pretrain-base.yaml
+
+# 2. SFT stage 1 (baseline, no add-ons)
+python scripts/run_train.py configs/sft1.yaml
+
+# 3. SFT stage 2 (only to step 200 for weights; ~2 hours)
+python scripts/run_train.py configs/sft2.yaml max_steps=250
+# Stop (Ctrl+C) once ckpt-000200 is saved; only it is used downstream
+
+# 4. Memory calibration (scheme B, frozen backbone, ~10 minutes)
+python scripts/init_memory.py --src data/llm-sft2/ckpt-000200/model.pt \
+  --vocab data/llm-sft/vocab.json --data data/sft-zh --out data/llm-sft-mem-init
+# Combined init (calibrated memory + zero retro keys; proceed only on 0.0 identity gap):
+~/.venvs/llm-train/bin/python -c "
+import torch
+from src.llm.local.config import SmallLLMConfig
+from src.llm.local.model import TinyLLM
+cfg = SmallLLMConfig(); cfg.memory_every = 4
+cfg.retro_enabled = True; cfg.retro_every = 4; cfg.retro_chunk_len = 64
+m = TinyLLM(cfg)
+missing, unexpected = m.load_state_dict(
+    torch.load('data/llm-sft-mem-init/model.pt', map_location='cpu'), strict=False)
+assert not unexpected and missing and all('retro' in k for k in missing)
+torch.save(m.state_dict(), 'data/llm-sft-both-init/model.pt')
+print('both-init ok')"
+
+# 5. sft4 (memory+RETRO, to step 200 for the champion; ~2 hours)
+python scripts/run_train.py configs/sft4.yaml max_steps=250
+# Stop once ckpt-000200 is saved
+
+# 6. sft5 (full combo + Belle 3:1, full run; ~10 hours)
+python scripts/run_train.py configs/sft5.yaml
+# Champion lands in data/llm-sft5/best/ automatically; check meta.json
+```
+
+Notes: pretrain deliberately uses the vanilla backbone (5300 steps proven stable;
+add-ons start from an exact identity, so adding them at SFT is equivalent and saves
+10k steps of retrieval/memory overhead; scheme-B calibration needs a trained
+backbone anyway). Starting fully loaded from step 0 works too (all switches are
+opt-in flags), but that path has no validation run behind it — experimental.
+
 ## Advanced switches (all default-off, see docs/ARCHITECTURE.md)
 
 - Long context: `longctx_config()` for 200K inference (YaRN×8 + sparse MLA); train short,
