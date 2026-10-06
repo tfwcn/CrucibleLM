@@ -815,6 +815,12 @@ def main(argv=None) -> int:
     replay_buf = (ReplayBuffer(args.replay_capacity, args.seed)
                   if args.replay_ratio > 0 or args.consolidate_steps > 0 else None)
     rng = random.Random(args.seed)
+    # RETRO 前瞻线程池（循环外建、finally 关；retro 关闭时为 None）
+    retr_pool = None
+    if retro_index is not None and args.enable_retro:
+        from concurrent.futures import ThreadPoolExecutor
+
+        retr_pool = ThreadPoolExecutor(max_workers=1)
     t0 = time.time()
     step = start_step
     # 冠军追踪：同目录续跑时继承历史最佳（best/meta.json），避免更差的覆盖冠军
@@ -850,34 +856,65 @@ def main(argv=None) -> int:
             used = 0
             from_replay = False
             kd_seen: list[float] = []  # KD 只在部分 micro 跑，跨 micro 收集以便日志
-            for micro_i in range(args.accum):
+            # RETRO 前瞻：后台线程查下个 micro 的 hits，主线程只做 tensor 组装；
+            # GPU 算当前 micro 时 CPU 同时检索，0.64s/micro 的检索被掩盖。
+            # retro 关闭时 pool 为 None，走直路零开销。
+            # （pool 在循环外建、finally 关，见下）
+
+            def _take_batch():
+                """取一个 micro batch（回放命中优先），耗尽返回 None."""
                 replay_hit = None
                 if replay_buf is not None and len(replay_buf) >= args.batch:
                     if rng.random() < replay_ratio:
                         replay_hit = replay_buf.sample(args.batch)
                 try:
-                    batch = replay_hit if replay_hit is not None else next(trains)
-                    from_replay = from_replay or replay_hit is not None
+                    batch = (replay_hit if replay_hit is not None
+                             else next(trains))
                 except StopIteration:
-                    break
+                    return None
+                return batch, replay_hit is not None
+
+            def _retrieve_hits(batch):
+                """纯 CPU 检索（线程安全）：batch -> hits（tensor 组装留主线程）."""
+                from src.llm.local.retro import retrieve_for_texts
+
+                texts = []
+                x_rows = batch[0] if isinstance(batch, tuple) else batch
+                for row in x_rows:
+                    chars = "".join(
+                        id_to_char.get(int(i), '') for i in row.tolist() if int(i) > 3)
+                    texts.append(chars[-1000:])
+                return retrieve_for_texts(retro_index, texts, k=args.retro_k,
+                                          max_terms=12)
+
+            pending = _take_batch()
+            pending_fut = (retr_pool.submit(_retrieve_hits, pending[0])
+                           if retr_pool is not None and pending is not None
+                           else None)
+            micro_i = 0
+            while pending is not None:
+                batch, is_replay = pending
+                from_replay = from_replay or is_replay
+                # 下一个先取好、检索先交出去，再算当前（重叠窗口）
+                pending = _take_batch()
+                if retr_pool is not None:
+                    hits = (pending_fut.result() if pending_fut is not None
+                            else None)
+                    pending_fut = (retr_pool.submit(_retrieve_hits, pending[0])
+                                   if pending is not None else None)
+                else:
+                    hits = None
                 do_kd = (micro_i % kd_every == 0)
+                micro_i += 1
                 kd_w = args.kd_alpha * kd_every if do_kd else 0.0
-                # RETRO：按 batch 检出 top-K 融合（仅 --enable-retro 且索引就绪）；
+                # RETRO：按 batch 检出 top-K 融合（hits 已就绪，只做 tensor 组装）；
                 # retro_every>0 走 V2 交错（chunk token id，模型侧 frozen 编码），
                 # =0 走 v1 单点（均值向量 mem）
                 mem, mem_mask, chunk_ids, chunk_mask = None, None, None, None
-                if retro_index is not None and args.enable_retro:
+                if hits is not None:
                     from src.llm.local.retro import (
-                        build_batch_chunk_ids, build_batch_mem, retrieve_for_texts)
+                        build_batch_chunk_ids, build_batch_mem)
 
-                    texts = []
-                    x_rows = batch[0] if isinstance(batch, tuple) else batch
-                    for row in x_rows:
-                        chars = "".join(
-                            id_to_char.get(int(i), '') for i in row.tolist() if int(i) > 3)
-                        texts.append(chars[-1000:])
-                    hits = retrieve_for_texts(retro_index, texts, k=args.retro_k,
-                                                  max_terms=12)
                     if args.retro_every > 0:
                         chunk_ids, chunk_mask = build_batch_chunk_ids(
                             tok, hits, args.retro_k, args.retro_len)
@@ -986,6 +1023,8 @@ def main(argv=None) -> int:
                                  data_cursor=_data_cursor(train_stream))
                 print(f"[ckpt] step={step} -> {snap.name}", flush=True)
     finally:
+        if retr_pool is not None:
+            retr_pool.shutdown(wait=True)
         logf.close()
     save_ckpt(ckpt_dir, model, optim, step, tokens_seen,
               {"phase": args.phase, "preset": args.preset},

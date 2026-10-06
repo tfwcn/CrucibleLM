@@ -230,6 +230,8 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   最高的 64 个词做候选、单遍打分 + 堆取 top-K；33 万文档下全扫描 5.4s/查
   → 64 词 2.4s → 训练用 12 词 0.76s（top-1 与全量一致，增广够用）。
   老索引无倒排时 `load` 就地重建。SFT 目录（instruction 列）建库加 `--sft`。
+  训练时检索与 GPU 计算重叠：后台单线程前瞻下个 micro 的 hits（纯 CPU 部分），
+  主线程只做 tensor 组装，0.64s/micro 的检索开销被掩盖；retro 关闭时零开销。
 - **会话增量状态落盘**（`session_cache.py` 的 `SessionCache`）：存 MLA latent +
   线性层状态 + 短卷积尾，`save()/load()` 跨进程恢复，turn 之间不丢长上下文。
   库侧组件（推理路径专用，不进训练循环）；服务进程按会话 id 复用待接线。
