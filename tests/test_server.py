@@ -45,6 +45,16 @@ def test_stream_matches_generate():
     assert m.training
 
 
+def test_chat_params_include_repetition_penalty_and_top_k(tmp_path):
+    """服务参数解析：repetition_penalty 透传（默认 1.0 关闭），top_k 不再被吞."""
+    srv = OpenAIServer(_tiny_backend(tmp_path))
+    out = srv._chat_params({"messages": [], "repetition_penalty": 1.3,
+                            "top_k": 50})
+    assert out[4] == 1.3 and out[3] == 50
+    dflt = srv._chat_params({"messages": []})
+    assert dflt[4] == 1.0 and dflt[3] == 0
+
+
 def _serve_in_thread(backend, **kwargs):
     """后台起服务，返回 (server, port)."""
     server = OpenAIServer(backend, **kwargs)

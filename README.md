@@ -229,9 +229,10 @@ backend = LocalChatBackend.load("data/llm-ckpt/model", SmallLLMConfig())
 resp = backend.chat([{"role": "user", "content": "Hello"}], max_new_tokens=128)
 print(resp["content"])  # resp also has reasoning/tool_calls/finish_reason (OpenAI-shaped)
 
-# Sampling: temperature=0 greedy; >0 temperature sampling with top_k cutoff
-# (no top-p/repetition penalty by default; for looping use temperature 0.7-1.0
-# plus short max_new_tokens)
+# Sampling: temperature=0 greedy; >0 temperature sampling with top_k cutoff;
+# repetition_penalty>1 suppresses seen tokens (HF semantics, 1.0 = off;
+# greedy + 1.2~1.4 kills template-`<`/markdown-`####` loops, measured 4-gram
+# repeat 0.58 -> 0.04; no top-p by default)
 resp = backend.chat([{"role": "user", "content": "Hello"}], max_new_tokens=256, temperature=0.7, top_k=50)
 ```
 

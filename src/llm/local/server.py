@@ -97,18 +97,19 @@ class OpenAIServer:
 
         return Handler
 
-    def _chat_params(self, req: dict) -> tuple[list[dict], int, float, int, list[str]]:
-        """解析通用参数（messages/max_tokens/temperature/top_k/stop）."""
+    def _chat_params(self, req: dict) -> tuple[list[dict], int, float, int, float, list[str]]:
+        """解析通用参数（messages/max_tokens/temperature/top_k/repetition_penalty/stop）."""
         messages = req.get("messages") or []
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
         max_tokens = int(req.get("max_tokens") or 128)
         temperature = float(req.get("temperature") or 0.0)
         top_k = int(req.get("top_k") or req.get("top_logprobs") or 0)
+        repetition_penalty = float(req.get("repetition_penalty") or 1.0)
         stop = req.get("stop") or []
         if isinstance(stop, str):
             stop = [stop]
-        return messages, max_tokens, temperature, top_k, stop
+        return messages, max_tokens, temperature, top_k, repetition_penalty, stop
 
     @staticmethod
     def _apply_stop(text: str, stop: list[str]) -> tuple[str, str]:
@@ -120,13 +121,15 @@ class OpenAIServer:
 
     def handle_chat(self, handler: BaseHTTPRequestHandler, req: dict) -> None:
         """处理 chat 请求（stream=true 走 SSE 真增量）。"""
-        messages, max_tokens, temperature, top_k, stop = self._chat_params(req)
+        (messages, max_tokens, temperature, top_k,
+         repetition_penalty, stop) = self._chat_params(req)
         stream = bool(req.get("stream", False))
         model_id = req.get("model") or self.model_name
         if not stream:
             with self._lock:
                 resp = self.backend.chat(messages, max_new_tokens=max_tokens,
-                                         temperature=temperature)
+                                         temperature=temperature, top_k=top_k,
+                                         repetition_penalty=repetition_penalty)
             content, finish = self._apply_stop(resp["content"] or "", stop)
             handler._send_json(200, {  # noqa: SLF001 - 同类内部调用
                 "id": f"chatcmpl-{int(time.time() * 1000)}",
@@ -152,7 +155,8 @@ class OpenAIServer:
         try:
             with self._lock:
                 for piece in self.backend.stream(messages, max_new_tokens=max_tokens,
-                                                 temperature=temperature):
+                                                 temperature=temperature, top_k=top_k,
+                                                 repetition_penalty=repetition_penalty):
                     chunk = dict(prefix)
                     chunk["choices"] = [{"index": 0,
                                          "delta": {"content": piece},

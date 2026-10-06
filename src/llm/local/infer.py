@@ -138,12 +138,16 @@ class LocalChatBackend:
         messages: list[dict],
         max_new_tokens: int = 128,
         temperature: float = 0.0,
+        top_k: int = 0,
+        repetition_penalty: float = 1.0,
     ) -> dict:
         """对话生成，返回 {"content","reasoning","tool_calls","finish_reason"}."""
         input_ids, _ = self._prepare_ids(messages, max_new_tokens)
         gen = self.model.generate(
             input_ids, max_new_tokens=max_new_tokens,
-            temperature=temperature, eos_id=SimpleTokenizer.EOS,
+            temperature=temperature, top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            eos_id=SimpleTokenizer.EOS,
         )
         new_ids = gen[0].tolist()[len(input_ids[0]):]
         return {
@@ -158,13 +162,17 @@ class LocalChatBackend:
         messages: list[dict],
         max_new_tokens: int = 128,
         temperature: float = 0.0,
+        top_k: int = 0,
+        repetition_penalty: float = 1.0,
     ):
         """流式生成，逐块 yield 文本（SSE 用；字符级分词保证增量解码精确）."""
         input_ids, _ = self._prepare_ids(messages, max_new_tokens)
         inv = {i + 4: ch for i, ch in enumerate(self.tokenizer._chars)}
         for tid in self.model.stream_tokens(
                 input_ids, max_new_tokens=max_new_tokens,
-                temperature=temperature, eos_id=SimpleTokenizer.EOS):
+                temperature=temperature, top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                eos_id=SimpleTokenizer.EOS):
             ch = inv.get(tid)
             if ch:  # 特殊 token（BOS/EOS/UNK）跳过不吐
                 yield ch

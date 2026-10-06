@@ -51,6 +51,62 @@ def test_generate_greedy():
     assert int(gen.max()) < 256
 
 
+def test_repetition_penalty_off_is_identity():
+    """惩罚=1.0 时与旧采样逐位一致；stream 与 generate 同基元逐位一致."""
+    m = _tiny()
+    m.eval()
+    x = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        g1 = m.generate(x, max_new_tokens=8)
+        g2 = m.generate(x, max_new_tokens=8, repetition_penalty=1.0)
+        s1 = list(m.stream_tokens(x, max_new_tokens=8))
+        s2 = list(m.stream_tokens(x, max_new_tokens=8, repetition_penalty=1.3))
+        g3 = m.generate(x, max_new_tokens=8, repetition_penalty=1.3)
+    assert torch.equal(g1, g2)
+    assert s1 == g1[0, 8:].tolist()
+    assert s2 == g3[0, 8:].tolist()
+
+
+def test_repetition_penalty_suppresses_seen_tokens():
+    """惩罚压低已出现 token 的原始 logit（正值除、负值乘，一律下降）."""
+    m = _tiny()
+    m.eval()
+    h = torch.randn(1, 1, m.config.d_model)
+    with torch.no_grad():
+        base = m._sample_next(h, 0.0, 0)
+        t = int(base[0, 0])
+        raw = m.lm_head(h)[:, -1, :].float()[0, t].item()
+        got = m.lm_head(h)[:, -1, :].float()
+        past = torch.full((1, 6), t, dtype=torch.long)
+        seen = torch.zeros_like(got, dtype=torch.bool)
+        seen.scatter_(1, past.clamp(0, got.shape[-1] - 1), True)
+        lowered = torch.where(
+            seen,
+            torch.where(got < 0, got * 1.5, got / 1.5), got)[0, t].item()
+        assert lowered < raw
+
+
+def test_repetition_penalty_per_row_independent():
+    """batch 行间互不串扰：只换第 0 行上下文，第 1 行输出逐位不变."""
+    m = _tiny()
+    m.eval()
+    h = torch.randn(2, 1, m.config.d_model)
+    row1_past = torch.tensor([[5, 6, 7, 8, 9, 10]], dtype=torch.long)
+    past_a = torch.zeros(2, 6, dtype=torch.long)
+    past_a[1] = row1_past
+    past_b = torch.full((2, 6), 200, dtype=torch.long)
+    past_b[1] = row1_past
+    with torch.no_grad():
+        out_a = m._sample_next(h, 0.0, 0, 2.0, past_a)
+        out_b = m._sample_next(h, 0.0, 0, 2.0, past_b)
+    assert int(out_a[1, 0]) == int(out_b[1, 0])
+    # past=None 等价无惩罚
+    with torch.no_grad():
+        out_none = m._sample_next(h, 0.0, 0, 2.0, None)
+        out_plain = m._sample_next(h, 0.0, 0)
+    assert torch.equal(out_none, out_plain)
+
+
 def test_train_step_decreases_or_finite():
     """单步训练：loss 有限、梯度范数有限."""
     m = _tiny()

@@ -224,6 +224,7 @@ class TinyLLM(nn.Module):
         temperature: float = 0.0,
         top_k: int = 0,
         eos_id: int | None = None,
+        repetition_penalty: float = 1.0,
     ) -> torch.Tensor:
         """自回归生成（增量 KV/状态缓存，线性层 O(1)/步）.
 
@@ -235,7 +236,8 @@ class TinyLLM(nn.Module):
         self.eval()
         try:
             return self._generate_inner(
-                input_ids, max_new_tokens, temperature, top_k, eos_id)
+                input_ids, max_new_tokens, temperature, top_k, eos_id,
+                repetition_penalty)
         finally:
             if was_training:
                 self.train()
@@ -261,9 +263,28 @@ class TinyLLM(nn.Module):
         h_last: torch.Tensor,
         temperature: float,
         top_k: int,
+        repetition_penalty: float = 1.0,
+        past_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """按温度/top-k 采样下一步（贪心 temperature=0），返回 (b, 1) id."""
-        next_logits = self.lm_head(h_last)[:, -1, :]
+        """按温度/top-k 采样下一步（贪心 temperature=0），返回 (b, 1) id.
+
+        repetition_penalty: HF 语义，已出现 token 的 logit 正值除以惩罚、
+        负值乘以惩罚（=1.0 关闭，逐位等价旧行为）；past_ids 为 (b, T) 上下文
+        （含已生成），None 时不惩罚。专治贪心在高频 token（模板 `<`、
+        markdown `####`）上的循环吸引子。
+        """
+        next_logits = self.lm_head(h_last)[:, -1, :].float()
+        if repetition_penalty != 1.0 and past_ids is not None:
+            v = next_logits.shape[-1]
+            seen = torch.zeros_like(next_logits, dtype=torch.bool)
+            seen.scatter_(1, past_ids.clamp(0, v - 1), True)
+            next_logits = torch.where(
+                seen,
+                torch.where(next_logits < 0,
+                            next_logits * repetition_penalty,
+                            next_logits / repetition_penalty),
+                next_logits,
+            )
         if temperature > 0:
             next_logits = next_logits / max(temperature, 1e-6)
             if top_k > 0:
@@ -310,6 +331,7 @@ class TinyLLM(nn.Module):
         temperature: float = 0.0,
         top_k: int = 0,
         eos_id: int | None = None,
+        repetition_penalty: float = 1.0,
     ) -> torch.Tensor:
         """自回归生成内循环（调用方 generate 已处理 eval 模式切换）.
 
@@ -319,7 +341,8 @@ class TinyLLM(nn.Module):
         h, pasts = self._prefill(input_ids)
         cur = input_ids
         for _ in range(max_new_tokens):
-            nxt = self._sample_next(h[:, -1:], temperature, top_k)
+            nxt = self._sample_next(h[:, -1:], temperature, top_k,
+                                    repetition_penalty, cur)
             cur = torch.cat([cur, nxt], dim=1)
             if eos_id is not None and bool((nxt == eos_id).all()):
                 break
@@ -334,6 +357,7 @@ class TinyLLM(nn.Module):
         temperature: float = 0.0,
         top_k: int = 0,
         eos_id: int | None = None,
+        repetition_penalty: float = 1.0,
     ):
         """逐 token 生成器（SSE 流式/OpenAI stream 用），逐个 yield 新 id（int）.
 
@@ -344,11 +368,16 @@ class TinyLLM(nn.Module):
         self.eval()
         try:
             h, pasts = self._prefill(input_ids)
+            seen: list[torch.Tensor] = []
             for _ in range(max_new_tokens):
-                nxt = self._sample_next(h[:, -1:], temperature, top_k)
+                cur = (torch.cat([input_ids, *seen], dim=1) if seen
+                       else input_ids)
+                nxt = self._sample_next(h[:, -1:], temperature, top_k,
+                                        repetition_penalty, cur)
                 yield int(nxt[0, 0])
                 if eos_id is not None and bool((nxt == eos_id).all()):
                     break
+                seen.append(nxt)
                 h, pasts = self._decode_step(nxt, pasts)
         finally:
             if was_training:

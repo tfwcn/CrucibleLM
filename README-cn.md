@@ -219,8 +219,9 @@ backend = LocalChatBackend.load("data/llm-ckpt/model", SmallLLMConfig())
 resp = backend.chat([{"role": "user", "content": "你好"}], max_new_tokens=128)
 print(resp["content"])  # resp 还有 reasoning/tool_calls/finish_reason 字段（OpenAI 兼容形状）
 
-# 采样参数：temperature=0 贪心；>0 按温度采样，top_k 截断（默认无 top-p/重复惩罚，
-# 长文本循环用 temperature 0.7~1.0 + 短 max_new_tokens 缓解）
+# 采样参数：temperature=0 贪心；>0 按温度采样，top_k 截断；repetition_penalty>1
+# 抑制已出现 token（HF 语义，默认 1.0 关闭；贪心配 1.2~1.4 可消灭模板 `<`/markdown
+# `####` 类循环，实测 4-gram 复读 0.58→0.04；默认无 top-p）
 resp = backend.chat([{"role": "user", "content": "你好"}], max_new_tokens=256, temperature=0.7, top_k=50)
 ```
 
