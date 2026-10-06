@@ -31,6 +31,16 @@
 - 配置存档：启动器把 YAML 拷进 `ckpt-dir/run.yaml`——复现认这个文件，
   不认你当时敲了什么。
 
+## 从想法到代码
+
+三种命三种写法：latest 全量（含 optim），快照轮转，冠军看 eval：
+
+```python
+save_ckpt(...)          # 每 100 步：model.pt + optim.pt + latest.json，快照只留 20
+if ema_val < best_val:  # 每次 eval：新低才存
+    save_best(ema_or_model)  # best/ 永不轮转
+```
+
 ## 代价与坑
 
 - `optim.pt` 和权重是分开的两个文件，拷 checkpoint 务必成对拷，

@@ -40,6 +40,17 @@ out = Σ w_e · Expert_e(x)  +  Shared(x)
 - AMP 下 `top_w` 常为 fp32，权重先对齐到输入精度再聚合，否则 index 报错
   或隐式提升把残差流抬成 fp32（注释里有，抄的时候别删）。
 
+## 从想法到代码
+
+"分诊"即 top-k，"会诊"即加权和；性能版把 16 次循环压成 3 次 bmm：
+
+```python
+top_w, top_i = topk(softmax(router(x)), 4)   # 分诊
+# 朴素版：for e in 16: w = (top_i == e) 加权求和；expert(x)  # 16 次 dispatch
+# 分组版：token 展开×4 → 按专家排序垫齐 → 3 次 bmm → 散射加回
+gate = silu(canvas @ Wg) * (canvas @ Wu); out = gate @ Wd
+```
+
 ## 代价与坑
 
 - 推理要存 16 个专家的权重（128M 里大头），batch=1 时 12 个没命中的白占显存——

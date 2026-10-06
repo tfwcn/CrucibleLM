@@ -41,6 +41,18 @@ delta = Σ softmax(score)·values[slot]；输出 = h + delta（残差式）
   稀疏收益在于每步只 gather 命中的 k 行；
 - `_decode_step` 必须同步走记忆层（value 非零后漏掉即分叉 0.69，pitfalls 第 7 条）。
 
+## 从想法到代码
+
+查字典即"劈半查目录 + 笛卡尔对页码"，恒等即 value 全零：
+
+```python
+i1, i2 = topk(q1 @ K1.T), topk(q2 @ K2.T)   # 两半各查各的
+slot = i1 * side + i2                        # 笛卡尔组合，k² 候选再取 top-k
+delta = softmax(score) @ values[slot]        # 只搬 k 行
+return h + delta                              # values 全零时恒等
+# B 初始化：init_memory.py 跑校准集 → hidden 劈半 k-means → 簇心当 keys
+```
+
 ## 代价与坑
 
 - 记忆是"外挂"，不是"学会"：keys 定了之后靠训练微调，学新事实不如 RAG 快，

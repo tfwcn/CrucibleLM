@@ -36,6 +36,17 @@ RMSNorm 内部用 fp32 求方差（`mla.py` 注释写了），混合精度下不
 - 初始化配合：残差分支的输出投影用小方差（`0.02/sqrt(2N)`，GPT-2 式），
   embedding 小方差——归一 + 小初始化双保险，loss 起步才不爆炸
 
+## 从想法到代码
+
+稳压器三行，半精度安全是刻意设计（内部 fp32 求方差）：
+
+```python
+xf = x.float(); var = xf.pow(2).mean(-1, keepdim=True)
+return (xf * rsqrt(var + eps) * self.weight.float()).to(x.dtype)
+# QK-Norm：点积前 q, k = RMSNorm(q), RMSNorm(k)
+# SwiGLU：w_down(silu(w_gate(x)) * w_up(x))
+```
+
 ## 代价与坑
 
 - RMSNorm 的 `weight` 全 1 初始化，别手贱改小——它是"缩放"不是"衰减"。

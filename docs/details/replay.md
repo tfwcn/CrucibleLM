@@ -29,6 +29,16 @@ SFT 第二遍刷同样数据，val 走 U 型——新分布把旧能力覆盖了
 4. **巩固期**（`--consolidate-steps N --consolidate-replay 0.4`）：
    新分布开头 N 步回放加码 + lr 钳制在起始值（warmup 不升）。
 
+## 从想法到代码
+
+三件套各一行：池子是 FIFO，混合是 batch 级轮询，巩固是 lr 钳制：
+
+```python
+replay_buf.push(hardest_block)                 # 每步最难 1 块入池
+trains = interleave_batches(sft, replay, 17, 3)  # 主流耗尽即停，回放不计 cursor
+g["lr"] = min(scheduled, lr0)                  # 巩固期：只许降不许升
+```
+
 ## 代价与坑
 
 - 三者默认全关：500 步 A/B（同数据同种子，eval 低 ≥0.1 且 aux 不飘）赢了再开——

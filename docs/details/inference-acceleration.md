@@ -45,6 +45,16 @@ rope 下标钳制（预留 L 可超 rope 缓存，空位反正被掩）。
 - 反面教材：静态缓存之前 compile 是 5.1（越编越慢）——"本地无效不进库"，
   当时直接删了方法只留教训，缓存落地后才请回来
 
+## 从想法到代码
+
+三级跳各一行：分组压循环，定形状消重编，融算子消分发：
+
+```python
+# L1: 16 次 expert(x) → 3 次 bmm（moe.py 分组）
+# L2: past: (c, kr) → (buf_c, buf_kr, pos)  # 预分配+按位写，形状恒定
+# L3: model.compile_decode()                # sparse _decode 标 disable 防重编
+```
+
 ## 代价与坑
 
 - prefill 缓存从 T 长变 L 长（多预留区），200K 会话按需 reservation，别瞎扩；

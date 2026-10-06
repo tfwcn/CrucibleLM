@@ -32,6 +32,16 @@ MTP 头是个浅层块（`norm + proj`，`mtp_depth=1`），复用主词表头�
 - RHO 选择时 MTP 全量（aux 和 MTP 都必须看全路由/全序列，不能只挑难的）；
 - 推理/评测：MTP 头直接不用，零成本。
 
+## 从想法到代码
+
+多押一注就是多一个浅头，复用主词表头，不新增大矩阵：
+
+```python
+mtp_h = self.mtp(h[:, :-2])          # norm + proj，独立表达空间
+mtp_loss = CE(lm_head(mtp_h), targets[:, 2:])  # 拿 i 处 hidden 押 i+2
+loss = main + 0.3 * mtp_loss + aux
+```
+
 ## 代价与坑
 
 - MTP loss 天然比主 loss 高（t+2 更难猜，实测 3.8~4.7 vs 主 1.6~2.0），

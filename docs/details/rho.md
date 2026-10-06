@@ -31,7 +31,8 @@ loss = loss - main_mean + (loss·mask).mean()   # 精确扣除：同张量相减
    （`do_kd` 的 micro 才算，其余 micro 回落自参照），零额外开销。
 
 关键细节：**精确扣除**——`loss - main_mean + selected`，同张量相减，
-保证没选中的 token 梯度贡献精确为零（而不是"约等于零"），保底 64 个防空选。
+保证没选中的 token 梯度贡献精确为零（而不是"约等于零"），
+保底防空选（自参照 64 个，老师版 8 个——配对位少，阈值跟着小）。
 
 ## 我们的实现
 
@@ -40,6 +41,16 @@ loss = loss - main_mean + (loss·mask).mean()   # 精确扣除：同张量相减
 - 开关：`--rho-keep 0.5`、`--rho-ref teacher/none`
 - RHO 的 loss 口径天然偏高（只平均难的），**绝不能和旧曲线比大小**
   （AGENTS.md 明文规定；看 val，不看 train loss）
+
+## 从想法到代码
+
+错题本就是 mask，同张量相减保证没选中的梯度精确为零：
+
+```python
+mask = top50%(token_losses)                    # 自参照：batch 内百分位
+mask = top50%(student - teacher)               # 老师版：超额 loss，锚点位排名
+loss = loss - main_mean + (loss * mask).mean() # 精确扣除
+```
 
 ## 代价与坑
 

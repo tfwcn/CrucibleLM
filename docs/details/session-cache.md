@@ -35,6 +35,17 @@
 - 服务进程按会话 id 复用待接线（现状）；和 RETRO 正交可叠加
   （一个管"说过的话"，一个管"库里的知识"）。
 
+## 从想法到代码
+
+存折就是 past 列表 + 已见 id，扩容按 2x：
+
+```python
+h, self.pasts = model._prefill(ids, max_new_tokens=N)  # 首段预留
+h, self.pasts = model._decode_step(tok, self.pasts)    # 后续单步续跑
+torch.save({"pasts": ..., "ids": ...}, path)           # 落盘
+self.ensure_room(need)                                 # 不够就 2x 扩
+```
+
 ## 代价与坑
 
 - 预留是"prompt + max_new"精确制，超了 fail-fast（IndexError）——

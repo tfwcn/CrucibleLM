@@ -42,6 +42,16 @@
 校准脚本注意：`vocab_size` 保持预设 8192，缩表会导致 embedding 静默覆写不上
 （实测抓到过）。
 
+## 从想法到代码
+
+打包即"拼满切块"，混合即"按权轮询"，续流即"记数快进"：
+
+```python
+ids += prompt_ids + output_ids          # SFT：prompt 掩 IGNORE，只学 output
+blocks = interleave([a]*3 + [b]*1)     # 多目录按权重轮询
+_skip(stream, data_cursor - 1024)      # 断点续流，扣在途余量宁重勿丢
+```
+
 ## 代价与坑
 
 - 换数据 = 换评测尺子：holdout 取自流的前 256 个（多目录交错取），

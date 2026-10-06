@@ -31,6 +31,17 @@
 - 服务端 `repetition_penalty` + `top_k` 全透传（`top_k` 曾解析了又丢掉，
   README 却写透传，顺手修实了）。
 
+## 从想法到代码
+
+采样即"改 logits 再掷骰子"，惩罚即"见过的降权"：
+
+```python
+logits = lm_head(h_last)[:, -1, :]
+seen = scatter(past_ids)                       # 上下文出现过的位置
+logits = where(seen, where(logits < 0, logits*p, logits/p), logits)  # HF 语义
+nxt = argmax(logits) if temp == 0 else multinomial(softmax(logits/temp))
+```
+
 ## 代价与坑
 
 - 贪心 + 无惩罚 = 循环 Fuji：sample 评测必须固定 prompt 集看复读率数字，

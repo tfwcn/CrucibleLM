@@ -33,6 +33,16 @@
 日常迭代（数据/loss/长度/优化器）永远 `--resume`，不动结构；
 精确迁移直接续，近似迁移先小步验证（loss 回到旧终点附近再全速）。
 
+## 从想法到代码
+
+恒等即"输出投影置零 / 单元复制平分"，迁移即"换结构 + 严格载入旧权重"：
+
+```python
+migrate --add-layers 4        # 新层 w_o 置零，pre-norm 下恒等
+migrate --expert-hidden 384   # Net2WiderNet：复制单元，下投影列平分
+train --init-checkpoint out/  # overlap 载入，动量新开，直接续训
+```
+
 ## 代价与坑
 
 - 恒等只保输出，不保优化 landscape——加深后梯度路径变了，

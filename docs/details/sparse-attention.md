@@ -37,6 +37,16 @@ sink（开头 128）+ window（附近 4096）+ stride（每 512 抽 1 个）。
 - softmax 提 fp32（bf16 下长序列 exp 易欠精），再转回；
 - 长序列 prefill 按 `sparse_chunk=2048` 分块（显存/速度折中）。
 
+## 从想法到代码
+
+"跳读"就是下标计算 + gather，阈值下直接走 dense（同一套权重，零分叉）：
+
+```python
+idx, n_static = select_keys(total, start, end, sink=128, window=4096, stride=512)
+k_sel = k_full[:, :, idx, :]          # 只把选中的 key 搬出来算
+mask = tril(...)                       # 静态列放行，本块列因果掩
+```
+
 ## 代价与坑
 
 - pattern 是手写的启发式，不是学出来的——如果关键信息恰好落在"跳过"的缝里，

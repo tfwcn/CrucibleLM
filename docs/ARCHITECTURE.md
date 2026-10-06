@@ -249,8 +249,8 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   只在锚点配对位排名，非配对位恒训练；区分"真不会"与"噪声"，老师前向与 KD 共用。
 - **课程**（`--curriculum "0.7:0.0:3000"`）：min-score 阈值线性放开，仅有 score
   字段的源生效（ultrafineweb），HQ 自动跳过；阈值实时读，日志记 `cur_min_score`。
-- **EMA**（`--ema-every 100 --ema-weight 0.05`）：bf16 影子 + logits-MSE 一致性，
-  稳定器（专治站点切换鼓包），多约 0.3GB 显存和一次前向。
+- **EMA**（`--ema-every 100 --ema-weight 0.05`）：fp32 影子 + logits-MSE 一致性，
+  稳定器（专治站点切换鼓包），多约 0.5GB 显存和一次前向。
   开 EMA 后评测同步测影子（`ema_val_loss`，影子保持 eval 模式），
   冠军按影子值选、存影子权重（平滑冠军，过拟合抖动期白捡精度）。
 - **冠军快照**（自动）：每次 eval 出现新低就另存 `best/`（权重 + meta，

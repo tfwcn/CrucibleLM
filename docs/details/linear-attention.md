@@ -48,6 +48,19 @@ o_t = q_t^T · S_t / sqrt(d)
 - 解码时卷积尾部必须拼上次的 `buf`（`_step_conv` 取 `buf+current` 末段），
   否则第 3 个 token 起左感受野丢一个真实 token（pitfalls 第 4 条）。
 
+## 从想法到代码
+
+"金鱼小抄"就是三行递推，训练并行版是它的数学展开：
+
+```python
+# 解码（O(1)/步）：先衰减旧小抄，再把新知识以外积写进去
+new_state = s_prev * decay + k.unsqueeze(-1) @ v.unsqueeze(-2)
+o = (q @ new_state) * scale
+# 训练（并行等价）：衰减连乘成矩阵，一次算完
+d_mat[i, j] = prod(decay[j+1..i])   # 先填 -inf 再 exp，防 0×inf=NaN
+scores = (Q @ K.T) * scale * d_mat
+```
+
 ## 代价与坑
 
 - 状态是定长的，200K 的细节注定记不住——和 MLA 互补（MLA 记梗概准，

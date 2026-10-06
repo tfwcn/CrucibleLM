@@ -39,6 +39,17 @@
   交叉验证：aux 0.12（路由均衡）+ 零休眠 = 模型已被榨干，
   "效果一般"不是容量闲置，杠杆只剩数据与规模（见 ARCHITECTURE 容量节）。
 
+## 从想法到代码
+
+考勤即 hook 均值，交接即"输入重开 + 输出置零"：
+
+```python
+mid = silu(expert.w_gate(x)) * expert.w_up(x)  # hook 在 MoE 上重算（专家 forward 已不跑）
+score = mean(|mid|); dormant = score < 1e-3 * 层均值
+expert.w_gate[j].normal_(); expert.w_up[j].normal_()  # 输入重开
+expert.w_down[:, j].zero_()                          # 输出置零 → 恒等
+```
+
 ## 代价与坑
 
 - 分组 bmm 后专家子模块 forward 不再被调用——hook 必须挂在 MoE 上重算

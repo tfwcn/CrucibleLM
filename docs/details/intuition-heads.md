@@ -28,6 +28,16 @@
 - RAG 切片：决策取"最近 + top-K 捞回"（`retrieval.py`），不啃全量；
   200K 会话靠"RAG 切片先行、增量状态随后"（+ `SessionCache` 联动）。
 
+## 从想法到代码
+
+把脉即"冻结 backbone，只训头"，置信度要校准：
+
+```python
+feat = backbone.encode_full_hidden(ids)  # 冻结，不花梯度
+logits = IntuitionHead(feat)              # d→256→n类，二分类自动 BCE
+T = calibrate_temperature(...)            # 网格选 T，不然置信度全是 0.99
+```
+
 ## 代价与坑
 
 - 头的上限是 backbone 的 hidden 质量——backbone 不行，头再调也没用，

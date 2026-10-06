@@ -36,6 +36,16 @@ router 这些向量/特殊参数继续 AdamW——不同形状不同脾气，硬
 - 注意：Muon 存盘和 AdamW **不互通**——切换优化器要删 `optim.pt` 重开动量
   （权重不受影响，只丢动量，warmup 几天就回来）
 
+## 从想法到代码
+
+队列操就是"正交化动量"，2D 才用（向量继续 AdamW）：
+
+```python
+# 2D 隐藏权重走 Muon，其余走 AdamW（build_hybrid_optimizer 按形状分流）
+M = newton_schulz(momentum)   # 正交化：方向留下，大小抹平
+W -= muon_lr * M              # muon_lr 与 AdamW 的 lr 分开调度
+```
+
 ## 代价与坑
 
 - Muon 偏好大 batch：小 batch 下噪声把正交化带偏，反而不如 AdamW 稳。

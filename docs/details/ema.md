@@ -37,9 +37,20 @@
 - 日志：`ema_val_loss` 与 `val_loss` 并列，看两条线的 gap——gap 大说明抖动大，
   影子价值大；gap 收敛说明训练已稳
 
+## 从想法到代码
+
+影子三件：建（deepcopy）、同步（动量式）、评（保持 eval）：
+
+```python
+ema = deepcopy(model).eval()                          # 建
+ema_p.mul_(decay).add_(p.detach(), alpha=1-decay)     # 每 N 步同步
+ema_val = evaluate(ema, ..., restore_train=False)     # 评：别被翻成 train
+if ema_val < best: save_best(ema)                     # 冠军存影子
+```
+
 ## 代价与坑
 
-- 多一份模型权重的显存（bf16 影子约 0.3GB）+ 每 N 步一次全量拷贝（同步开销小）。
+- 多一份模型权重的显存（影子与主干同精度 fp32，约 0.5GB；别信旧文档写的 bf16/0.3GB，实测纠正过）+ 每 N 步一次全量拷贝（同步开销小）。
 - 影子是滞后的：训练初期（前几百步）影子不如 raw，别太早信它；过拟合上坡段
   影子一直在变好（sft5 实测 ema 全程单调下行），那是它最高光的时刻。
 

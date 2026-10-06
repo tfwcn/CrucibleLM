@@ -41,6 +41,17 @@ attention 天然能做"指针式复制"，这是 v1 到 v2 的质变。
 - 用法推荐 B（mid-training 增广 + 尾段关掉冷却），A（真 RAG 上线）等
   检索升级 + mem 消融诊断（真 mem vs 随机 mem 有 loss 差）后再做。
 
+## 从想法到代码
+
+v1 是均值拼前缀，v2 是原文按 token 融；检索是"倒排 + 掐头去尾"：
+
+```python
+# v1: mem = mean(embed(doc))            # (b, K, d)，话题方向
+# v2: ids, mask = build_batch_chunk_ids(...)  # (b, K, L)，frozen embed 查表
+h = h + w_o(attend(h, mem))             # w_o 零初始化，恒等起点
+hits = query(text, k=2, max_terms=12)   # 只取 idf 最高的词，0.76s/查
+```
+
 ## 代价与坑
 
 - v1 的增益期望≈0（均值向量只能给方向），它的任务是证明管线不炸——

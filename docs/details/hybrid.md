@@ -30,8 +30,19 @@
   `src/llm/local/config.py`（`is_full_attn_layer()`）
 - 全注意力层 = `SparseMLAModule`（MLA + 稀疏，短序列自动退化 dense）；
   线性层 = `GatedDeltaLite`
-- 记忆层和 RETRO 交错块恰好也落在 0/4/8 层（`memory_every=4`），
-  和"钉子户"同层：记忆需要最准的 hidden，钉子户给的就是最准的
+- 记忆层和 RETRO 交错块可以和"钉子户"同层（sft5 配 `memory_every=4` 落在 0/4/8）：
+  记忆需要最准的 hidden，钉子户给的就是最准的（注意 `retro_every` 默认 0
+  是单点融合，只在显式设为 4 时才交错，别抄错）
+
+## 从想法到代码
+
+排班就是一行取模，构造时决定，之后全模型通用（迁移工具也调它，防漂移）：
+
+```python
+def is_full_attn_layer(i): return i % full_attn_every == 0  # 0/4/8 是钉子户
+def build_block(cfg, i):  # 模型/迁移/训练共用的唯一入口
+    attn = SparseMLAModule(...) if is_full_attn_layer(i) else GatedDeltaLite(...)
+```
 
 ## 代价与坑
 

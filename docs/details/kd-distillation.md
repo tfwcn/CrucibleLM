@@ -40,6 +40,16 @@ Loss = CE + kd_alpha·KL/T² + MTP（Hinton T² 还原梯度量级，按配对�
   transformers 锁 4.54.1，别升级；
 - RHO-teacher 复用同一路老师前向（`do_kd` 的 micro 才算，其余回落自参照）
 
+## 从想法到代码
+
+对齐即查表：老师 token 的字符区间 → 学生位置，锚点处截断做 KL：
+
+```python
+s_pos = pos_of_char[bnd - 1]          # 老师 token k 覆盖 [a,b) → 学生位置
+kl = KL(softmax(t[t_anchor]/T) || log_softmax(s[s_anchor]/T)) * T² / n_pairs
+# kd-every=8：每 8 micro 跑 1 次老师，kd 项 ×8 保期望
+```
+
 ## 代价与坑
 
 - 锚点只有 423 个字符（7%），93% 的位置老师帮不上——KD 是"家教"不是"代考"，
