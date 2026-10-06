@@ -140,16 +140,17 @@ class SparseMLAModule(MLAModule):
     def forward(
         self,
         h: torch.Tensor,
-        past: tuple[torch.Tensor, torch.Tensor] | None = None,
+        past: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         return_state: bool = True,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        reserve: int = 0,
+    ) -> tuple[torch.Tensor, tuple | None]:
         """稀疏前向：短序列/解码缓存命中时退化为 dense 等价，超长才分块聚集."""
         b, t, _ = h.shape
         if past is not None:
             return self._decode(h, past)
         if t <= self.sparse_threshold:
-            # 短序列：与 MLAModule 逐位一致
-            return super().forward(h, None, return_state)
+            # 短序列：与 MLAModule 逐位一致（reserve 透传装箱）
+            return super().forward(h, None, return_state, reserve)
         # 长序列分块预填充
         q_full, k_full, v_full, c_kv, k_rope_raw = self._full_qkv_for_gather(h)
         outs = []
@@ -160,33 +161,46 @@ class SparseMLAModule(MLAModule):
         out = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, t, -1)
         if not return_state:
             return self.w_o(out), None
-        # 缓存仍存 latent（与 MLA 一致，200K 上下文每 token 仅 ~320B/层）
-        return self.w_o(out), (c_kv, k_rope_raw)
+        # 缓存仍存 latent（与 MLA 一致，200K 上下文每 token 仅 ~320B/层），
+        # 静态装箱（reserve 由 _prefill 按 prompt+max_new 精确给出）
+        return self.w_o(out), self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
 
+    @torch._dynamo.disable
     def _decode(
         self,
         h: torch.Tensor,
-        past: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """增量解码：latent 缓存展开后按 pattern 聚集（短上下文自动退化为全量）."""
+        past: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """增量解码：latent 缓存展开后按 pattern 聚集（短上下文自动退化为全量）.
+
+        静态缓存版：按位写进预分配缓冲（不再 `cat`），pattern 按实际长度算
+        （gather 下标全落在有效区，无需额外掩码，与 cat 版逐位一致）。
+        """
         b, t, _ = h.shape
-        c_prev, kr_prev = past
-        c_new = torch.cat([c_prev, self.w_dkv(h)], dim=1)
-        k_rope_new = torch.cat([kr_prev, self.w_kr(h)], dim=1)
-        total = c_new.shape[1]
+        buf_c, buf_kr, pos = past
+        w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
+        buf_c.index_copy_(1, w_idx, self.w_dkv(h))
+        buf_kr.index_copy_(1, w_idx, self.w_kr(h))
+        pos_next = pos + t
+        # 实际长度（pattern 按实际算；一次同步，eager 可忽略；
+        # compile 下此处 graph-break 但不重编）
+        total = int(pos_next.item())
         # 当步 Q（含绝对位置 RoPE）
         q_c = self.w_dq(h)
         q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
         q_rope = self.w_qr(q_c).view(b, t, self.n_heads, self.qk_rope_dim)
         off = total - t
         q_rope = apply_rope_wrap(q_rope, self.rope_cos[off:off + t], self.rope_sin[off:off + t])
-        # 全历史展开（latent 省的是缓存不是计算，单步展开可接受）
-        k = self.k_norm(self.w_uk(c_new).view(b, total, self.n_heads, self.head_dim))
-        v = self.w_uv(c_new).view(b, total, self.n_heads, self.head_dim)
+        # 全缓冲展开（latent 省的是缓存不是计算，单步展开可接受；
+        # pattern 只 gather 有效下标，空位不参与；rope 下标钳制防 L 超缓存）
+        k = self.k_norm(self.w_uk(buf_c).view(b, -1, self.n_heads, self.head_dim))
+        v = self.w_uv(buf_c).view(b, -1, self.n_heads, self.head_dim)
+        _rlen = self.rope_cos.shape[0]
+        _ridx = torch.arange(buf_kr.shape[1], device=h.device).clamp(max=_rlen - 1)
         k_rope_hist = apply_rope_wrap(
-            k_rope_new,
-            self.rope_cos[:total],
-            self.rope_sin[:total],
+            buf_kr,
+            self.rope_cos[_ridx],
+            self.rope_sin[_ridx],
         ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)
         q_full = torch.cat([q, q_rope], dim=-1).transpose(1, 2)
         k_full = torch.cat([k, k_rope_hist], dim=-1).transpose(1, 2)
@@ -194,7 +208,7 @@ class SparseMLAModule(MLAModule):
         # 查询即最后位置：select_keys(total, total-1, total)，q 只有当步
         out = self._sparse_scores(q_full, k_full, v_full, total - 1, total, total)
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
-        return self.w_o(out), (c_new, k_rope_new)
+        return self.w_o(out), (buf_c, buf_kr, pos_next)
 
 
 def apply_rope_wrap(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:

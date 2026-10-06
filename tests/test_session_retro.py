@@ -168,3 +168,17 @@ def test_memory_init_with_fewer_samples_than_slots():
     assert info["n_samples"] == 5 and info["inertia"] >= 0
     x = torch.randn(1, 3, 32)
     assert torch.allclose(pk(x), x, atol=1e-6)
+
+
+def test_session_cache_grows_and_stays_correct():
+    """ensure_room：预留打满后自动 2x 扩，续跑仍与全前向一致."""
+    m = _tiny_eval()
+    x = torch.randint(0, 256, (1, 12))
+    with torch.no_grad():
+        full = m(x)["logits"]
+    sc = SessionCache(m)
+    sc.extend(x[:, :4], max_new_tokens=2)  # 只留 2 步余量
+    h = sc.extend(x[:, 4:8])  # 4 步 > 余量，触发扩容
+    with torch.no_grad():
+        logits = m.lm_head(h.unsqueeze(1))
+    assert torch.allclose(logits, full[:, 7:8], atol=1e-5)

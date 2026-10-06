@@ -808,7 +808,7 @@ def test_sparse_dense_equivalence():
         o_dense, _ = dense(h)
         o_sparse, past = sparse(h)
     assert torch.allclose(o_dense, o_sparse, atol=1e-5), (o_dense - o_sparse).abs().max()
-    assert past is not None and len(past) == 2
+    assert past is not None and len(past) == 3  # 静态三元组 (buf_c, buf_kr, pos)
 
 
 def test_sparse_decode_matches_prefill():
@@ -823,8 +823,8 @@ def test_sparse_decode_matches_prefill():
     h = torch.randn(1, 32, 128)
     with torch.no_grad():
         full, _ = m(h)
-        # prefill 前 24 个，再单步解码 8 个
-        pre, past = m(h[:, :24])
+        # prefill 前 24 个（reserve 精确到 32），再单步解码 8 个
+        pre, past = m(h[:, :24], None, True, 32)
         assert pre.shape == (1, 24, 128)
         hh, cur_past = h[:, 24:25], past
         outs = []
@@ -1048,3 +1048,37 @@ def test_run_train_argv_mapping():
         assert "max_stepz" in str(e)
     else:
         raise AssertionError("未知键应报错")
+
+
+def test_mla_static_cache_matches_full_forward():
+    """MLA 静态缓存：prefill（reserve 精确）+ 逐 token 解码 == 全前向."""
+    from src.llm.local.mla import MLAModule
+
+    torch.manual_seed(0)
+    m = MLAModule(128, 4, 32, 32, 16, max_seq_len=256)
+    m.eval()
+    h = torch.randn(1, 20, 128)
+    with torch.no_grad():
+        full, _ = m(h)
+        _, past = m(h[:, :14], None, True, 20)
+        assert len(past) == 3 and past[2].item() == 14
+        outs = []
+        cur = past
+        for i in range(14, 20):
+            o, cur = m(h[:, i:i + 1], cur)
+            outs.append(o)
+    assert torch.allclose(torch.cat(outs, dim=1), full[:, 14:], atol=1e-5)
+
+
+def test_static_cache_overflow_fails_fast():
+    """预留不足时解码越界报错（fail-fast，防静默写坏；扩容走 ensure_room）."""
+    from src.llm.local.mla import MLAModule
+
+    torch.manual_seed(0)
+    m = MLAModule(128, 4, 32, 32, 16, max_seq_len=256)
+    m.eval()
+    h = torch.randn(1, 4, 128)
+    with torch.no_grad():
+        _, past = m(h[:, :3], None, True, 3)  # 恰好装满，无余量
+        with pytest.raises((RuntimeError, IndexError)):  # index_copy_ 越界
+            m(h[:, 3:4], past)

@@ -119,6 +119,27 @@ def test_half_inference_runs_finite():
         assert int(gen.max()) < 256
 
 
+def test_compile_decode_matches_eager():
+    """编译解码与 eager 逐位一致（静态缓存下无重编，见 pitfalls 9）."""
+    m = _tiny()
+    m.eval()
+    m2 = _tiny()
+    m2.load_state_dict(m.state_dict())
+    m2.eval()
+    m2.compile_decode()
+    x = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        h1, p1 = m._prefill(x, max_new_tokens=8)
+        h2, p2 = m2._prefill(x, max_new_tokens=8)
+        for _ in range(4):
+            n1 = m._sample_next(h1[:, -1:], 0.0, 0)
+            n2 = m2._sample_next(h2[:, -1:], 0.0, 0)
+            assert int(n1[0, 0]) == int(n2[0, 0])
+            h1, p1 = m._decode_step(n1, p1)
+            h2, p2 = m2._decode_step(n2, p2)
+        assert torch.allclose(h1, h2, atol=1e-5)
+
+
 def test_train_step_decreases_or_finite():
     """单步训练：loss 有限、梯度范数有限."""
     m = _tiny()

@@ -245,16 +245,20 @@ class TinyLLM(nn.Module):
     def _prefill(
         self, input_ids: torch.Tensor,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        max_new_tokens: int = 64,
     ) -> tuple[torch.Tensor, list]:
         """Prefill：整段 prompt 一次前向，返回 (末位置 hidden 前的 h, 每层缓存）.
 
         h 为全序列 hidden（调用方取 h[:, -1:] 算 logits）；pasts 供单步解码续跑。
         retro_mem：V2 交错融合的 frozen chunk 编码（生成带检索时传，与 decode 同值）。
+        max_new_tokens: 静态缓存预留（prompt 长 + 该值；generate 精确传入，
+        不够写时解码报错，SessionCache 用 ensure_room 提前扩）。
         """
         h = self.embed(input_ids)
+        reserve = input_ids.shape[1] + max(0, max_new_tokens)
         pasts: list = []
         for layer in self.layers:
-            h, (p, _) = layer(h, retro_mem=retro_mem)
+            h, (p, _) = layer(h, retro_mem=retro_mem, reserve=reserve)
             pasts.append(p)
         return self.final_norm(h), pasts
 
@@ -323,6 +327,18 @@ class TinyLLM(nn.Module):
             new_pasts.append(p2)
         return self.final_norm(hh), new_pasts
 
+    def compile_decode(self, mode: str = "default") -> "TinyLLM":
+        """编译单步解码（推理专用）.
+
+        前提：静态缓存（形状恒定，无增长 `cat`），否则逐周 Rehab 编反而更慢
+        （教训见 pitfalls 第 9 条）。sparse 层的 pattern 选择会 graph-break
+        但不重编。约束：编译后改权重/切精度/切模式必须重调；
+        训练路径不用；与 eager 逐位一致，单测锁定。返回 self。
+        """
+        self._decode_step = torch.compile(  # type: ignore[method-assign]
+            self._decode_step, mode=mode, dynamic=True)
+        return self
+
     @torch.no_grad()
     def _generate_inner(
         self,
@@ -338,7 +354,7 @@ class TinyLLM(nn.Module):
         temperature=0 为贪心；>0 时按温度采样（可配 top-k 截断）。
         与 stream_tokens 同一基元（数学一致，单测锁定）。
         """
-        h, pasts = self._prefill(input_ids)
+        h, pasts = self._prefill(input_ids, max_new_tokens=max_new_tokens)
         cur = input_ids
         for _ in range(max_new_tokens):
             nxt = self._sample_next(h[:, -1:], temperature, top_k,
@@ -367,7 +383,7 @@ class TinyLLM(nn.Module):
         was_training = self.training
         self.eval()
         try:
-            h, pasts = self._prefill(input_ids)
+            h, pasts = self._prefill(input_ids, max_new_tokens=max_new_tokens)
             seen: list[torch.Tensor] = []
             for _ in range(max_new_tokens):
                 cur = (torch.cat([input_ids, *seen], dim=1) if seen

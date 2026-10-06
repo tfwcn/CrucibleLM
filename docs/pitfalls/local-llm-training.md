@@ -98,6 +98,9 @@ SFT 模板标签（`<用户>`）和 markdown（`####`）里的 `<`、`#` 是超�
 结论：先静态缓存（预分配、按位写，不再 `cat` 增长，涉及 mla/sparse 两处
 decode），再谈 compile；顺序反了就是负优化。这条是"本地无效不进库"活例子：
 方法写完、单测全绿、真机一测变慢——删了，只留教训。
+后续：静态缓存落地后 compile 复活（`model.compile_decode()`），sparse 的
+`select_keys` 纯 Python 集合逻辑标 `@torch._dynamo.disable`（eager 跑、
+不重编；输出形状恒定，下游不断）——30.9 tok/s。
 附带实测：MoE 分组 bmm（16 次 dispatch→3 次）13→22.5 tok/s，真提速，已留；
 bf16 推理同速（launch-bound 下带宽不是瓶颈）但显存减半，200K 长上下文有用，
 `LocalChatBackend.load(..., dtype="bf16")`，已留。

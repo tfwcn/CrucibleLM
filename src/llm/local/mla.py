@@ -72,6 +72,34 @@ class MLAModule(nn.Module):
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
+    def _pack_cache(
+        self, c_kv: torch.Tensor, k_rope_raw: torch.Tensor, reserve: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """静态缓存装箱：latent 尾部补零到 reserve 长，并附位置计数.
+
+        返回 (buf_c, buf_kr, pos)，pos 为 0 维 long 张量（值动态、形状恒定，
+        dynamo 不会按值特化）。解码按位写、掩码读，不再 `cat` 增长。
+        """
+        b, t, _ = c_kv.shape
+        assert reserve >= t, f"缓存预留 {reserve} 不足序列 {t}"
+        if reserve == t:
+            buf_c, buf_kr = c_kv, k_rope_raw
+        else:
+            pad = torch.zeros(b, reserve - t, c_kv.shape[-1],
+                              device=c_kv.device, dtype=c_kv.dtype)
+            buf_c = torch.cat([c_kv, pad], dim=1)
+            pad_r = torch.zeros(b, reserve - t, k_rope_raw.shape[-1],
+                                device=c_kv.device, dtype=k_rope_raw.dtype)
+            buf_kr = torch.cat([k_rope_raw, pad_r], dim=1)
+        pos = torch.tensor(t, device=c_kv.device, dtype=torch.long)
+        return buf_c, buf_kr, pos
+
+    def _valid_mask(self, length: int, pos_next: torch.Tensor,
+                    device: torch.device) -> torch.Tensor:
+        """有效位掩码 (1, 1, 1, L)：已写位置放行，预留空位屏蔽."""
+        return (torch.arange(length, device=device).view(1, 1, 1, length)
+                < pos_next.view(1, 1, 1, 1))
+
     def _qkv(
         self, h: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
@@ -101,48 +129,66 @@ class MLAModule(nn.Module):
     def forward(
         self,
         h: torch.Tensor,
-        past: tuple[torch.Tensor, torch.Tensor] | None = None,
+        past: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         return_state: bool = True,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        reserve: int = 0,
+    ) -> tuple[torch.Tensor, tuple | None]:
         """训练/Prefill 前向：全序列并行注意力.
 
-        past: 解码缓存 (c_kv_cache, k_rope_cache)，解码时传入可增量拼接。
+        past: 静态解码缓存 (buf_c, buf_kr, pos)，pos 为已缓存长度（0 维张量）；
+        传入即增量解码（按位写、掩码读，不再 `cat` 增长）。
+        reserve: prefill 预留总长（prompt + 后续解码，generate 由 max_new_tokens
+        精确给出；0 表示恰好当前长度，解码前由调用方扩到够用）。
         return_state=False 时不返回解码缓存（训练用不上，省两次投影）。
         返回 (输出, 新缓存或 None)。
         """
         b, t, _ = h.shape
         if past is not None:
-            # 增量解码：拼接 latent + 共享 rope 键（省约 9x 显存），只算当前步的 Q
-            c_prev, kr_prev = past
-            c_new = torch.cat([c_prev, self.w_dkv(h)], dim=1)
-            k_rope_new = torch.cat([kr_prev, self.w_kr(h)], dim=1)
+            # 增量解码：按位写入 latent + 共享 rope 键，只算当前步的 Q
+            buf_c, buf_kr, pos = past
+            total = buf_c.shape[1]
+            # 范围写（t==1 即单槽；dynamo 安全，形状恒定）
+            w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
+            buf_c.index_copy_(1, w_idx, self.w_dkv(h))
+            buf_kr.index_copy_(1, w_idx, self.w_kr(h))
+            pos_next = pos + t
             q_c = self.w_dq(h)
             q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
             q_rope = self.w_qr(q_c).view(b, t, self.n_heads, self.qk_rope_dim)
-            # 单 token 解码：旋转相位按绝对位置 offset 切片
-            off = c_prev.shape[1]
+            # 旋转相位按绝对位置 gather（dynamo 安全，不按值特化）；
+            # 下标钳制在 rope 缓存内（有效位本就 ≤ rope_len，旧约束不变）
+            rlen = self.rope_cos.shape[0]
+            q_idx = (pos.reshape(1) + torch.arange(t, device=h.device)).clamp(
+                max=rlen - 1)
             q_rope = apply_rope(
                 q_rope,
-                self.rope_cos[off:off + t],
-                self.rope_sin[off:off + t],
+                self.rope_cos[q_idx],
+                self.rope_sin[q_idx],
             )
-            k = self.k_norm(self.w_uk(c_new).view(b, -1, self.n_heads, self.head_dim))
-            v = self.w_uv(c_new).view(b, -1, self.n_heads, self.head_dim)
-            # 全历史旋转键：先在 (b, T, rope_dim) 上旋转，再广播到各头
+            k = self.k_norm(self.w_uk(buf_c).view(b, total, self.n_heads, self.head_dim))
+            v = self.w_uv(buf_c).view(b, total, self.n_heads, self.head_dim)
+            # 全缓冲旋转键 + 有效位掩码（预留空位屏蔽，与 cat 版逐位一致）；
+            # rope 相位下标钳制在缓存内（预留 L 可超 rope_len，空位被掩码，
+            # 有效位此前已保证 ≤ rope_len，与旧约束一致）
+            rlen = self.rope_cos.shape[0]
+            ridx = torch.arange(total, device=h.device).clamp(max=rlen - 1)
             k_rope_hist = apply_rope(
-                k_rope_new,
-                self.rope_cos[:k_rope_new.shape[1]],
-                self.rope_sin[:k_rope_new.shape[1]],
+                buf_kr,
+                self.rope_cos[ridx],
+                self.rope_sin[ridx],
             ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)
             q_full = torch.cat([q, q_rope], dim=-1).transpose(1, 2)
             k_full = torch.cat([k, k_rope_hist], dim=-1).transpose(1, 2)
             v_full = v.transpose(1, 2)
-            # 解码时 query 只有 1 步，对全历史做非因果注意力即可
+            # 解码时 query 只有 1 步，对全缓冲做掩码注意力即可
+            # （SDPA bool 掩码 True=放行；预留空位 False 屏蔽）
             out = F.scaled_dot_product_attention(
-                q_full, k_full, v_full, is_causal=False, dropout_p=0.0,
+                q_full, k_full, v_full,
+                attn_mask=self._valid_mask(total, pos_next, h.device),
+                dropout_p=0.0,
             )
             out = out.transpose(1, 2).contiguous().view(b, t, -1)
-            return self.w_o(out), (c_new, k_rope_new)
+            return self.w_o(out), (buf_c, buf_kr, pos_next)
         # 训练/Prefill：全序列并行
         q, k, v, q_rope, k_rope, c_kv, k_rope_raw = self._qkv(h)
         k_rope_full = k_rope.expand(-1, -1, self.n_heads, -1)
@@ -155,7 +201,8 @@ class MLAModule(nn.Module):
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
         if not return_state:
             return self.w_o(out), None
-        return self.w_o(out), (c_kv, k_rope_raw)
+        # 静态缓存装箱（reserve=0 即恰好当前长度，解码前由调用方扩到够用）
+        return self.w_o(out), self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
 
     def cache_bytes_per_token(self, dtype_bytes: int = 2) -> int:
         """每 token KV 缓存字节数（对比 MHA 说明压缩收益）."""

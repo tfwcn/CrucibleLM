@@ -80,14 +80,20 @@ class HybridBlock(nn.Module):
         past: tuple | torch.Tensor | None = None,
         return_state: bool = True,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        reserve: int = 0,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
         """前向：past 为解码缓存（MLA 传 latent 元组，线性层传状态矩阵）.
 
         return_state=False 时注意力层不返回缓存（训练路径）。
         retro_mem=(mem_h, mem_mask)：V2 交错融合的 frozen chunk 编码；
         None 或本层无融合块时跳过（backbone 本体，评测/生成路径）。
+        reserve: prefill 预留总长（只用于全注意力静态缓存装箱；线性层忽略）。
         """
-        a_out, new_past = self.attn(self.norm1(h), past, return_state)  # type: ignore[arg-type]
+        if past is None and self.full_attn:
+            a_out, new_past = self.attn(  # type: ignore[call-arg]
+                self.norm1(h), past, return_state, reserve)
+        else:
+            a_out, new_past = self.attn(self.norm1(h), past, return_state)  # type: ignore[arg-type]
         h = h + a_out
         m_out, aux = self.moe(self.norm2(h))
         h = h + m_out

@@ -237,9 +237,10 @@ resp = backend.chat([{"role": "user", "content": "Hello"}], max_new_tokens=256, 
 ```
 
 - **Incremental decoding**: `generate()` carries KV/state caches (MLA latent, linear O(1)
-  states), one prefill then single-step decoding; ~22 tok/s after grouped MoE
-  (batch=1, RTX 3080 Laptop measured), `load(..., dtype="bf16")` same speed at
-  half memory (matters for 200K context);
+  states), one prefill then single-step decoding; ~31 tok/s after grouped MoE +
+  `compile_decode()` (batch=1, RTX 3080 Laptop measured; sparse pattern logic
+  dynamo-disabled to avoid recompiles), `load(..., dtype="bf16")` halves memory
+  (matters for 200K context);
 - **200K context**: `longctx_config()` + same `generate()` (sparse gather decoding,
   ~0.2GB KV; one 200K prefill takes minutes, then normal per-step speed);
 - **Fast-lane decisions** (no generation): `heads.py` intuition heads — one forward pass

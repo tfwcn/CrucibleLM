@@ -226,8 +226,9 @@ resp = backend.chat([{"role": "user", "content": "你好"}], max_new_tokens=256,
 ```
 
 - **增量解码**：`generate()` 自带 KV/状态缓存（MLA 存 latent，线性层 O(1) 状态），prefill 一次、单步续写；
-  MoE 分组 bmm 后 base 模型约 22 tok/s（batch=1，RTX 3080 Laptop 实测），
-  半精度 `load(..., dtype="bf16")` 同速但显存减半（200K 上下文有用）；
+  MoE 分组 + `compile_decode()` 后约 31 tok/s（batch=1，RTX 3080 Laptop 实测；
+  sparse pattern 逻辑 dynamo-disable 保不重编），半精度 `load(..., dtype="bf16")`
+  显存减半（200K 上下文有用）；
 - **200K 上下文**：`longctx_config()` + 同样 `generate()`（稀疏聚集解码，KV 仅约 0.2GB；200K prefill 一次约分钟级，之后单步正常）；
 - **快道决策**（免生成）：`heads.py` 直觉头——冻结 backbone 取 hidden，一次前向出分类，
   毫秒~秒级（CPU），详见 docs/ARCHITECTURE.md 推理章节。
