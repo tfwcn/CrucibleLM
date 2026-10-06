@@ -22,15 +22,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def parse_args(argv=None) -> argparse.Namespace:
     """解析命令行参数."""
     p = argparse.ArgumentParser(description="SFT 转 Belle jsonl")
-    p.add_argument("--dataset", required=True, help="HF 数据集名")
+    p.add_argument("--dataset", default="", help="HF 数据集名（与 --local-jsonl 二选一）")
     p.add_argument("--split", default="train", help="切分")
     p.add_argument("--out", required=True, help="输出目录")
-    p.add_argument("--dedup-dir", default="", help="去重参照 SFT 目录（空=不去重）")
+    p.add_argument("--dedup-dir", default="",
+                   help="去重参照 SFT 目录（逗号分隔多个，空=不去重）")
     p.add_argument("--min-out-len", type=int, default=20, help="output 最短字符")
     p.add_argument("--limit", type=int, default=0, help="最多行数（0=全量）")
     p.add_argument("--cache-dir", default="data/_dl/hf", help="HF 缓存目录")
     p.add_argument("--endpoint", default="https://hf-mirror.com",
                    help="HF 镜像（直连超时用）")
+    p.add_argument("--local-jsonl", default="",
+                   help="本地原始 jsonl（与 --dataset 二选一；配 --schema 解析）")
+    p.add_argument("--schema", default="belle", choices=["belle", "coig-exam"],
+                   help="本地 jsonl 的字段格式（belle=instruction/input/output 直通；"
+                   "coig-exam=考试题 textbox_* 拼卷）")
     return p.parse_args(argv)
 
 
@@ -41,40 +47,73 @@ def main(argv=None) -> int:
     from datasets import load_dataset
 
     args = parse_args(argv)
-    os.environ.setdefault("HF_ENDPOINT", args.endpoint)
-    ds = load_dataset(args.dataset, split=args.split, cache_dir=args.cache_dir)
-    print(f"源数据 {len(ds)} 行，列 {ds.column_names}", flush=True)
+    if bool(args.dataset) == bool(args.local_jsonl):
+        raise SystemExit("--dataset 与 --local-jsonl 二选一（且仅选一）")
+
+    def _iter_rows():
+        if args.local_jsonl:
+            with open(args.local_jsonl, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if args.schema == "coig-exam":
+                        yield ((obj.get("textbox_q_instruction") or "").strip(),
+                               ((obj.get("textbox_q_context") or "") + "\n"
+                                + (obj.get("textbox_question") or "")).strip(),
+                               ("答案：" + (obj.get("textbox_answer") or "").strip()
+                                + "\n解析："
+                                + (obj.get("textbox_answer_analysis") or "").strip()))
+                    else:
+                        yield ((obj.get("instruction") or "").strip(),
+                               (obj.get("input") or "").strip(),
+                               (obj.get("output") or "").strip())
+            return
+        os.environ.setdefault("HF_ENDPOINT", args.endpoint)
+        ds = load_dataset(args.dataset, split=args.split, cache_dir=args.cache_dir)
+        print(f"源数据 {len(ds)} 行，列 {ds.column_names}", flush=True)
+        for row in ds:
+            yield ((row.get("instruction") or "").strip(),
+                   (row.get("input") or "").strip(),
+                   (row.get("output") or "").strip())
 
     seen: set[str] = set()
     if args.dedup_dir:
         from src.llm.local.data import iter_local_sft
 
-        for instruction, _inp, _out in iter_local_sft(args.dedup_dir):
-            seen.add(instruction.strip())
+        for d in args.dedup_dir.split(","):
+            d = d.strip()
+            if not d:
+                continue
+            for instruction, _inp, _out in iter_local_sft(d):
+                # 联合键：考试/代码题 instruction 是模板（万题共用一句），
+                # 必须连 input 一起才算重复；input 为空时退化为 instruction
+                seen.add(instruction.strip() + "" + (_inp or "").strip())
         print(f"参照去重基 {len(seen)} 条 instruction", flush=True)
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     n_ok = n_dup = n_short = 0
     fp = open(out / "part-0000.jsonl", "w", encoding="utf-8")
-    for i, row in enumerate(ds):
+    for ins, inp, out_text in _iter_rows():
         if args.limit and n_ok >= args.limit:
             break
-        ins = (row.get("instruction") or "").strip()
-        out_text = (row.get("output") or "").strip()
         if not ins or not out_text:
             n_short += 1
             continue
         if len(out_text) < args.min_out_len:
             n_short += 1
             continue
-        if ins in seen:
+        key = ins + "" + inp
+        if key in seen:
             n_dup += 1
             continue
-        seen.add(ins)
-        fp.write(json.dumps({"instruction": ins,
-                             "input": (row.get("input") or "").strip(),
-                             "output": out_text},
+        seen.add(key)
+        fp.write(json.dumps({"instruction": ins, "input": inp, "output": out_text},
                             ensure_ascii=False) + "\n")
         n_ok += 1
         if n_ok % 100000 == 0:

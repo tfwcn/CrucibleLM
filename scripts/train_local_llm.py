@@ -892,7 +892,9 @@ def main(argv=None) -> int:
                            if retr_pool is not None and pending is not None
                            else None)
             micro_i = 0
-            while pending is not None:
+            # 双终止：accum 个数到了停（主条件，与旧 for 语义一致），
+            # 数据耗尽也停（pending 为 None；单目录小数据走这条）
+            while pending is not None and micro_i < args.accum:
                 batch, is_replay = pending
                 from_replay = from_replay or is_replay
                 # 下一个先取好、检索先交出去，再算当前（重叠窗口）

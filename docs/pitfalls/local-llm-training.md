@@ -87,6 +87,16 @@ SFT 模板标签（`<用户>`）和 markdown（`####`）里的 `<`、`#` 是超�
 判据：固定 prompt 集 × 多档权重，`<` 占比 + 4-gram 复读率双降才算修好，
 别只看 sample 那一题。
 
+## 10. micro 循环必须以 accum 个数为终止主条件（数据耗尽只做辅条件）
+
+把 `for micro_i in range(accum)` 重构成 `while pending is not None`
+（为塞检索前瞻）后，单目录小数据冒烟全过——因为 1 个文档秒耗尽、
+`used==0` 正常退出；一上 50 万对的混合数据直接转几千个 micro 不停
+（CPU 700% 烧 15 分钟，faulthandler 抓栈显示在正常 forward 里空转，
+极具迷惑性）。教训两条：一是终止条件重构必须保持原语义
+（个数主条件 + 耗尽辅条件，双条件缺一不可）；二是 CPU 冒烟必须含
+"耗不尽"的大数据用例，只测小数据等于没测（见 test 里的 mix 冒烟备注）。
+
 ## 9. torch.compile 在增长缓存上越编越慢（删掉的教训）
 
 `_decode_step` 每步约 1800 个小算子，看似 compile 的天菜，实测 eager 22.5
