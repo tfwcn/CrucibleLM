@@ -18,7 +18,7 @@
 - **200K-context inference ready** — latent KV cache + linear recurrent states + sparse attention
 - **Full training stack included** — streaming corpora, SFT, cross-tokenizer distillation, eval, OpenAI-compatible serving
 
-[Chinese](./README-cn.md) | [Architecture](./docs/ARCHITECTURE.md) | [Training pitfalls](./docs/pitfalls/local-llm-training.md)
+[Chinese](./README-cn.md) | [Architecture](./docs/ARCHITECTURE.md) | [Techniques](./docs/details/) | [Training pitfalls](./docs/pitfalls/local-llm-training.md)
 
 ## What is this
 
@@ -217,7 +217,7 @@ python -m pytest tests/ -q
 | Inference | Incremental decoding + OpenAI API server + intuition heads + BM25 RAG | Serve, fast decisions, long session memory | `server.py`, `heads.py`, `retrieval.py` |
 | Migration | Identity-layer growth / expert widening / pruning / SVD (`migrate_model.py`) | Change arch without retraining from scratch | `migrate.py` |
 
-Details for each: `docs/ARCHITECTURE.md`. Hard lessons: `docs/pitfalls/`.
+Details for each: `docs/ARCHITECTURE.md` (accessible per-technique guides in `docs/details/`). Hard lessons: `docs/pitfalls/`.
 
 ## Inference
 

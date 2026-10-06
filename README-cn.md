@@ -18,7 +18,7 @@
 - **200K 上下文推理就绪**——latent KV 缓存 + 线性递推状态 + 稀疏注意力
 - **完整训练栈**——流式语料、SFT、跨词表蒸馏、评测、OpenAI 兼容服务
 
-[English](./README.md) | [架构详解](./docs/ARCHITECTURE.md) | [训练血泪史](./docs/pitfalls/local-llm-training.md)
+[English](./README.md) | [架构详解](./docs/ARCHITECTURE.md) | [技术详解](./docs/details/) | [训练血泪史](./docs/pitfalls/local-llm-training.md)
 
 ## 这是什么
 
@@ -207,7 +207,7 @@ python -m pytest tests/ -q
 | 推理 | 增量解码 + OpenAI 服务 + 直觉头 + BM25 检索 | 对外服务、快速决策、长会话记忆 | `server.py`、`heads.py`、`retrieval.py` |
 | 迁移 | 恒等加深 / 专家加宽 / 裁剪 / SVD（`migrate_model.py`） | 改架构不重训 | `migrate.py` |
 
-逐项详解见 `docs/ARCHITECTURE.md`，血泪教训见 `docs/pitfalls/`。
+逐项详解见 `docs/ARCHITECTURE.md`（一技术一文件的通俗版在 `docs/details/`），血泪教训见 `docs/pitfalls/`。
 
 ## 推理
 
