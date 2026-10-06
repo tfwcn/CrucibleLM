@@ -51,29 +51,51 @@ class FineGrainedMoE(nn.Module):
         aux_loss: 标准负载均衡损失 mean(p) 与 one-hot 负载的点积，
         防止路由坍缩到少数专家。
 
-        专家分组计算：每个专家只算分给它的 token（而非全量前向再 mask），
-        总计算量从 n_experts 降到约 top_k，数值与全量版一致。
+        分组 bmm：每个 token 展开成 top-k 行，按专家排序后垫齐 batch，
+        3 次 bmm 算完所有专家（替代 16 次逐专家 Python dispatch，
+        解码主力开销），再按权重散射加回。数值与逐专家版一致（单测锁定）。
         """
         orig_shape = x.shape
-        flat = x.reshape(-1, x.shape[-1])  # (N, d)
+        d = x.shape[-1]
+        flat = x.reshape(-1, d)  # (N, d)
+        n = flat.shape[0]
         logits = self.router(flat)  # (N, n_experts)
         probs = F.softmax(logits, dim=-1)
         top_w, top_i = torch.topk(probs, self.top_k, dim=-1)
         top_w = top_w / top_w.sum(-1, keepdim=True).clamp_min(1e-6)
-        # 加权聚合被选中的专家输出（小模型逐专家 mask，清晰优先）
+        # 展开：每 token k 行（token 序号、专家号、归一化权重）
+        m = n * self.top_k
+        tok_idx = torch.arange(n, device=x.device).repeat_interleave(self.top_k)
+        exp_idx = top_i.reshape(-1)
+        # 权重对齐到输入精度（AMP 下 top_w 常为 fp32：避免 index_put 报类型错，
+        # 也避免旧式 where 隐式提升把残差流抬成 fp32）
+        w_row = top_w.reshape(-1).to(flat.dtype)
+        order = torch.argsort(exp_idx, stable=True)
+        exp_s = exp_idx[order]
+        counts = torch.bincount(exp_s, minlength=self.n_experts)
+        max_n = int(counts.max().item())
+        # 组内槽位：slot[r] = 该行在其专家组内的序号
+        cum = counts.cumsum(0)
+        slot = torch.arange(m, device=x.device) - (cum[exp_s] - counts[exp_s])
+        # 画布 (E, max_n, *)：token / 权重 / 有效掩码
+        canvas = torch.zeros(self.n_experts, max_n, d,
+                             device=x.device, dtype=flat.dtype)
+        canvas[exp_s, slot] = flat.repeat_interleave(self.top_k, dim=0)[order]
+        w_canvas = torch.zeros(self.n_experts, max_n,
+                               device=x.device, dtype=flat.dtype)
+        w_canvas[exp_s, slot] = w_row[order]
+        row_mask = torch.zeros(self.n_experts, max_n,
+                               device=x.device, dtype=torch.bool)
+        row_mask[exp_s, slot] = True
+        # 专家权重堆叠（view 级 stack，反向精确回传到各专家参数）
+        w_g = torch.stack([e.w_gate.weight for e in self.experts])  # (E, h, d)
+        w_u = torch.stack([e.w_up.weight for e in self.experts])
+        w_d = torch.stack([e.w_down.weight for e in self.experts])  # (E, d, h)
+        gate = F.silu(canvas @ w_g.transpose(1, 2)) * (canvas @ w_u.transpose(1, 2))
+        out_e = (gate @ w_d.transpose(1, 2)) * (
+            w_canvas * row_mask.to(flat.dtype)).unsqueeze(-1)
         out = torch.zeros_like(flat)
-        for e, expert in enumerate(self.experts):
-            # 该专家在 top-k 各槽位中的权重求和
-            pick = top_i == e  # (N, top_k)
-            if not pick.any():
-                continue
-            sel = pick.any(-1)  # (N,) 分给该专家的 token
-            # 权重对齐到输入精度（AMP 下 top_w 常为 fp32：避免 index_put 报类型错，
-            # 也避免旧式 where 隐式提升把残差流抬成 fp32）
-            w_sum = (top_w * pick.to(top_w.dtype)).sum(-1).to(flat.dtype)  # (N,)
-            contrib = torch.zeros_like(flat)
-            contrib[sel] = w_sum[sel].unsqueeze(-1) * expert(flat[sel])
-            out = out + contrib
+        out.index_add_(0, tok_idx[order], out_e[exp_s, slot])
         out = out.view(orig_shape)
         # 共享专家直通（常驻知识通道）
         for expert in self.shared:

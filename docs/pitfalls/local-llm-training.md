@@ -86,3 +86,18 @@ SFT 模板标签（`<用户>`）和 markdown（`####`）里的 `<`、`#` 是超�
 实测 4-gram 复读 0.58→0.04；服务侧 `repetition_penalty` 参数透传。
 判据：固定 prompt 集 × 多档权重，`<` 占比 + 4-gram 复读率双降才算修好，
 别只看 sample 那一题。
+
+## 9. torch.compile 在增长缓存上越编越慢（删掉的教训）
+
+`_decode_step` 每步约 1800 个小算子，看似 compile 的天菜，实测 eager 22.5
+→ compile 5.1 tok/s（更慢）。两道墙：
+1. cudagraphs（reduce-overhead）要求静态内存，MLA latent/卷积尾每步 `cat`
+   增长，抓图即炸；
+2. dynamic=True 也救不了：dynamo 把每层 attn 拆成子帧，符号形状没传进去，
+   `past[i] size mismatch` 逐层每步重编（recompiles 日志刷屏）。
+结论：先静态缓存（预分配、按位写，不再 `cat` 增长，涉及 mla/sparse 两处
+decode），再谈 compile；顺序反了就是负优化。这条是"本地无效不进库"活例子：
+方法写完、单测全绿、真机一测变慢——删了，只留教训。
+附带实测：MoE 分组 bmm（16 次 dispatch→3 次）13→22.5 tok/s，真提速，已留；
+bf16 推理同速（launch-bound 下带宽不是瓶颈）但显存减半，200K 长上下文有用，
+`LocalChatBackend.load(..., dtype="bf16")`，已留。

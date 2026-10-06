@@ -190,16 +190,25 @@ class LocalChatBackend:
         return self.tokenizer._chars
 
     @classmethod
-    def load(cls, path: str, config: SmallLLMConfig) -> "LocalChatBackend":
+    def load(cls, path: str, config: SmallLLMConfig,
+             dtype: str | None = None) -> "LocalChatBackend":
         """加载权重 + 字符表.
 
         词表按顺序找：path.vocab.json（save 默认）→ 同目录 vocab.json（训练落盘布局）。
+        dtype: None=fp32 原样；"fp16"/"bf16" 半精度推理（RMSNorm 内部 fp32，
+        half 安全；logits 精度降一档，贪心 argmax 基本不变，采样温度建议重验证）。
         """
         import json
         from pathlib import Path as _Path
 
         model = TinyLLM(config)
         model.load_state_dict(torch.load(path + ".pt", map_location="cpu"))
+        if dtype is not None:
+            dmap = {"fp16": torch.float16, "bf16": torch.bfloat16,
+                    "fp32": torch.float32}
+            if dtype not in dmap:
+                raise ValueError(f"dtype 须为 {sorted(dmap)}，当前 {dtype}")
+            model = model.to(dmap[dtype])
         model.eval()
         tok = SimpleTokenizer(config.vocab_size)
         candidates = [path + ".vocab.json",

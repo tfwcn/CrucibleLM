@@ -107,6 +107,18 @@ def test_repetition_penalty_per_row_independent():
     assert torch.equal(out_none, out_plain)
 
 
+def test_half_inference_runs_finite():
+    """半精度推理可跑、有限（bf16/fp16；RMSNorm 内部 fp32 保稳定）."""
+    for dt in (torch.bfloat16, torch.float16):
+        m = _tiny().to(dt)
+        m.eval()
+        x = torch.randint(0, 256, (1, 8))
+        with torch.no_grad():
+            gen = m.generate(x, max_new_tokens=8)
+        assert gen.shape == (1, 16)
+        assert int(gen.max()) < 256
+
+
 def test_train_step_decreases_or_finite():
     """单步训练：loss 有限、梯度范数有限."""
     m = _tiny()
