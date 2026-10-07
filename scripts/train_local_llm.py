@@ -297,6 +297,33 @@ def collect_holdout(args: argparse.Namespace, data_cursor: int = 0) -> tuple[lis
     return holdout, _Counted(stream)
 
 
+def collect_diag_holdouts(args, per_dir: int = 64) -> dict[str, list]:
+    """SFT 本地多目录诊断评测集：每目录头 per_dir 对（独立迭代器）.
+
+    日志记 val_<目录名>，盯"老分布掉没掉"（容量仪表盘）。
+    注意与主 holdout 不同：这几十对仍在训练范围内（会被训到），值偏乐观，
+    只看跨轮趋势，不看绝对值；主 holdout 是跳过的干净集，冠军仍只看它。
+    非本地 SFT 返回空（无目录可分）。
+    """
+    if not (args.data == "local" and args.phase == "sft"):
+        return {}
+    from pathlib import Path as _Path
+
+    from src.llm.local.data import SFT_PROMPT as _TPL
+    from src.llm.local.data import iter_local_sft, parse_local_mix as _plm3
+
+    out: dict[str, list] = {}
+    for path, _ in _plm3(args.local_path):
+        pairs = []
+        for ins, inp, o in iter_local_sft(path):
+            pairs.append((_TPL.format(instruction=ins, input=inp or ""), o))
+            if len(pairs) >= per_dir:
+                break
+        if pairs:
+            out[_Path(path).name] = pairs
+    return out
+
+
 def collect_missing(args, tok) -> list[str]:
     """扫描语料找词表缺字（按频次排序，截断到 --extend-max-new）.
 
@@ -642,6 +669,8 @@ def main(argv=None) -> int:
     if curriculum:
         args.pretrain_min_score = lambda: score_state["min"]  # noqa: E731
     holdout, train_stream = collect_holdout(args, resume_cursor)
+    # 诊断评测集（每源目录头 64 对，看老分布趋势；见 collect_diag_holdouts 注释）
+    diag_holdouts = collect_diag_holdouts(args)
 
     # 分词器：评测文档复用做拟合（省一次采样；SFT 对用 t[-1] 取 response）
     fit_sample = holdout if args.phase == "pretrain" else [t[0] + t[-1] for t in holdout]
@@ -650,6 +679,7 @@ def main(argv=None) -> int:
 
     # 数据打包流（评测流每次重建， holdout 是 list 可反复迭代）
     encode = tok.encode
+    make_eval_subset = None  # SFT 分支内定义（pretrain 无诊断集，保持 None）
     if args.phase == "pretrain":
         train_blocks = pack_pretrain(train_stream, encode, args.seq_len, eos)
 
@@ -663,6 +693,10 @@ def main(argv=None) -> int:
         def make_eval() -> PackedBatcher:
             return PackedBatcher(
                 pack_pairs(iter(holdout), encode, args.seq_len, eos), args.batch)
+
+        def make_eval_subset(pairs) -> PackedBatcher:
+            return PackedBatcher(
+                pack_pairs(iter(pairs), encode, args.seq_len, eos), args.batch)
 
         if args.shuffle_buffer > 0:
             sft_blocks = ShuffleBuffer(sft_blocks, args.shuffle_buffer, args.seed)
@@ -1006,6 +1040,16 @@ def main(argv=None) -> int:
                 msg = f"[eval] step={step} val_loss={val:.4f}"
                 if "ema_val_loss" in record_val:
                     msg += f" ema_val={record_val['ema_val_loss']:.4f}"
+                if diag_holdouts and make_eval_subset is not None:
+                    # 分源诊断（与冠军同模型；值偏乐观，只看趋势）
+                    for tag, pairs in diag_holdouts.items():
+                        sv = evaluate(champ_model,
+                                      lambda p=pairs: make_eval_subset(p),
+                                      args.eval_batches, device,
+                                      restore_train=ema_model is None)
+                        record_val[f"val_{tag}"] = sv
+                    msg += " " + " ".join(
+                        f"{t}={record_val[f'val_{t}']:.4f}" for t in diag_holdouts)
                 print(msg, flush=True)
                 logf.write(json.dumps(record_val, ensure_ascii=False) + "\n")
                 logf.flush()

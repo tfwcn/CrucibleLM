@@ -1082,3 +1082,27 @@ def test_static_cache_overflow_fails_fast():
         _, past = m(h[:, :3], None, True, 3)  # 恰好装满，无余量
         with pytest.raises((RuntimeError, IndexError)):  # index_copy_ 越界
             m(h[:, 3:4], past)
+
+
+def test_collect_diag_holdouts_per_dir(tmp_path):
+    """诊断评测集：每目录独立头 N 对，键为目录名；非本地 SFT 返回空."""
+    import json as _json
+    from types import SimpleNamespace as _NS
+
+    for name in ("dirA", "dirB"):
+        d = tmp_path / name
+        d.mkdir()
+        rows = [{"instruction": f"{name}第{i}题", "input": "",
+                 "output": f"{name}答案{i}，补充一些文字凑长度。"} for i in range(10)]
+        (d / "a.jsonl").write_text(
+            "\n".join(_json.dumps(r, ensure_ascii=False) for r in rows),
+            encoding="utf-8")
+    args = _NS(data="local", phase="sft",
+               local_path=f"{tmp_path / 'dirA'},{tmp_path / 'dirB'}")
+    out = flow.collect_diag_holdouts(args, per_dir=4)
+    assert set(out) == {"dirA", "dirB"}
+    assert all(len(v) == 4 for v in out.values())
+    assert "dirA第0题" in out["dirA"][0][0] and "dirB" not in out["dirA"][0][0]
+    assert "dirB第0题" in out["dirB"][0][0] and "dirA" not in out["dirB"][0][0]
+    assert flow.collect_diag_holdouts(_NS(data="hf", phase="sft",
+                                          local_path=""), per_dir=4) == {}
