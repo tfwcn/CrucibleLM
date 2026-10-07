@@ -211,6 +211,22 @@ class TinyLLM(nn.Module):
         """是否有 V2 交错融合层（retro_enabled 且 retro_every>0）."""
         return bool(self.config.retro_enabled and self.config.retro_every > 0)
 
+    def hyper_gain(self) -> float | None:
+        """超连接复合 Amax 增益（论文 Fig.3/7 指标），无超连接返回 None.
+
+        读各层 `_last_H`（需先开 track_stats 跑一次前向）；≈1 健康，
+        飙升即残差流爆炸预警。"""
+        mats = []
+        for layer in self.layers:
+            hyp = getattr(layer, "hyper", None)
+            if hyp is not None and getattr(hyp, "_last_H", None) is not None:
+                mats.append(hyp._last_H)
+        if not mats:
+            return None
+        from src.llm.local.hyperconn import composite_gain
+
+        return composite_gain(mats)
+
     def _layer_ckpt(
         self, layer: HybridBlock, h: torch.Tensor, aux_total: torch.Tensor,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
@@ -329,7 +345,7 @@ class TinyLLM(nn.Module):
             # 每层 norm 由 block 内部处理，这里直接走 attn+moe 等价路径：
             # 为复用逻辑，重新拼 block 前向（单 token 开销可忽略）
             xxs = hh
-            hh_in = hh.mean(dim=2) if hyper_n else hh
+            hh_in = layer.hyper.pre_mix(hh) if hyper_n and layer.hyper is not None else hh
             hh_norm = layer.norm1(hh_in)
             a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
             hh = hh_in + a_out

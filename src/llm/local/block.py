@@ -100,7 +100,7 @@ class HybridBlock(nn.Module):
         h: 无超连接时 (b, t, d)；有超连接时 (b, t, n, d) n 路流。
         """
         xs = h
-        h_in = h.mean(dim=2) if self.hyper is not None else h
+        h_in = self.hyper.pre_mix(h) if self.hyper is not None else h
         h = h_in
         if past is None and self.full_attn:
             a_out, new_past = self.attn(  # type: ignore[call-arg]

@@ -46,9 +46,13 @@ y = einsum(H, x) + post * F_out     # 混合 + 写回
 - 开关：`--hyper-streams 2`（0=关；1 直接拒；先 2，赢了再 4）
 - 每层约 52k 参数（n=4, d=768），12 层共 0.6M（+0.5%）；
   模块 FLOP 不变（只看均值流），多的是 n×n 拌合（可忽略）；
+- pre 用动态凸组合（softmax，零初值即均匀，与旧 mean 路径逐位一致），
+  H_res 全动态 + Sinkhorn，post 动态写回——论文 Table 1 的最小集再加 pre，
+  pre 开销 12k/层可忽略；
+- Amax 监控：`track_stats` 开时记录各层 H 均值，eval 附 `hyper_gain`
+ （复合映射行列和，≈1 健康；默认关，compiled 路径不受影响）；
 - 缓存格式不变（attn past 照旧），SessionCache/`_decode_step` 只需展开/聚合；
   旧权重 overlap 载入（缺的仅 hyper 键）；
-- 先只做 H_res（八成收益），pre 均值、post 动态——论文 Table 1 指导的最小集。
 
 ## 代价与坑
 

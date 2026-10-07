@@ -108,3 +108,41 @@ def test_hyper_state_dict_compatible():
     n_hyper_layers = sum(getattr(layer, "hyper", None) is not None
                          for layer in m1.layers)
     assert n_hyper_layers == len(m1.layers)
+
+
+def test_pre_mix_uniform_at_init():
+    """动态 pre 零初值即均匀均值（与旧 mean 路径逐位一致，可无缝替换）."""
+    m = _tiny_hyper(2)
+    layer = m.layers[0]
+    assert layer.hyper is not None
+    x = torch.randn(1, 6, 2, 128)  # (b, t, n, d)，tiny d=128
+    with torch.no_grad():
+        got = layer.hyper.pre_mix(x)
+        want = x.mean(dim=2)
+    assert torch.allclose(got, want, atol=1e-6)
+
+
+def test_composite_gain_identity_and_scaled():
+    """复合增益：全 I 矩阵得 1.0；2I 连乘按 2^n 放大（定义本身正确）."""
+    from src.llm.local.hyperconn import composite_gain
+
+    assert abs(composite_gain([torch.eye(4) for _ in range(3)]) - 1.0) < 1e-6
+    assert abs(composite_gain([2 * torch.eye(2)]) - 2.0) < 1e-6
+
+
+def test_hyper_gain_tracks_eval_forward():
+    """hyper_gain：track 关时 None；开跑一次前向后 ≈1（恒等起点附近）."""
+    m = _tiny_hyper(2)
+    assert m.hyper_gain() is None
+    for layer in m.layers:
+        if layer.hyper is not None:
+            layer.hyper.track_stats = True
+    x = torch.randint(0, 256, (1, 16))
+    with torch.no_grad():
+        m(x)
+    g = m.hyper_gain()
+    assert g is not None and abs(g - 1.0) < 0.05
+    for layer in m.layers:
+        if layer.hyper is not None:
+            layer.hyper.track_stats = False
+    assert m.hyper_gain() is not None  # 关 track 不清旧值（读的是上次）

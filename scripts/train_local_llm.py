@@ -1035,9 +1035,25 @@ def main(argv=None) -> int:
                 logf.write(json.dumps(record, ensure_ascii=False) + "\n")
                 logf.flush()
             if args.eval_every and step % args.eval_every == 0:
+                # 超连接 Amax 监控：开 track 跑评测前向，读复合增益（≈1 健康）
+                hyper_on = any(getattr(layer, "hyper", None) is not None
+                               for layer in model.layers)
+                if hyper_on:
+                    for layer in model.layers:
+                        if getattr(layer, "hyper", None) is not None:
+                            layer.hyper.track_stats = True
                 val = evaluate(model, make_eval, args.eval_batches, device)
                 record_val: dict = {"step": step, "val_loss": val}
                 champ_model, champ_val = model, val
+                if hyper_on:
+                    # 主评测刚跑完，前向已 populated，立刻读并关 track
+                    # （后面的 ema/分源评测不再记录，保证增益口径=主 holdout）
+                    hg = model.hyper_gain()
+                    for layer in model.layers:
+                        if getattr(layer, "hyper", None) is not None:
+                            layer.hyper.track_stats = False
+                    if hg is not None:
+                        record_val["hyper_gain"] = round(hg, 4)
                 if ema_model is not None:
                     # EMA 影子同步评（restore_train=False 保 eval 模式），
                     # 冠军按影子值选、存影子权重（平滑冠军）
@@ -1058,6 +1074,8 @@ def main(argv=None) -> int:
                         record_val[f"val_{tag}"] = sv
                     msg += " " + " ".join(
                         f"{t}={record_val[f'val_{t}']:.4f}" for t in diag_holdouts)
+                if hyper_on and "hyper_gain" in record_val:
+                    msg += f" hyper_gain={record_val['hyper_gain']:.4f}"
                 print(msg, flush=True)
                 logf.write(json.dumps(record_val, ensure_ascii=False) + "\n")
                 logf.flush()

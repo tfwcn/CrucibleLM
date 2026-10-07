@@ -58,6 +58,15 @@ class HyperConnRes(nn.Module):
         self.phi_post = nn.Linear(d_model * n_streams, n_streams, bias=False)
         self.bias_post = nn.Parameter(torch.zeros(n_streams))
         self.alpha_post = nn.Parameter(torch.tensor(0.0))
+        # 动态 pre 聚合（H_pre）：凸组合读入，零初值即均匀均值（softmax 保守恒）
+        self.phi_pre = nn.Linear(d_model * n_streams, n_streams, bias=False)
+        self.bias_pre = nn.Parameter(torch.zeros(n_streams))
+        self.alpha_pre = nn.Parameter(torch.tensor(0.0))
+        # Amax 监控缓存（论文 Fig.3 的 instability 预警器）：track_stats 开时
+        # 记录 H 在 batch/位置上的均值（n×n，detach）；默认关，compiled 解码
+        # 路径不受影响（属性写入会触发 dynamo 重编，故用 flag 门控）
+        self.track_stats = False
+        self._last_H: torch.Tensor | None = None
 
     def mappings(self, x: torch.Tensor
                  ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -77,11 +86,36 @@ class HyperConnRes(nn.Module):
         dt = x.dtype
         return h.to(dt), post.to(dt)
 
+    def pre_mix(self, x: torch.Tensor) -> torch.Tensor:
+        """动态 pre 聚合：n 路按凸组合读成一路（softmax 保证和为 1）.
+
+        零初值即均匀均值（与旧 mean 路径逐位一致，可无缝替换）。
+        """
+        b, t, n, c = x.shape
+        v = self.norm(x.reshape(b, t, n * c)).float()
+        w = self.phi_pre.weight.float()
+        pre = torch.softmax(
+            (v @ w.T) * self.alpha_pre.float() + self.bias_pre.float(), dim=-1)
+        return torch.einsum("bts,btsc->btc", pre.to(x.dtype), x)
+
     def combine(self, x: torch.Tensor, f_out: torch.Tensor) -> torch.Tensor:
         """y_s = Σ_r H[s,r]·x_r + post_s·F（流混合 + 写回）."""
         h, post = self.mappings(x)
+        if self.track_stats:
+            with torch.no_grad():
+                self._last_H = h.detach().float().mean(dim=(0, 1))
         mixed = torch.einsum("btsr,btrc->btsc", h, x)
         return mixed + post.unsqueeze(-1) * f_out.unsqueeze(2)
+
+
+def composite_gain(mats: list[torch.Tensor]) -> float:
+    """复合映射 Amax 增益（论文 Fig.3/7 指标）：各层 H 均值按层序连乘后，
+    行/列和绝对值的最大值。≈1 健康，飙升=残差流爆炸预警。"""
+    comp = mats[-1]
+    for m in reversed(mats[:-1]):
+        comp = comp @ m
+    return max(comp.sum(-1).abs().max().item(),
+               comp.sum(-2).abs().max().item())
 
     def extra_repr(self) -> str:
         """模块摘要（打印模型结构用）."""
