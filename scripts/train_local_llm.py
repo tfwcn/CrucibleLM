@@ -969,10 +969,13 @@ def main(argv=None) -> int:
             if curriculum:
                 score_state["min"] = curriculum_value(*curriculum, step)
             if ema_model is not None and step % args.ema_every == 0:
+                # decay 按同步间隔换算（每步等效 decay^every；0.999 每 10 步同步
+                # ≈ 每步 0.9999，记忆上万步影子冻住——必须换算，否则 best/ 存过期权重）
+                eff = args.ema_decay ** max(args.ema_every, 1)
                 with torch.no_grad():
                     for ema_p, p in zip(ema_model.parameters(), model.parameters()):
-                        ema_p.mul_(args.ema_decay).add_(
-                            p.detach().to(ema_p.dtype), alpha=1 - args.ema_decay)
+                        ema_p.mul_(eff).add_(
+                            p.detach().to(ema_p.dtype), alpha=1 - eff)
             record = {"step": step, "tokens": tokens_seen,
                       "lr": optim.param_groups[0]["lr"],
                       "secs": round(time.time() - t0, 1), **accumuloss(accum_stats)}

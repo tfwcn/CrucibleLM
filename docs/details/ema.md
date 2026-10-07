@@ -43,7 +43,9 @@
 
 ```python
 ema = deepcopy(model).eval()                          # 建
-ema_p.mul_(decay).add_(p.detach(), alpha=1-decay)     # 每 N 步同步
+ema_p.mul_(eff).add_(p.detach(), alpha=1-eff)         # 每 N 步同步
+# eff = decay ** every：必须按间隔换算，否则影子冻住（0.999 每 10 步同步
+# ≈ 每步 0.9999，记忆上万步，best/ 存过期权重——实测抓到过）
 ema_val = evaluate(ema, ..., restore_train=False)     # 评：别被翻成 train
 if ema_val < best: save_best(ema)                     # 冠军存影子
 ```
