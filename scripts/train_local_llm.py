@@ -1022,10 +1022,13 @@ def main(argv=None) -> int:
                                       ensure_ascii=False) + "\n")
                 logf.flush()
             if args.save_every and step % args.save_every == 0:
+                # 游标累加上轮基数：resume 后 _Counted 从 0 重数，不加基数
+                # 下次 resume 会倒退重读（sft6 实测 99452→29854，白送回放）
                 snap = save_ckpt(ckpt_dir, model, optim, step, tokens_seen,
                                  {"phase": args.phase, "preset": args.preset},
                                  keep_last=args.keep_last,
-                                 data_cursor=_data_cursor(train_stream))
+                                 data_cursor=_data_cursor(train_stream)
+                                 + resume_cursor)
                 print(f"[ckpt] step={step} -> {snap.name}", flush=True)
     finally:
         if retr_pool is not None:
@@ -1034,7 +1037,7 @@ def main(argv=None) -> int:
     save_ckpt(ckpt_dir, model, optim, step, tokens_seen,
               {"phase": args.phase, "preset": args.preset},
               keep_last=args.keep_last,
-              data_cursor=_data_cursor(train_stream))
+              data_cursor=_data_cursor(train_stream) + resume_cursor)
     print(f"训练结束：step={step}，权重 {ckpt_dir}/model.pt，分词表 {ckpt_dir}/vocab.json",
           flush=True)
     print("试用：LocalChatBackend.load("
