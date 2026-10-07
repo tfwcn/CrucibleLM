@@ -70,6 +70,8 @@ class SmallLLMConfig:
     memory_every: int = 0
     memory_slots: int = 4096  # 槽位数（64×64 子码本）
     memory_topk: int = 8  # 每 token 激活槽数
+    # 超连接残差：0=关闭（标准单流残差）；≥2=n 路流混合（mHC-lite，见 hyperconn.py）
+    hyper_streams: int = 0
 
     @property
     def head_dim(self) -> int:

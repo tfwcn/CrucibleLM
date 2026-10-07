@@ -119,6 +119,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="模型侧开启 RETRO 融合（需 --retro-db 提供，仅在 mid-training 起用）")
     p.add_argument("--enable-memory", action="store_true",
                    help="开启 Product-Key 记忆层（每 memory_every 层一个）")
+    p.add_argument("--hyper-streams", type=int, default=0,
+                   help="超连接残差流数（mHC-lite；0=关闭，≥2 开启，建议先 2）")
     p.add_argument("--memory-every", type=int, default=4, help="记忆层插入间隔（N 层一个）")
     p.add_argument("--memory-slots", type=int, default=4096, help="记忆槽位数")
     p.add_argument("--memory-topk", type=int, default=8, help="每 token 激活槽数")
@@ -625,7 +627,7 @@ def main(argv=None) -> int:
               f"（{config.n_layers} 层，专家 hidden {config.expert_hidden}）",
               flush=True)
     config.grad_ckpt = args.grad_ckpt
-    # 检索/记忆：显式 flag 才覆盖 config（默认零变化）
+    # 检索/记忆/超连接：显式 flag 才覆盖 config（默认零变化）
     if args.enable_retro:
         config.retro_enabled = True
         config.retro_every = max(args.retro_every, 0)
@@ -650,6 +652,12 @@ def main(argv=None) -> int:
             raise SystemExit("--memory-topk 至少为 1")
         print(f"记忆层已开：每 {config.memory_every} 层一个，"
               f"槽数 {config.memory_slots}（子码本 {side}×{side}），top-{config.memory_topk}",
+              flush=True)
+    if args.hyper_streams:
+        if args.hyper_streams < 2:
+            raise SystemExit("--hyper-streams 须为 0（关）或 ≥2（n=1 退化恒等）")
+        config.hyper_streams = args.hyper_streams
+        print(f"超连接残差已开：{config.hyper_streams} 路流（mHC-lite，恒等起点）",
               flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0

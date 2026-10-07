@@ -176,6 +176,8 @@ EMA 影子评测 + 冠军快照兜底——分阶段的手工课程已被这三�
   `--retro-every N --retro-len L`（每 N 层融合 token 级 chunk，frozen 编码）；
 - 会话落盘：`SessionCache`（MLA latent / 线性状态 / 卷积尾跨 turn、跨进程存取，
   库侧组件，服务进程按会话 id 复用）；
+- 超连接残差：`--hyper-streams 2`（mHC-lite，n 路流混合 + 动态写回，恒等起点；
+  详见 `docs/details/hyperconn.md`，先 A/B 后合入）；
 - 推理侧：直觉头（`heads.py`，冻结 backbone 上的毫瓦级决策器）+ BM25 检索（`retrieval.py`）。
 
 ## 单测

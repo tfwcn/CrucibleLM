@@ -185,6 +185,8 @@ replace manual staged curriculum. Starting fully loaded from step 0 works too
   token-level chunks, frozen-embedding encoded);
 - Session state: `SessionCache` (persist MLA latents, linear states and conv tails
   across turns and processes; library-side, used by the serving path);
+- Hyper-connections: `--hyper-streams 2` (mHC-lite, n-stream mixing with identity
+  start; see `docs/details/hyperconn.md`, A/B before merging);
 - Inference side: intuition heads (`heads.py`, milliwatt decision heads on a frozen backbone)
   + BM25 retrieval (`retrieval.py`).
 

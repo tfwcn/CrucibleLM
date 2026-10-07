@@ -43,3 +43,4 @@
 - [直觉头：毫瓦级决策器](./intuition-heads.md)
 - [架构迁移：不重交学费](./migrate.md)
 - [神经元复壮：恒等式重开](./dormancy-rejuvenation.md)
+- [超连接残差：mHC-lite](./hyperconn.md)

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from src.llm.local.linear_attn import GatedDeltaLite
+from src.llm.local.hyperconn import HyperConnRes
 from src.llm.local.memory import ProductKeyMemory
 from src.llm.local.mla import RMSNorm
 from src.llm.local.moe import FineGrainedMoE
@@ -44,6 +45,7 @@ class HybridBlock(nn.Module):
         memory_topk: int = 8,
         use_retro: bool = False,
         retro_heads: int = 8,
+        hyper_streams: int = 0,
     ):
         super().__init__()
         self.full_attn = full_attn
@@ -73,6 +75,13 @@ class HybridBlock(nn.Module):
             RetroFusion(d_model, retro_heads, dropout)
             if use_retro else None
         )
+        # 超连接残差（默认 None；开后 block 输入输出为 n 路流，恒等起点）
+        assert hyper_streams == 0 or hyper_streams >= 2, \
+            "hyper_streams 须为 0（关）或 ≥2（n=1 退化恒等，无意义）"
+        self.hyper: HyperConnRes | None = (
+            HyperConnRes(d_model, hyper_streams)
+            if hyper_streams >= 2 else None
+        )
 
     def forward(
         self,
@@ -88,7 +97,11 @@ class HybridBlock(nn.Module):
         retro_mem=(mem_h, mem_mask)：V2 交错融合的 frozen chunk 编码；
         None 或本层无融合块时跳过（backbone 本体，评测/生成路径）。
         reserve: prefill 预留总长（只用于全注意力静态缓存装箱；线性层忽略）。
+        h: 无超连接时 (b, t, d)；有超连接时 (b, t, n, d) n 路流。
         """
+        xs = h
+        h_in = h.mean(dim=2) if self.hyper is not None else h
+        h = h_in
         if past is None and self.full_attn:
             a_out, new_past = self.attn(  # type: ignore[call-arg]
                 self.norm1(h), past, return_state, reserve)
@@ -103,4 +116,7 @@ class HybridBlock(nn.Module):
         if self.retro is not None and retro_mem is not None:
             mh, mm = retro_mem
             h = self.retro(h, mh, mm)
+        if self.hyper is not None:
+            # 超连接写回：F 为本块在均值流上的总增量，流混合后按 post 写回各路
+            h = self.hyper.combine(xs, h - h_in)
         return h, (new_past, aux)

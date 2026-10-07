@@ -17,6 +17,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
                   and layer_idx % config.memory_every == 0)
     use_retro = (config.retro_enabled and config.retro_every > 0
                  and layer_idx % config.retro_every == 0)
+    use_hyper = config.hyper_streams >= 2
     return HybridBlock(
         d_model=config.d_model,
         n_heads=config.n_heads,
@@ -44,6 +45,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         memory_topk=config.memory_topk,
         use_retro=use_retro,
         retro_heads=config.retro_heads,
+        hyper_streams=config.hyper_streams if use_hyper else 0,
     )
 
 
@@ -135,6 +137,11 @@ class TinyLLM(nn.Module):
                 "（RoPE 缓存盖不住）：请调大 max_seq_len 或直接用 longctx_config()（200K 预设）"
             )
         h = self.embed(input_ids)
+        # 超连接：embedding 展开成 n 路流（各路初始相同，对称性由 H 参数打破）；
+        # 模块（注意/MoE/记忆/retro）只看均值流，FLOP 不变
+        hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
+        if hyper_n:
+            h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         aux_total = torch.zeros((), device=h.device, dtype=h.dtype)
         # V2 交错 mem：frozen 查表一次编码，供各融合层共享（无梯度）
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None
@@ -157,6 +164,8 @@ class TinyLLM(nn.Module):
             else:
                 h, (_, aux) = layer(h, None, False, retro_mem)
                 aux_total = aux_total + aux
+        if hyper_n:
+            h = h.mean(dim=2)  # 流聚合（均值即 H_pre，论文消融默认）
         h = self.final_norm(h)
         if self.retro is not None:
             if mem is None:
@@ -256,10 +265,15 @@ class TinyLLM(nn.Module):
         """
         h = self.embed(input_ids)
         reserve = input_ids.shape[1] + max(0, max_new_tokens)
+        hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
+        if hyper_n:
+            h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         pasts: list = []
         for layer in self.layers:
             h, (p, _) = layer(h, retro_mem=retro_mem, reserve=reserve)
             pasts.append(p)
+        if hyper_n:
+            h = h.mean(dim=2)
         return self.final_norm(h), pasts
 
     def _sample_next(
@@ -307,13 +321,18 @@ class TinyLLM(nn.Module):
     ) -> tuple[torch.Tensor, list]:
         """单 token 步进各层：返回 (新 hidden, 新缓存），供流式/批量生成共用."""
         hh = self.embed(nxt)
+        hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
+        if hyper_n:
+            hh = hh.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         new_pasts: list = []
         for layer, p in zip(self.layers, pasts):
             # 每层 norm 由 block 内部处理，这里直接走 attn+moe 等价路径：
             # 为复用逻辑，重新拼 block 前向（单 token 开销可忽略）
-            hh_norm = layer.norm1(hh)
+            xxs = hh
+            hh_in = hh.mean(dim=2) if hyper_n else hh
+            hh_norm = layer.norm1(hh_in)
             a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
-            hh = hh + a_out
+            hh = hh_in + a_out
             m_out, _ = layer.moe(layer.norm2(hh))
             hh = hh + m_out
             if layer.memory is not None:
@@ -324,7 +343,12 @@ class TinyLLM(nn.Module):
                 # V2 交错融合同样同步（block 前向末节；w_o 非零后漏掉即分叉）
                 mh, mm = retro_mem
                 hh = layer.retro(hh, mh, mm)
+            if hyper_n and layer.hyper is not None:
+                # 超连接写回与 block.forward 同式（均值流增量 + 流混合）
+                hh = layer.hyper.combine(xxs, hh - hh_in)
             new_pasts.append(p2)
+        if hyper_n:
+            hh = hh.mean(dim=2)
         return self.final_norm(hh), new_pasts
 
     def compile_decode(self, mode: str = "default") -> "TinyLLM":
@@ -407,8 +431,13 @@ class TinyLLM(nn.Module):
         训练长序列走分块路径（linear_chunk/sparse），与 generate 的 prefill 一致。
         """
         h = self.embed(input_ids)
+        hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
+        if hyper_n:
+            h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         for layer in self.layers:
             h, _ = layer(h, None, False)
+        if hyper_n:
+            h = h.mean(dim=2)
         return self.final_norm(h)
 
     @torch.no_grad()
@@ -442,10 +471,15 @@ class TinyLLM(nn.Module):
             sum(p.numel() for p in layer.retro.parameters())
             for layer in self.layers
             if getattr(layer, "retro", None) is not None)
+        # 超连接：整块参与（n 小量，可忽略但计入）
+        hyper_active = sum(
+            sum(p.numel() for p in layer.hyper.parameters())
+            for layer in self.layers
+            if getattr(layer, "hyper", None) is not None)
         active = (
             self.embed.weight.numel()
             + per_layer_active * c.n_layers
-            + mem_active + retro_active
+            + mem_active + retro_active + hyper_active
             + self.final_norm.weight.numel()
             + (0 if c.tie_embeddings else self.lm_head.weight.numel())
         )
