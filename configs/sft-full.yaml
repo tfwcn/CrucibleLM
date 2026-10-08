@@ -34,3 +34,5 @@ retro_db: data/retro-sft.pkl
 retro_k: 2
 retro_every: 4
 retro_len: 64
+# 超连接（A/B 已验证：SFT 续训起点上赢；从 base 起的 SFT 全程未验证，属实验项）
+hyper_streams: 2
