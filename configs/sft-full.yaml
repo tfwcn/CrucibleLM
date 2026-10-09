@@ -13,7 +13,7 @@ max_steps: 2000
 lr: 1.0e-4
 warmup: 20
 grad_ckpt: true
-ckpt_dir: data/llm-sft
+ckpt_dir: data/llm-sft-full
 vocab: data/llm-ckpt/vocab.json
 data: local
 local_path: "data/sft-zh:3,data/sft-belle:1"

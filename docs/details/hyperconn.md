@@ -59,6 +59,8 @@ y = einsum(H, x) + post * F_out     # 混合 + 写回
 - 激活显存 ×n（残差流变宽，12 层约多 3 份 hidden；grad-ckpt 兜着，16G 够）；
 - A/B 已结案（sft-hyper 500 步：ema -0.023，hyper_gain 全程 1.0，后 500 步平台期）：
   赢面定格在前 500 步的结构红利，已合入 `sft-full.yaml`（`hyper_streams: 2`）；
+  注：冻影子时代的 `best/`（1.4972）名不副实，锚定正冠后真冠军是 raw ckpt-800
+  （四子集横扫，mean 1.7396 vs 1.7527/1.762），已拷 `champion/`；
 - 128M 上 -0.021 未必复现（论文 27B 的数）：A/B 赢的是"-0.023 vs sft6 同段"，
   不是论文数字，继续保持诚实；
 - `float(0维张量)` 会 detach 断梯度——α 必须保持张量运算（修过，单测锁梯度）。
