@@ -97,9 +97,22 @@ def main(argv=None) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     kept, total = 0, 0
-    fall = open(out / "all.jsonl", "w", encoding="utf-8")
-    fkeep = open(out / "kept.jsonl", "w", encoding="utf-8")
+    done = set()
+    if (out / "all.jsonl").exists():
+        import json as _json2
+
+        for line in open(out / "all.jsonl", encoding="utf-8"):
+            try:
+                r = _json2.loads(line)
+                done.add((r["instruction"], r.get("input", "")))
+            except (ValueError, KeyError):
+                continue
+        print(f"断点续采：跳过已采 {len(done)} 对 prompt", flush=True)
+    fall = open(out / "all.jsonl", "a", buffering=1, encoding="utf-8")
+    fkeep = open(out / "kept.jsonl", "a", buffering=1, encoding="utf-8")
     for ins, inp in prompts:
+        if (ins, inp) in done:
+            continue
         for _ in range(args.n_samples):
             total += 1
             r = be.chat([{"role": "user", "content": ins}],
