@@ -75,7 +75,8 @@ def main(argv=None) -> int:
 
     cfg = tiny_test_config() if args.preset == "tiny" else SmallLLMConfig()
     tok.vocab_size = len(tok._chars) + 4  # 文件只存 _chars，容量另算
-    cfg.vocab_size = tok.vocab_size  # 与词表文件对齐（否则 embed 形状炸）
+    # cfg.vocab_size 保持预设容量（8192）：训练扩词复用空行不改形状，
+    # 建模必须同宽，否则 embed/lm_head 严格载入必炸（init_memory.py 同规则）
     cfg.memory_every = args.memory_every
     if args.retro_every > 0:
         cfg.retro_enabled = True
