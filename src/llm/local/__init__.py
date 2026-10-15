@@ -14,6 +14,10 @@
 - model.py       完整模型（含 MTP 头、前向/生成/参数统计）
 - train.py       训练单步、16G 配方、显存估算
 - infer.py       简单分词器 + chat 封装（可对接现有 Runner 调试）
+- spec_decode.py 投机解码起草器（n-gram + MTP，默认关）
+- offload.py     专家跨设备 offload（CPU/磁盘 + LRU，默认关）
+- les.py         专家命中预测（供 offload 预取，默认关）
+- vision_compress.py 视觉 token 压缩（结构预留，默认关）
 """
 
 from src.llm.local.config import SmallLLMConfig

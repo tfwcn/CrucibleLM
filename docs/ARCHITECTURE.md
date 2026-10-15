@@ -297,6 +297,28 @@ $LLMPY scripts/train_local_llm.py --phase sft --preset base \
 transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内有垫片）；
 老师只在 SFT/mid-training 开，base 预训练继续吃大锅饭。
 
+## 推理加速扩展（`spec_decode.py`/`offload.py`/`les.py`/`vision_compress.py`，默认全关）
+
+四项 opt-in 能力，默认全关；关闭时旧命令与 checkpoint 逐位兼容（单测锁定）。
+参数对着 `config.py`，细节见 `docs/details/` 对应四篇：
+
+| 开关（默认） | 作用 | 文件 |
+|---|---|---|
+| `draft_enabled`(False) / `draft_window`(5) / `draft_source`(hybrid) / `draft_ngram_min`(2) | 投机解码：MTP+n-gram 起草 + 主干并行验证，输出=逐 token 贪心 | `spec_decode.py` |
+| `offload_enabled`(False) / `offload_target`(cpu) / `offload_dir`("") / `offload_capacity`(0) / `offload_prefetch`(False) | 专家 offload 到 CPU/磁盘 + LRU 淘汰 | `offload.py` |
+| `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 预取 | `les.py` |
+| `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) | 视觉 token 压缩（结构预留，仅推理前缀） | `vision_compress.py` |
+
+- **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
+  仅 batch=1、`temperature=0` 生效，输出与逐 token 贪心逐位一致。为支撑并行
+  验证，MLA（`_valid_mask` 块内因果）、稀疏（`_decode` 取最后 t 个查询）、线性
+  （`past≠None, t>1` 分支）三条解码路径补齐多 token 增量，`t==1` 逐位不变。
+- **专家 offload**：开启后 MoE 从分组 bmm 切到"只算命中专家"的逐专家路径，数值一致；
+  逐个 `ensure`（`capacity<命中数` 也不会误用已置 meta 的专家）。
+- **LES**：纯统计、零可训练参数；预测只影响搬运时序，不改变数值。
+- **视觉压缩**：默认关时模型无该模块、`state_dict` 兼容；当前只接线推理前缀
+  （`encode_vision` + `forward(vision_embeds=...)`），训练 loss 路径未接线。
+
 ## 直觉头/RAG（`heads.py` + `retrieval.py`，SFT 后启用）
 
 - **样本抽取**：`scripts/extract_tool_choices.py` 扫会话库
@@ -338,5 +360,10 @@ python scripts/migrate_model.py --src data/llm-ckpt --out data/llm-16L --add-lay
     ## 单测
 
 ```bash
-python -m pytest tests/test_local_llm.py -v  # 需要 torch，无 torch 自动跳过
+python -m pytest tests/ -q  # 需要 torch，无 torch 自动跳过
 ```
+
+新增能力各有独立单测：`test_speculative.py`（起草器 + "等于贪心"契约 + 回滚）、
+`test_offload.py`（CPU/磁盘数值等价 + LRU）、`test_les.py`（预测确定性 + 数值不变）、
+`test_vision_compress.py`（patch 往返 + 压缩形状 + 默认关兼容）、
+`test_multi_token_decode.py`（多 token 增量解码回归）。

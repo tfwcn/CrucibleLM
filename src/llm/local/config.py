@@ -73,6 +73,44 @@ class SmallLLMConfig:
     # 超连接残差：0=关闭（标准单流残差）；≥2=n 路流混合（mHC-lite，见 hyperconn.py）
     hyper_streams: int = 0
 
+    # ===== 投机解码（推理加速，默认关；见 spec_decode.py / docs/details/speculative-decoding.md）=====
+    # 关闭时生成路径逐位不变（单测锁定）
+    draft_enabled: bool = False
+    # 每轮最多起草的 token 数（喂给主干并行验证的窗口，越大越省但拒答代价越高）
+    draft_window: int = 5
+    # 起草来源：ngram（前缀查表，零成本且命中率高）/ mtp（复用 MTP 头猜 t+2）/ hybrid（MTP 起头 + ngram 补足）
+    draft_source: str = "hybrid"
+    # ngram 起草的最短匹配后缀长度（太短会误命中，太长覆盖不足）
+    draft_ngram_min: int = 2
+
+    # ===== 跨设备专家 offload（默认关；见 offload.py / docs/details/cross-device-offload.md）=====
+    offload_enabled: bool = False
+    # offload 目标设备的专家冷副本落点：cpu（内存）或 disk（磁盘，更省内存）
+    offload_target: str = "cpu"
+    # disk 目标的落盘目录（offload_target=disk 时必填）
+    offload_dir: str = ""
+    # GPU 常驻专家数上限（LRU 淘汰）；<=0 表示不限
+    offload_capacity: int = 0
+    # 是否根据上一步路由结果预取下一位可能命中的专家
+    offload_prefetch: bool = False
+
+    # ===== LES 专家调度（默认关；见 les.py / docs/details/les-expert-scheduling.md）=====
+    les_enabled: bool = False
+    # 预测器历史窗口（最近多少步路由命中参与打分）
+    les_history: int = 8
+    # 每步预测搬上算力设备的专家数
+    les_topn: int = 4
+
+    # ===== 视觉 token 压缩（默认关；见 vision_compress.py / docs/details/vision-token-compression.md）=====
+    vision_enabled: bool = False
+    # 压缩后送进主干的视觉 token 数
+    vision_tokens: int = 64
+    # patch 边长（图像 H/W 需为其整数倍）
+    vision_patch: int = 16
+    # 压缩方式：avgpool（自适应平均池化，无参数查询）/ perceiver（可学习查询 cross-attention）
+    vision_compress: str = "avgpool"
+    vision_d_in: int = 3  # 输入通道（RGB=3）
+
     @property
     def head_dim(self) -> int:
         """每个头的维度."""

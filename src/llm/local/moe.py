@@ -44,6 +44,82 @@ class FineGrainedMoE(nn.Module):
         self.shared = nn.ModuleList(
             [SwiGLUExpert(d_model, expert_hidden) for _ in range(n_shared)]
         )
+        # 可选：专家跨设备搬运（默认 None = 走分组 bmm 快路径，逐位不变）
+        self.store = None
+        # 可选：LES 专家预测器（默认 None；仅 offload 时才有意义）
+        self.les = None
+        self.prefetch = False
+
+    def enable_offload(
+        self,
+        compute_device,
+        target: str = "cpu",
+        offload_dir: str = "",
+        capacity: int = 0,
+        prefetch: bool = False,
+    ):
+        """开启专家 offload（构建 ExpertStore；由模型 setup_offload 调用）."""
+        from src.llm.local.offload import ExpertStore
+
+        self.store = ExpertStore(
+            self.experts, compute_device, target, offload_dir, capacity)
+        self.prefetch = prefetch
+        return self
+
+    def enable_les(self, history: int = 8, topn: int = 4):
+        """开启 LES 专家预测（隐含预取；无 offload 时不会被消费）."""
+        from src.llm.local.les import build_les
+
+        self.les = build_les(self.n_experts, history, topn)
+        self.prefetch = True
+        return self
+
+    def _forward_offload(
+        self, x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """offload 前向：只把命中专家搬到算力设备，逐专家算后散射加回.
+
+        与朴素全量实现数学一致（tests/test_offload.py 对比分组版逐位/紧公差）。
+        共享专家常驻（不参与 offload），aux loss 与分组版同式。
+        """
+        orig_shape = x.shape
+        d = x.shape[-1]
+        flat = x.reshape(-1, d)
+        logits = self.router(flat)
+        probs = F.softmax(logits, dim=-1)
+        top_w, top_i = torch.topk(probs, self.top_k, dim=-1)
+        top_w = top_w / top_w.sum(-1, keepdim=True).clamp_min(1e-6)
+        hit = torch.unique(top_i)
+        # LES：按历史命中预测下一步热点，先搬上算力设备（预取；只影响时序）
+        if self.prefetch and self.les is not None:
+            self.store.ensure(self.les.predict(self.store.hot_ids()))
+        out = torch.zeros_like(flat)
+        for e in hit.tolist():
+            sel = (top_i == e).any(dim=-1)
+            if not bool(sel.any()):
+                continue
+            # 逐个 ensure（不能整批先 ensure 再算：capacity < 命中数时，
+            # 后搬入的会把先搬入的挤回冷端，随后用到已置 meta 的专家 → 错）
+            self.store.ensure([e])
+            idx = sel.nonzero(as_tuple=True)[0]
+            w_e = (top_w * (top_i == e).to(top_w.dtype)).sum(-1)[sel]
+            y_e = self.experts[e](flat[sel])
+            out = out.index_add(0, idx, w_e.unsqueeze(-1) * y_e)
+        out = out.view(orig_shape)
+        for expert in self.shared:
+            out = out + expert(x)
+        # LES：记录本步真实命中，供下一步预测
+        if self.les is not None:
+            self.les.observe(hit.tolist())
+        # 负载均衡 aux loss（与分组版同式）
+        flat_b = top_i.numel() // self.top_k
+        importance = probs.reshape(-1, self.n_experts).mean(0)
+        load_frac = (
+            F.one_hot(top_i.reshape(-1), self.n_experts).float().sum(0)
+            / max(flat_b * self.top_k, 1)
+        )
+        aux_loss = (importance * load_frac).sum() * self.n_experts * self.aux_coef
+        return out, aux_loss
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """前向并返回 (输出, aux_loss).
@@ -55,6 +131,9 @@ class FineGrainedMoE(nn.Module):
         3 次 bmm 算完所有专家（替代 16 次逐专家 Python dispatch，
         解码主力开销），再按权重散射加回。数值与逐专家版一致（单测锁定）。
         """
+        if self.store is not None:
+            # 开启 offload：走逐专家命中路径（只搬命中专家上算力设备）
+            return self._forward_offload(x)
         orig_shape = x.shape
         d = x.shape[-1]
         flat = x.reshape(-1, d)  # (N, d)

@@ -91,6 +91,15 @@ class TinyLLM(nn.Module):
 
             self.retro = RetroFusion(
                 config.d_model, config.retro_heads, config.dropout)
+        # 视觉 token 压缩（默认 None：无参数，state_dict 兼容；开后多一段视觉前缀）
+        self.vision: nn.Module | None = None
+        if config.vision_enabled:
+            from src.llm.local.vision_compress import VisionCompressor
+
+            self.vision = VisionCompressor(
+                config.d_model, config.vision_d_in, config.vision_patch,
+                config.vision_tokens, config.vision_compress, config.n_heads,
+                config.dropout)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -118,6 +127,7 @@ class TinyLLM(nn.Module):
         mem_mask: torch.Tensor | None = None,
         chunk_ids: torch.Tensor | None = None,
         chunk_mask: torch.Tensor | None = None,
+        vision_embeds: torch.Tensor | None = None,
     ) -> dict:
         """前向：训练时传 targets 返回组合 loss，推理时只返回 logits.
 
@@ -137,6 +147,11 @@ class TinyLLM(nn.Module):
                 "（RoPE 缓存盖不住）：请调大 max_seq_len 或直接用 longctx_config()（200K 预设）"
             )
         h = self.embed(input_ids)
+        # 视觉前缀（结构预留，默认 None）：视觉 token 已投影到 d_model，拼在文本前
+        if vision_embeds is not None:
+            if targets is not None:
+                raise NotImplementedError("视觉前缀暂只支持推理路径（loss 对齐待接线）")
+            h = torch.cat([vision_embeds.to(h.dtype), h], dim=1)
         # 超连接：embedding 展开成 n 路流（各路初始相同，对称性由 H 参数打破）；
         # 模块（注意/MoE/记忆/retro）只看均值流，FLOP 不变
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
@@ -367,6 +382,123 @@ class TinyLLM(nn.Module):
             hh = hh.mean(dim=2)
         return self.final_norm(hh), new_pasts
 
+    @torch.no_grad()
+    def _decode_multi(
+        self, tokens: torch.Tensor, pasts: list,
+        retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+    ) -> tuple[torch.Tensor, list]:
+        """并行验证：一次前向喂 t 个 token，返回 (全段 hidden (b,t,d), 新缓存).
+
+        投机解码专用：与逐 token `_decode_step` **同一算术**（MLA 多查询 SDPA
+        逐行独立、稀疏路径按 start=total-t 聚集、线性层走多 token 增量递推），
+        因此验证出的主干贪心序列即真实贪心序列（契约见 test_speculative.py）。
+        普通生成仍走 `_decode_step`，此路径不参与编译。
+        """
+        hh = self.embed(tokens)
+        hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
+        if hyper_n:
+            hh = hh.unsqueeze(2).expand(-1, -1, hyper_n, -1)
+        new_pasts: list = []
+        for layer, p in zip(self.layers, pasts):
+            xxs = hh
+            hh_in = layer.hyper.pre_mix(hh) if hyper_n and layer.hyper is not None else hh
+            hh_norm = layer.norm1(hh_in)
+            a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
+            hh = hh_in + a_out
+            m_out, _ = layer.moe(layer.norm2(hh))
+            hh = hh + m_out
+            if layer.memory is not None:
+                hh = layer.memory(hh)
+            if layer.retro is not None and retro_mem is not None:
+                mh, mm = retro_mem
+                hh = layer.retro(hh, mh, mm)
+            if hyper_n and layer.hyper is not None:
+                hh = layer.hyper.combine(xxs, hh - hh_in)
+            new_pasts.append(p2)
+        if hyper_n:
+            hh = hh.mean(dim=2)
+        return self.final_norm(hh), new_pasts
+
+    def _spec_eligible(self, input_ids: torch.Tensor, temperature: float) -> bool:
+        """是否走投机解码：需开关开、batch=1、纯贪心（temperature=0）."""
+        return bool(self.config.draft_enabled) and input_ids.shape[0] == 1 \
+            and temperature == 0.0
+
+    @torch.no_grad()
+    def _spec_stream(
+        self, input_ids: torch.Tensor, max_new_tokens: int, eos_id: int | None,
+        repetition_penalty: float,
+    ):
+        """投机解码内循环（贪心；逐 token yield 新 id int）.
+
+        每轮：主头出权威下一位 → 起草器补足后续候选 → `_decode_multi` 一次并行
+        验证 → 接受最长草稿前缀；部分接受时回滚缓存并逐 token 重放（保证
+        状态精确）。输出与 `_generate_inner` 的贪心逐位一致（单测锁定）。
+        """
+        from src.llm.local.spec_decode import build_draft_provider
+
+        cfg = self.config
+        provider = build_draft_provider(self, cfg.draft_source, cfg.draft_ngram_min)
+        window = max(1, int(cfg.draft_window))
+        dev = input_ids.device
+        # 预留：每轮最多并行写 window 个位置，多留 window 防越界
+        h, pasts = self._prefill(
+            input_ids, max_new_tokens=max_new_tokens + window)
+        ctx = input_ids[0].tolist()
+        n_new = 0
+        rounds = 0
+        n_accepted = 0
+        while n_new < max_new_tokens:
+            rounds += 1
+            ctx_t = torch.tensor([ctx], dtype=torch.long, device=dev)
+            t0 = int(self._sample_next(
+                h[:, -1:], 0.0, 0, repetition_penalty, ctx_t)[0, 0])
+            k = window - 1
+            drafts = provider.propose(ctx, h[:, -1:], k) if k > 0 else []
+            feed = [t0] + list(drafts)
+            y = torch.tensor([feed], dtype=torch.long, device=dev)
+            old_pasts = pasts
+            h_multi, pasts_multi = self._decode_multi(y, old_pasts)
+            # 验证：逐位比草稿与主干贪心（seen 上下文逐步累积，惩罚口径一致）
+            accepted = 0
+            seen = list(ctx)
+            for i in range(1, len(feed)):
+                seen_t = torch.tensor([seen], dtype=torch.long, device=dev)
+                tg = int(self._sample_next(
+                    h_multi[:, i - 1:i], 0.0, 0, repetition_penalty, seen_t)[0, 0])
+                if tg == feed[i]:
+                    accepted += 1
+                    seen.append(feed[i])
+                else:
+                    break
+            n_accepted += accepted
+            committed = feed[:1 + accepted]
+            if accepted == len(drafts):
+                # 全接受：并行结果即最终状态，直接采用（零回滚）
+                h = h_multi[:, len(feed) - 1:len(feed)]
+                pasts = pasts_multi
+            else:
+                # 部分接受：缓存回退到本轮起点，逐 token 重放已提交前缀
+                # （MLA 缓冲按 pos 回退、线性状态是新建张量未被原地改，均安全）
+                h = h[:, -1:]
+                pasts = old_pasts
+                for tok in committed:
+                    ht = torch.tensor([[tok]], dtype=torch.long, device=dev)
+                    h, pasts = self._decode_step(ht, pasts)
+            stop = False
+            for tok in committed:
+                yield tok
+                n_new += 1
+                ctx.append(tok)
+                if (eos_id is not None and tok == eos_id) or n_new >= max_new_tokens:
+                    stop = True
+                    break
+            if stop:
+                break
+        # 统计（日志/单测用：accepted 越接近 window×rounds 越省）
+        self._spec_stats = {"rounds": rounds, "accepted": n_accepted,
+                            "emitted": n_new, "window": window}
+
     def compile_decode(self, mode: str = "default") -> "TinyLLM":
         """编译单步解码（推理专用）.
 
@@ -394,6 +526,14 @@ class TinyLLM(nn.Module):
         temperature=0 为贪心；>0 时按温度采样（可配 top-k 截断）。
         与 stream_tokens 同一基元（数学一致，单测锁定）。
         """
+        if self._spec_eligible(input_ids, temperature):
+            ids = list(self._spec_stream(
+                input_ids, max_new_tokens, eos_id, repetition_penalty))
+            if not ids:
+                return input_ids.clone()
+            add = torch.tensor([ids], dtype=input_ids.dtype,
+                               device=input_ids.device)
+            return torch.cat([input_ids, add], dim=1)
         h, pasts = self._prefill(input_ids, max_new_tokens=max_new_tokens)
         cur = input_ids
         for _ in range(max_new_tokens):
@@ -423,6 +563,10 @@ class TinyLLM(nn.Module):
         was_training = self.training
         self.eval()
         try:
+            if self._spec_eligible(input_ids, temperature):
+                yield from self._spec_stream(
+                    input_ids, max_new_tokens, eos_id, repetition_penalty)
+                return
             h, pasts = self._prefill(input_ids, max_new_tokens=max_new_tokens)
             seen: list[torch.Tensor] = []
             for _ in range(max_new_tokens):
@@ -463,6 +607,37 @@ class TinyLLM(nn.Module):
         不碰 train/eval 状态（只关梯度；dropout>0 时调用方自行 eval）。
         """
         return self.encode_full_hidden(input_ids)[:, -1, :]
+
+    @torch.no_grad()
+    def encode_vision(self, images: torch.Tensor) -> torch.Tensor:
+        """图像 → 视觉 token 序列 (B, n_tokens, d_model)（需 vision_enabled=True）."""
+        if self.vision is None:
+            raise ValueError("vision_enabled=False，模型无视觉模块")
+        return self.vision(images)
+
+    def setup_offload(self, compute_device=None) -> "TinyLLM":
+        """按配置为每层 MoE 开启专家 offload / LES 调度（默认关时无操作）.
+
+        与 `compile_decode` 同风格：改权重/切设备后需重新调用。仅推理路径用。
+        返回 self。
+        """
+        cfg = self.config
+        if not (cfg.offload_enabled or cfg.les_enabled):
+            return self
+        if compute_device is None:
+            compute_device = next(self.parameters()).device
+        for layer in self.layers:
+            if cfg.offload_enabled:
+                layer.moe.enable_offload(
+                    compute_device,
+                    target=cfg.offload_target,
+                    offload_dir=cfg.offload_dir,
+                    capacity=cfg.offload_capacity,
+                    prefetch=cfg.offload_prefetch,
+                )
+            if cfg.les_enabled:
+                layer.moe.enable_les(cfg.les_history, cfg.les_topn)
+        return self
 
     def count_params(self) -> dict:
         """统计总参数与每 token 激活参数（MoE 只计 top-k + 共享专家）."""

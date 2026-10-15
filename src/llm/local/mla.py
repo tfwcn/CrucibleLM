@@ -94,11 +94,20 @@ class MLAModule(nn.Module):
         pos = torch.tensor(t, device=c_kv.device, dtype=torch.long)
         return buf_c, buf_kr, pos
 
-    def _valid_mask(self, length: int, pos_next: torch.Tensor,
+    def _valid_mask(self, length: int, pos: torch.Tensor, t: int,
                     device: torch.device) -> torch.Tensor:
-        """有效位掩码 (1, 1, 1, L)：已写位置放行，预留空位屏蔽."""
-        return (torch.arange(length, device=device).view(1, 1, 1, length)
-                < pos_next.view(1, 1, 1, 1))
+        """有效位掩码 (1, 1, t, L)：已写位置放行 + 预留空位屏蔽 + 块内因果.
+
+        t==1（逐 token 解码）时退化为旧式 (1,1,1,L)，逐位不变；
+        t>1（投机解码并行验证）时必须补块内因果掩码：新查询只许看到
+        自身及之前，否则会偷看同批未来草稿（未开因果的经典 bug）。
+        """
+        keys = torch.arange(length, device=device).view(1, 1, 1, length)
+        mask = keys < (pos + t).view(1, 1, 1, 1)
+        if t > 1:
+            q_pos = pos.reshape(1) + torch.arange(t, device=device)
+            mask = mask & (keys <= q_pos.view(1, 1, t, 1))
+        return mask
 
     def _qkv(
         self, h: torch.Tensor
@@ -184,7 +193,7 @@ class MLAModule(nn.Module):
             # （SDPA bool 掩码 True=放行；预留空位 False 屏蔽）
             out = F.scaled_dot_product_attention(
                 q_full, k_full, v_full,
-                attn_mask=self._valid_mask(total, pos_next, h.device),
+                attn_mask=self._valid_mask(total, pos, t, h.device),
                 dropout_p=0.0,
             )
             out = out.transpose(1, 2).contiguous().view(b, t, -1)

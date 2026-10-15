@@ -210,6 +210,8 @@ class LocalChatBackend:
                 raise ValueError(f"dtype 须为 {sorted(dmap)}，当前 {dtype}")
             model = model.to(dmap[dtype])
         model.eval()
+        # 专家 offload / LES：按配置为各层 MoE 挂搬运器（默认关时无操作）
+        model.setup_offload()
         tok = SimpleTokenizer(config.vocab_size)
         candidates = [path + ".vocab.json",
                       str(_Path(path).parent / "vocab.json")]

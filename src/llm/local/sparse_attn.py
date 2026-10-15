@@ -205,8 +205,9 @@ class SparseMLAModule(MLAModule):
         q_full = torch.cat([q, q_rope], dim=-1).transpose(1, 2)
         k_full = torch.cat([k, k_rope_hist], dim=-1).transpose(1, 2)
         v_full = v.transpose(1, 2)
-        # 查询即最后位置：select_keys(total, total-1, total)，q 只有当步
-        out = self._sparse_scores(q_full, k_full, v_full, total - 1, total, total)
+        # 查询即最后 t 个位置：select_keys(total, total-t, total)，t==1 时与旧式一致；
+        # t>1 为投机解码并行验证服务（块内因果由 chunk_causal_mask 保证）
+        out = self._sparse_scores(q_full, k_full, v_full, total - t, total, total)
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
         return self.w_o(out), (buf_c, buf_kr, pos_next)
 

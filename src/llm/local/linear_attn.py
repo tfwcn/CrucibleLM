@@ -120,6 +120,22 @@ class GatedDeltaLite(nn.Module):
             o = (q[:, 0].unsqueeze(-2) @ new_state).squeeze(-2) * self.scale
             o = (o.reshape(b, t, -1) * F.silu(u)).contiguous()
             return self.w_o(o), (new_state, new_bufs[0], new_bufs[1])
+        if past is not None and t > 1:
+            # 多 token 增量（投机解码并行验证用）：以 s_prev 为初值，按单步
+            # 同款算术逐 token 递推。必须与 t==1 路径**逐位一致**——验证路径
+            # 若与逐 token 解码存在浮点顺序差异，草稿接受判定会在近并列 logit
+            # 上松弛，"等于贪心"的契约就守不住（单测
+            # test_linear_multi_token_decode_matches_sequential 锁定）。
+            s = s_prev
+            outs = []
+            for i in range(t):
+                kv_i = k[:, i].unsqueeze(-1) @ v[:, i].unsqueeze(-2)
+                s = s * decay[:, i].view(b, self.n_heads, 1, 1) + kv_i
+                oi = (q[:, i].unsqueeze(-2) @ s).squeeze(-2) * self.scale
+                outs.append(oi)
+            o = torch.stack(outs, dim=1).reshape(b, t, -1)
+            o = (o * F.silu(u)).contiguous()
+            return self.w_o(o), (s, new_bufs[0], new_bufs[1])
         if t > self.linear_chunk:
             # 长序列分块递推（前向精确，块间截断 BPTT，见 _forward_chunked）；
             # 缓存拼三元组（S + 卷积尾），与短序列分支一致

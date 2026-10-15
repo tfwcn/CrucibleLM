@@ -38,6 +38,13 @@
 - [数据管线](./data-pipeline.md)
 - [存盘与续跑](./checkpoint.md)
 
+## 推理加速扩展（默认全关）
+
+- [投机解码：先猜后验](./speculative-decoding.md)
+- [跨设备推理：专家 offload](./cross-device-offload.md)
+- [LES 专家调度：预判下一步](./les-expert-scheduling.md)
+- [视觉 token 压缩](./vision-token-compression.md)
+
 ## 决策与迁移
 
 - [直觉头：毫瓦级决策器](./intuition-heads.md)
