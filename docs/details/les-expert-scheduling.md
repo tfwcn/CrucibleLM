@@ -23,8 +23,13 @@ predict(topn)：取分数最高的若干，排除已在热端的
 observe(hits)：把本步真实命中滑入窗口
 ```
 
-预测结果喂给 `ExpertStore.ensure` 做**预取**（提前搬运），只影响"何时搬"，
-不改变数值。纯统计、零可训练参数，不污染 `state_dict`。
+预测结果喂给 `ExpertStore.ensure(prefetch=True)` 做**预取**（提前搬运），只影响
+"何时搬"，不改变数值。纯统计、零可训练参数，不污染 `state_dict`。
+
+**关键约束：预取只填空闲容量、绝不淘汰。** 若预取也能淘汰，它会按 LRU 把"马上
+要用的专家"挤回冷端，凭空多出搬运——实测（16 专家、top_k=4、`les_topn=4`、
+`capacity=8`）预取+淘汰使搬运数翻 3 倍、吞吐减半。改成"只填空位"后，预取
+**永不劣化**。
 
 ## 我们的实现
 
@@ -33,12 +38,28 @@ observe(hits)：把本步真实命中滑入窗口
 - 配置：`les_enabled`（默认关）、`les_history`、`les_topn`；
 - 无 offload 时开了也无副作用（预测没人消费）；预取与真实搬运都幂等，输出不变。
 
+### 实测（~128M、16 专家 top_k=4、RTX 3080 Laptop、CPU offload）
+
+单次 64-token 生成的搬运数（`moves`），LES 开/关对照：
+
+| 容量 | 无 LES | +LES | topn=4 时 |
+|---|---|---|---|
+| 6 | 3916 | 3916 | 预取首步填 48 次，之后容量满→全部跳过 |
+| 8 | 3058 | 3058 | 同上 |
+| 12 | 1674 | 1674 | 同上 |
+| ≥16 / 0(不限) | 192 | 192 | 一次性全上，之后零搬运 |
+
+即：**当前实现下 LES 对吞吐中性（不亏不赚）**——预取把"迟早要搬的"提前搬，
+省下的搬运被"预取错的专家占位"抵消。真正让它变成净收益，需要把预取放到
+**独立 CUDA stream 上异步搬运**、与当前步计算重叠；本版未做（结构已就位：
+预取只碰冷专家、绝不淘汰，异步化不会破坏正确性）。
+
 ## 从想法到代码
 
 ```python
-# moe.py 命中路径开头：先按预测预取，再算真实命中
+# moe.py 命中路径开头：先按预测预取（只填空位、不淘汰），再算真实命中
 if self.prefetch and self.les is not None:
-    self.store.ensure(self.les.predict(self.store.hot_ids()))   # 提前搬
+    self.store.ensure(self.les.predict(self.store.hot_ids()), prefetch=True)
 ...
 if self.les is not None:
     self.les.observe(hit.tolist())                              # 记录本步命中
@@ -46,10 +67,13 @@ if self.les is not None:
 
 ## 代价与坑
 
-- 预测错了只是白搬一次（LRU 会自然换出），不会算错——数值正确性与 offload 解耦；
+- 预测错了只是白占一个空位（不淘汰、不算错），数值正确性与 offload 解耦；
+- **预取绝不淘汰**是硬约束：否则会挤掉工作集，搬运数暴涨、吞吐倒退（见 pitfalls）；
 - 目前只按"近期频次"打分，未用专家转移矩阵；若命中序列更结构化可再升级，
   但**保持零参数**是底线（否则 checkpoint 不再通用）；
-- `les_topn` 与 offload 容量要配合：topn 超过容量会互相挤兑，均摊反而变差。
+- `les_topn` 与 offload 容量要配合：预取只能填空位，容量≈工作集时预取等价于
+  无操作（中性）；要见收益需配合异步搬运（见上）。
+- **预取绝不淘汰**是硬约束，违反即劣化（见 pitfalls 第 16 条）。
 
 ## 一句话总结
 

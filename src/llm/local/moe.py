@@ -93,7 +93,8 @@ class FineGrainedMoE(nn.Module):
         hit = torch.unique(top_i)
         # LES：按历史命中预测下一步热点，先搬上算力设备（预取；只影响时序）
         if self.prefetch and self.les is not None:
-            self.store.ensure(self.les.predict(self.store.hot_ids()))
+            # 预取：只填空闲容量、不淘汰（避免挤掉马上要用的专家）
+            self.store.ensure(self.les.predict(self.store.hot_ids()), prefetch=True)
         out = torch.zeros_like(flat)
         for e in hit.tolist():
             sel = (top_i == e).any(dim=-1)

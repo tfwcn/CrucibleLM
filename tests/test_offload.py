@@ -110,6 +110,30 @@ def test_expert_store_disk_paths_namespaced(tmp_path):
         assert torch.equal(m2.experts[i].w_gate.weight, ref2[i])
 
 
+def test_expert_store_prefetch_fills_but_never_evicts(tmp_path):
+    """预取只在有空位时搬入，绝不淘汰（避免挤掉马上要用的专家）."""
+    m = _moe()
+    store = ExpertStore(m.experts, "cpu", target="disk",
+                        offload_dir=str(tmp_path), capacity=2)
+    store.ensure([0, 1])
+    assert store.hot_ids() == [0, 1]
+    moves = store.moves
+    # 容量已满：预取应整体跳过，热集不变、不再搬运
+    store.ensure([5, 6], prefetch=True)
+    assert store.hot_ids() == [0, 1]
+    assert store.moves == moves
+    # 正常 ensure 仍会淘汰最旧的（淘汰权留给真正要用的那步）
+    store.ensure([7])
+    assert store.hot_ids() == [1, 7]
+    # 腾出空位后，预取可填空位但不替换现有热专家
+    m2 = _moe()
+    s2 = ExpertStore(m2.experts, "cpu", target="disk",
+                     offload_dir=str(tmp_path), name="s2", capacity=3)
+    s2.ensure([0])
+    s2.ensure([1, 2], prefetch=True)
+    assert s2.hot_ids() == [0, 1, 2]
+
+
 def test_model_setup_offload_disk_end_to_end(tmp_path):
     """整模型磁盘 offload：开/关 logits 与生成逐位一致（含多层 + 淘汰）."""
     torch.manual_seed(0)

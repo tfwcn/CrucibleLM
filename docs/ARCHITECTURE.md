@@ -317,8 +317,11 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   实测加速：普通对话 ~1.45–1.5x、代码 ~1.6–1.7x（MTP 首猜命中 ~0.6–0.8）；
   ngram 单用净亏（首猜命中 ~0.04），故 `hybrid` 仅在 ngram 与 MTP 首猜一致时采纳其更长续写。
 - **专家 offload**：开启后 MoE 从分组 bmm 切到"只算命中专家"的逐专家路径，数值一致；
-  逐个 `ensure`（`capacity<命中数` 也不会误用已置 meta 的专家）。
-- **LES**：纯统计、零可训练参数；预测只影响搬运时序，不改变数值。
+  逐个 `ensure`（`capacity<命中数` 也不会误用已置 meta 的专家）；磁盘目标落盘文件按
+  层命名空间隔离（`layer{li}_{i}.pt`），多层共用目录不互相覆盖。
+- **LES**：纯统计、零可训练参数；预测只影响搬运时序，不改变数值。预取走
+  `ensure(prefetch=True)`，**只填空闲容量、绝不淘汰**（否则挤掉工作集、搬运数暴涨）；
+  当前实现下对吞吐中性，异步搬运（独立 stream 重叠）为后续升级点。
 - **视觉压缩**：默认关时模型无该模块、`state_dict` 兼容；当前只接线推理前缀
   （`encode_vision` + `forward(vision_embeds=...)`），训练 loss 路径未接线。
 

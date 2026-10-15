@@ -91,13 +91,21 @@ class ExpertStore:
             e.to(self.cpu_device)
         self.moves += 1
 
-    def ensure(self, ids) -> None:
-        """保证列出的专家当前在算力设备上（命中即搬到热端，必要时 LRU 淘汰）."""
+    def ensure(self, ids, prefetch: bool = False) -> None:
+        """保证列出的专家当前在算力设备上（命中即搬到热端，必要时 LRU 淘汰）.
+
+        `prefetch=True` 用于 LES 预取：**只填空闲容量、绝不淘汰**。预取是为了
+        把搬运延迟藏到计算前，若它反而把"马上要用的专家"挤回冷端，就会凭空
+        多出搬运（实测预取+淘汰使 moves 翻 3 倍、吞吐减半）。故预取在容量已满时
+        直接跳过，把淘汰权完全留给真正要用专家的那一步。
+        """
         for i in ids:
             i = int(i)
             if i in self._hot:
                 self._hot.move_to_end(i)
                 continue
+            if prefetch and self.capacity > 0 and len(self._hot) >= self.capacity:
+                continue  # 预取不淘汰：无空位就不搬
             self._load(i)
             self._hot[i] = None
             if self.capacity > 0:
