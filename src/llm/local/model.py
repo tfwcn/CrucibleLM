@@ -142,16 +142,17 @@ class TinyLLM(nn.Module):
         仅 retro_every>0 的层生效；模型侧 frozen embedding 查表编码
         （no_grad，不吃梯度；autocast 下自动同精度）。
         """
-        if input_ids.shape[1] > self.config.max_seq_len:
+        v_len = 0 if vision_embeds is None else int(vision_embeds.shape[1])
+        if input_ids.shape[1] + v_len > self.config.max_seq_len:
             raise ValueError(
-                f"输入长度 {input_ids.shape[1]} 超过 max_seq_len={self.config.max_seq_len}"
+                f"输入长度 {input_ids.shape[1]}(+视觉 {v_len}) 超过 "
+                f"max_seq_len={self.config.max_seq_len}"
                 "（RoPE 缓存盖不住）：请调大 max_seq_len 或直接用 longctx_config()（200K 预设）"
             )
         h = self.embed(input_ids)
-        # 视觉前缀（结构预留，默认 None）：视觉 token 已投影到 d_model，拼在文本前
-        if vision_embeds is not None:
-            if targets is not None:
-                raise NotImplementedError("视觉前缀暂只支持推理路径（loss 对齐待接线）")
+        # 视觉前缀（结构预留，默认 None）：视觉 token 已投影到 d_model，拼在文本前。
+        # 训练时（targets 非空）视觉段不参与 loss：logits 只取文本段错位一位对齐
+        if v_len:
             h = torch.cat([vision_embeds.to(h.dtype), h], dim=1)
         # 超连接：embedding 展开成 n 路流（各路初始相同，对称性由 H 参数打破）；
         # 模块（注意/MoE/记忆/retro）只看均值流，FLOP 不变
@@ -196,9 +197,10 @@ class TinyLLM(nn.Module):
         out: dict = {"logits": logits, "aux_loss": aux_total.detach()}
         if targets is None:
             return out
-        # 主 loss：预测下一 token
+        # 主 loss：预测下一 token（视觉前缀存在时只取文本段，视觉段不参与）
+        text_logits = logits[:, v_len:v_len + input_ids.shape[1] - 1]
         ce_tokens = F.cross_entropy(
-            logits[:, :-1].reshape(-1, self.config.vocab_size),
+            text_logits.reshape(-1, self.config.vocab_size),
             targets[:, 1:].reshape(-1),
             reduction="none",
         )
@@ -209,9 +211,9 @@ class TinyLLM(nn.Module):
         out["_main_mean"] = main_loss
         if return_token_losses:
             out["token_losses"] = ce_tokens.view(input_ids.shape[0], -1)
-        # MTP loss：用位置 i 的 hidden 预测 i+2 的 token
+        # MTP loss：用位置 i 的 hidden 预测 i+2 的 token（同样只取文本段）
         if self.mtp is not None and targets.shape[1] > 2:
-            mtp_h = self.mtp(h[:, :-2])
+            mtp_h = self.mtp(h[:, v_len:h.shape[1] - 2])
             mtp_logits = self.lm_head(mtp_h)
             mtp_loss = F.cross_entropy(
                 mtp_logits.reshape(-1, self.config.vocab_size),

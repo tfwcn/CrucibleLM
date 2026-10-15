@@ -104,14 +104,80 @@ def test_vision_forward_prefix_attaches():
     assert torch.isfinite(out["logits"]).all()
 
 
-def test_vision_loss_path_rejected():
-    """视觉前缀 + 训练 targets：明确报错（结构预留，未接线）."""
+def test_vision_train_loss_alignment():
+    """视觉前缀 + targets：loss 只取文本段错位一位（视觉段不进 CE）."""
+    import torch.nn.functional as F
+
     torch.manual_seed(0)
     cfg = tiny_test_config()
     cfg.vision_enabled = True
     cfg.vision_tokens = 4
     cfg.vision_patch = 4
     m = TinyLLM(cfg)
+    m.eval()
     x = torch.randint(0, 256, (1, 6))
-    with pytest.raises(NotImplementedError, match="推理路径"):
-        m(x, targets=x, vision_embeds=torch.randn(1, 4, cfg.d_model))
+    ve = m.encode_vision(torch.randn(1, 3, 8, 8))
+    with torch.no_grad():
+        out = m(x, targets=x, vision_embeds=ve, return_token_losses=True)
+    v, t = ve.shape[1], x.shape[1]
+    logits = out["logits"]
+    # 参考：文本段 logits[v : v+T-1] 对齐 targets[:, 1:]
+    ref = F.cross_entropy(
+        logits[:, v:v + t - 1].reshape(-1, cfg.vocab_size),
+        x[:, 1:].reshape(-1))
+    assert torch.allclose(out["main_loss"], ref, atol=1e-5)
+    assert torch.isfinite(out["loss"]).all()
+    assert out["token_losses"].shape == (1, t - 1)
+
+
+def test_no_vision_train_loss_unchanged():
+    """无视觉前缀时主 loss 口径与旧式一致（logits[:, :-1] vs targets[:, 1:]）."""
+    import torch.nn.functional as F
+
+    torch.manual_seed(0)
+    m = TinyLLM(tiny_test_config())
+    m.eval()
+    x = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        out = m(x, targets=x)
+    ref = F.cross_entropy(
+        out["logits"][:, :-1].reshape(-1, m.config.vocab_size),
+        x[:, 1:].reshape(-1))
+    assert torch.allclose(out["main_loss"], ref, atol=1e-6)
+
+
+def test_vision_train_loss_backward_grads():
+    """视觉前缀可训练：反向有梯度且有限（视觉前缀 + 编码器参数都拿得到）."""
+    torch.manual_seed(0)
+    cfg = tiny_test_config()
+    cfg.vision_enabled = True
+    cfg.vision_tokens = 4
+    cfg.vision_patch = 4
+    m = TinyLLM(cfg)
+    m.train()
+    x = torch.randint(0, 256, (1, 6))
+    ve = m.vision(torch.randn(1, 3, 8, 8))  # 训练编码（带梯度）
+    ve.retain_grad()
+    out = m(x, targets=x, vision_embeds=ve)
+    out["loss"].backward()
+    assert m.vision.patch_embed.weight.grad is not None
+    assert torch.isfinite(m.vision.patch_embed.weight.grad).all()
+    assert ve.grad is not None and torch.isfinite(ve.grad).all()
+
+
+def test_vision_train_step_accepts_vision_embeds():
+    """train_step 透传视觉图像：一步训练 loss 有限、编码器参数更新."""
+    from src.llm.local.train import build_optimizer, train_step
+
+    torch.manual_seed(0)
+    cfg = tiny_test_config()
+    cfg.vision_enabled = True
+    cfg.vision_tokens = 4
+    cfg.vision_patch = 4
+    m = TinyLLM(cfg)
+    opt = build_optimizer(m, lr=1e-3)
+    x = torch.randint(0, 256, (1, 6))
+    before = m.vision.patch_embed.weight.detach().clone()
+    info = train_step(m, opt, x, vision_images=torch.randn(1, 3, 8, 8))
+    assert torch.isfinite(torch.tensor(info["loss"]))
+    assert not torch.equal(before, m.vision.patch_embed.weight.detach())

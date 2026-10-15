@@ -32,8 +32,14 @@
   `vision_compress`、`vision_d_in`；
 - 默认关时模型里根本不存在该模块，`state_dict` 与旧 checkpoint 逐位兼容
   （与 memory/retro 的"默认 None"同风格）；
-- 当前只接线到**推理前缀**：视觉 token 拼在文本前送主干；训练 loss 对齐
-  （label 位移）尚未接线，传 `targets` 会显式报错而非静默出错。
+- **推理**：`encode_vision`（`no_grad`）+ `forward(vision_embeds=...)`，视觉 token
+  拼在文本前；
+- **训练 loss 已接线**：`forward(targets=..., vision_embeds=...)` 只对**文本段**算 loss
+  —— logits 取 `[:, V : V+T-1]` 对齐 `targets[:, 1:]`（V 为视觉 token 数），视觉段
+  不参与 CE；MTP 同样只取文本段（`h[:, V : -2]` 预测 `targets[:, 2:]`）。
+  `V=0` 时该式退化为旧式，逐位不变（单测锁定）。
+- 训练侧入口 `train.py:train_step(..., vision_images=...)`：经 `model.vision`（**带梯度**）
+  编码，编码器参数一起吃梯度（`encode_vision` 是 no_grad 的推理版，勿用于训练）。
 
 ## 从想法到代码
 
@@ -43,6 +49,9 @@ h = self.patch_embed(tokens) + self.pos_embed[:, :N]
 pooled = F.adaptive_avg_pool1d(h.transpose(1, 2), self.n_tokens)   # avgpool 路径
 return self.out_norm(pooled.transpose(1, 2))       # (B, n_tokens, d_model)
 # 主干：h = torch.cat([vision_embeds, self.embed(input_ids)], dim=1)
+# 训练：只算文本段错位一位（视觉段不进 CE）
+text_logits = logits[:, V : V + T - 1]             # V=视觉 token 数
+loss = CE(text_logits, targets[:, 1:])
 ```
 
 ## 代价与坑
@@ -50,7 +59,9 @@ return self.out_norm(pooled.transpose(1, 2))       # (B, n_tokens, d_model)
 - 位置嵌入按上限 4096 patch 预留，超限直接报错（fail-fast，别静默截断）；
 - 仅结构预留：不含图像编码器预训练配方，也不含视觉-文本对齐训练；
 - 默认关是硬约束：开它会给 `state_dict` 加新键，旧权重需从零/迁移加载这部分；
-- 训练 loss 路径未接线，`vision_embeds` + `targets` 同时给会抛 `NotImplementedError`。
+- **loss 位移易错**：视觉前缀把位置整体后移 V，CE 必须取 `logits[:, V:V+T-1]`
+  才对齐 `targets[:, 1:]`；错当成 `logits[:, :-1]` 会把视觉 token 的预测算进 loss
+  且整体错位（单测 `test_vision_train_loss_alignment` 用参考实现卡死）。
 
 ## 一句话总结
 

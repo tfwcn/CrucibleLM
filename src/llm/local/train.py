@@ -124,23 +124,32 @@ def train_step(
     grad_clip: float = 1.0,
     use_amp: bool = False,
     labels: torch.Tensor | None = None,
+    vision_embeds: torch.Tensor | None = None,
+    vision_images: torch.Tensor | None = None,
 ) -> dict:
     """单步训练：前向（含 MTP+aux）→ 反向 → 裁剪 → 更新.
 
     input_ids 即 targets（自回归，内部自动错位一位）；
     SFT 时传 labels（含 -100 掩码），input_ids 仅作输入。
+    vision_images 非空时经视觉编码器（**带梯度**，训练路径；`encode_vision` 是
+    no_grad 的推理版，勿用于训练）编码后作为前缀；vision_embeds 则直接给已编码向量。
+    loss 只算文本段。
     """
     model.train()
     optimizer.zero_grad(set_to_none=True)
     targets = labels if labels is not None else input_ids
+    if vision_images is not None:
+        if model.vision is None:
+            raise ValueError("vision_images 需 vision_enabled=True")
+        vision_embeds = model.vision(vision_images)  # 带梯度（训练编码）
     if use_amp and input_ids.is_cuda:
         # bf16 混合精度（16G 训练推荐，可省近半激活显存）
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(input_ids, targets=targets)
+            out = model(input_ids, targets=targets, vision_embeds=vision_embeds)
             loss = out["loss"]
         loss.backward()
     else:
-        out = model(input_ids, targets=targets)
+        out = model(input_ids, targets=targets, vision_embeds=vision_embeds)
         loss = out["loss"]
         loss.backward()
     grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)

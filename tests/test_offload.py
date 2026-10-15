@@ -111,7 +111,11 @@ def test_expert_store_disk_paths_namespaced(tmp_path):
 
 
 def test_expert_store_prefetch_fills_but_never_evicts(tmp_path):
-    """预取只在有空位时搬入，绝不淘汰（避免挤掉马上要用的专家）."""
+    """预取只在有空位时搬入，绝不淘汰（避免挤掉马上要用的专家）.
+
+    注意：prefetch 只加载专家到算力设备，**不更新 LRU 顺序**（不加入 _hot），
+    避免 prefetch 本身改变命中专家的"最近使用"时序。
+    """
     m = _moe()
     store = ExpertStore(m.experts, "cpu", target="disk",
                         offload_dir=str(tmp_path), capacity=2)
@@ -125,13 +129,58 @@ def test_expert_store_prefetch_fills_but_never_evicts(tmp_path):
     # 正常 ensure 仍会淘汰最旧的（淘汰权留给真正要用的那步）
     store.ensure([7])
     assert store.hot_ids() == [1, 7]
-    # 腾出空位后，预取可填空位但不替换现有热专家
+    # 腾出空位后，预取可填空位但不替换现有热专家；
+    # prefetch 不更新 _hot（不改变 LRU 时序）
     m2 = _moe()
     s2 = ExpertStore(m2.experts, "cpu", target="disk",
                      offload_dir=str(tmp_path), name="s2", capacity=3)
     s2.ensure([0])
     s2.ensure([1, 2], prefetch=True)
-    assert s2.hot_ids() == [0, 1, 2]
+    # prefetch 不加入 _hot，所以 hot_ids 仍只有 [0]
+    assert s2.hot_ids() == [0]
+    # 正常 ensure [1] 会加入 _hot
+    s2.ensure([1])
+    assert s2.hot_ids() == [0, 1]
+
+
+def test_expert_store_async_prefetch_cpu_cuda():
+    """异步预取（cpu target + CUDA）：event 等待确保拷贝完成，数值正确.
+
+    注意：此测试需要 CUDA 环境；若无可跳过（pytest 自动 skip）。
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("需要 CUDA")
+
+    torch.manual_seed(0)
+    m = _moe()  # 基准模型（专家在 CPU）
+    x = torch.randn(2, 8, 64, device="cuda")
+    with torch.no_grad():
+        base_logits, base_aux = m(x)
+
+    # 独立测试 ExpertStore 的异步预取功能（不污染 m）
+    m_store = _moe()
+    store = ExpertStore(m_store.experts, "cuda", target="cpu", capacity=4)
+    store.ensure([0, 1], prefetch=True)
+    assert 0 in store._ready_events
+    assert 1 in store._ready_events
+    store.ensure([0, 1])
+    assert 0 not in store._ready_events
+    assert 1 not in store._ready_events
+
+    # 数值等价性：offload 路径与分组 bmm 一致
+    m2 = _moe()
+    m2.load_state_dict(m.state_dict())
+    m2.enable_offload("cuda", target="cpu", capacity=4)
+    with torch.no_grad():
+        o_g, aux_g = m2(x)
+    m3 = _moe()
+    m3.load_state_dict(m.state_dict())
+    with torch.no_grad():
+        o_n, aux_n = m3(x)
+    assert torch.allclose(o_g, o_n, atol=1e-5)
+    assert torch.allclose(aux_g, aux_n)
+    # 与基准模型（无 offload）比较
+    assert torch.allclose(o_g, base_logits, atol=1e-5)
 
 
 def test_model_setup_offload_disk_end_to_end(tmp_path):
