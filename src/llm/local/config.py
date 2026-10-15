@@ -76,9 +76,11 @@ class SmallLLMConfig:
     # ===== 投机解码（推理加速，默认关；见 spec_decode.py / docs/details/speculative-decoding.md）=====
     # 关闭时生成路径逐位不变（单测锁定）
     draft_enabled: bool = False
-    # 每轮最多起草的 token 数（喂给主干并行验证的窗口，越大越省但拒答代价越高）
+    # 每轮最多起草的 token 数（喂给主干并行验证的窗口）。实测 MTP 只给 1 个候选，
+    # 仅当 ngram 与 MTP 首猜一致时才会凑满窗口；窗口偏大对拒答轮几乎无额外代价
     draft_window: int = 5
-    # 起草来源：ngram（前缀查表，零成本且命中率高）/ mtp（复用 MTP 头猜 t+2）/ hybrid（MTP 起头 + ngram 补足）
+    # 起草来源：ngram（前缀查表，重复/模板文本命中率高）/ mtp（复用 MTP 头猜 t+2，首猜最准）/
+    # hybrid（MTP 起头，仅当 ngram 首猜一致时采纳其更长续写；默认）
     draft_source: str = "hybrid"
     # ngram 起草的最短匹配后缀长度（太短会误命中，太长覆盖不足）
     draft_ngram_min: int = 2

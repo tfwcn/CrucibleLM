@@ -67,6 +67,41 @@ def test_build_draft_provider_dispatch():
     assert isinstance(build_draft_provider(m, "???"), NgramDraftProvider)
 
 
+def test_hybrid_prefers_mtp_unless_ngram_agrees():
+    """hybrid 策略：ngram 与 MTP 首猜一致才采纳 ngram 长草稿，否则只用 MTP.
+
+    这样既拿到 ngram 的一致性续写，又避免"把 MTP 猜测并入上下文"污染 ngram
+    后缀检索（旧实现的坑：实测 ngram 补位几乎永不命中）。"""
+    m = _tiny()
+    p = HybridDraftProvider(m)
+
+    class _FakeMtp:
+        def __init__(self, out):
+            self.out = out
+
+        def propose(self, context, h_last, k):
+            return list(self.out[:max(0, k)])
+
+    class _FakeNg:
+        def __init__(self, out):
+            self.out = out
+
+        def propose(self, context, h_last, k):
+            return list(self.out[:max(0, k)])
+
+    # 1) 一致：采纳 ngram（更长）
+    p.mtp, p.ngram = _FakeMtp([7]), _FakeNg([7, 8, 9, 10])
+    assert p.propose([1, 2], None, 4) == [7, 8, 9, 10]
+    # 2) 不一致：只用 MTP 单猜
+    p.mtp, p.ngram = _FakeMtp([7]), _FakeNg([5, 8, 9, 10])
+    assert p.propose([1, 2], None, 4) == [7]
+    # 3) 无 MTP 首猜：退回 ngram
+    p.mtp, p.ngram = _FakeMtp([]), _FakeNg([5, 8, 9, 10])
+    assert p.propose([1, 2], None, 4) == [5, 8, 9, 10]
+    # k<=0 恒空
+    assert p.propose([1, 2], None, 0) == []
+
+
 # --------------------------- 契约：等于贪心 ---------------------------
 @pytest.mark.parametrize("source", ["ngram", "mtp", "hybrid"])
 def test_spec_matches_greedy(source):
@@ -126,6 +161,34 @@ def test_spec_temperature_falls_back():
     assert not m._spec_eligible(x1, 0.7)
 
 
+def test_spec_matches_greedy_with_hyper_memory_retro():
+    """全特性配置（hyper 多流 + memory + retro）下投机仍逐位等于贪心.
+
+    真实 128M 检查点就是这套配置；step_pasts 跳位必须在 hyper 展开/combine、
+    memory、retro 都开时仍成立。"""
+    torch.manual_seed(0)
+    cfg = tiny_test_config()
+    cfg.hyper_streams = 2
+    cfg.memory_every = 2
+    cfg.memory_slots = 64
+    cfg.memory_topk = 4
+    cfg.retro_enabled = True
+    cfg.retro_every = 2
+    cfg.retro_heads = 4
+    cfg.retro_chunk_len = 8
+    m = TinyLLM(cfg)
+    m.eval()
+    x = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        base = m.generate(x, max_new_tokens=24)
+    m.config.draft_enabled = True
+    m.config.draft_source = "hybrid"
+    m.config.draft_window = 5
+    with torch.no_grad():
+        spec = m.generate(x, max_new_tokens=24)
+    assert torch.equal(base, spec)
+
+
 # --------------------------- 并行验证原语 ---------------------------
 def test_decode_multi_matches_sequential():
     """_decode_multi（多 token 并行）与逐 token _decode_step 数值一致."""
@@ -142,8 +205,33 @@ def test_decode_multi_matches_sequential():
             hh, cur = m._decode_step(toks[:, i:i + 1], cur)
             hs.append(hh)
         seq = torch.cat(hs, dim=1)
-        multi, _ = m._decode_multi(toks, pb)
+        multi, _, step_pasts = m._decode_multi(toks, pb)
     assert torch.allclose(seq, multi, atol=1e-5), (seq - multi).abs().max()
+
+
+def test_decode_multi_step_pasts_match_sequential():
+    """_decode_multi 的 step_pasts[i] 与逐 token 解码到第 i 步的缓存等价.
+
+    投机解码靠它做"部分接受零重放"：从 step_pasts[A] 续跑必须和从头逐 token
+    跑到 A 的续跑逐位一致，否则契约破。"""
+    m = _tiny()
+    m.eval()
+    x = torch.randint(0, 256, (1, 8))
+    toks = torch.randint(0, 256, (1, 4))
+    nxt = torch.randint(0, 256, (1, 1))
+    with torch.no_grad():
+        _, pa = m._prefill(x, max_new_tokens=8)
+        _, pb = m._prefill(x, max_new_tokens=8)
+        _, _, step_pasts = m._decode_multi(toks, pa)
+        seq_pasts = []
+        cur = pb
+        for i in range(toks.shape[1]):
+            _, cur = m._decode_step(toks[:, i:i + 1], cur)
+            seq_pasts.append(cur)
+        for A in range(toks.shape[1]):
+            h_m, _ = m._decode_step(nxt, step_pasts[A])
+            h_s, _ = m._decode_step(nxt, seq_pasts[A])
+            assert torch.allclose(h_m, h_s, atol=1e-5), (A, (h_m - h_s).abs().max())
 
 
 # --------------------------- 接受 / 回滚路径 ---------------------------
@@ -158,7 +246,7 @@ class _CorrectProvider:
 
 
 class _WrongProvider:
-    """恒返回错误草稿 → 必然拒答（锁定"部分接受 + 回滚重放"分支）."""
+    """恒返回错误草稿 → 必然拒答（锁定"部分接受 → 按步缓存跳位"分支）."""
 
     def propose(self, context, h_last, k):
         return [0] * max(0, k)
@@ -184,7 +272,7 @@ def test_spec_full_accept_path(monkeypatch):
 
 
 def test_spec_reject_rollback_path(monkeypatch):
-    """回滚分支：恒错草稿下输出仍等于贪心（状态经重放精确对齐）."""
+    """部分接受路径：恒错草稿下输出仍等于贪心（缓存按步对齐，零重放）."""
     m = _tiny()
     m.eval()
     x = torch.randint(0, 256, (1, 8))
@@ -197,7 +285,7 @@ def test_spec_reject_rollback_path(monkeypatch):
     with torch.no_grad():
         spec = m.generate(x, max_new_tokens=24)
     assert torch.equal(spec, base)
-    assert m._spec_stats["accepted"] == 0  # 全部拒答，走了回滚
+    assert m._spec_stats["accepted"] == 0  # 全部拒答，走了部分接受跳位
 
 
 def test_spec_respects_eos():

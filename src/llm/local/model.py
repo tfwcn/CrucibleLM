@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from src.llm.local.block import HybridBlock
 from src.llm.local.config import SmallLLMConfig
+from src.llm.local.linear_attn import GatedDeltaLite
 from src.llm.local.mla import RMSNorm
 
 
@@ -393,17 +394,24 @@ class TinyLLM(nn.Module):
         逐行独立、稀疏路径按 start=total-t 聚集、线性层走多 token 增量递推），
         因此验证出的主干贪心序列即真实贪心序列（契约见 test_speculative.py）。
         普通生成仍走 `_decode_step`，此路径不参与编译。
+
+        额外返回 `step_pasts[i]`：提交前 i+1 个 token 后每层的完整缓存。部分
+        接受时据此直接跳到接受位（零重放）。MLA 复用同一缓冲、只调 pos；线性层
+        取 `multi_steps[i]`（该分支已按步记录）。
         """
         hh = self.embed(tokens)
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
         if hyper_n:
             hh = hh.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         new_pasts: list = []
-        for layer, p in zip(self.layers, pasts):
+        lin_steps: dict[int, list] = {}
+        for li, (layer, p) in enumerate(zip(self.layers, pasts)):
             xxs = hh
             hh_in = layer.hyper.pre_mix(hh) if hyper_n and layer.hyper is not None else hh
             hh_norm = layer.norm1(hh_in)
             a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
+            if isinstance(layer.attn, GatedDeltaLite):
+                lin_steps[li] = layer.attn.multi_steps
             hh = hh_in + a_out
             m_out, _ = layer.moe(layer.norm2(hh))
             hh = hh + m_out
@@ -417,7 +425,23 @@ class TinyLLM(nn.Module):
             new_pasts.append(p2)
         if hyper_n:
             hh = hh.mean(dim=2)
-        return self.final_norm(hh), new_pasts
+        # 每步 pasts：线性层取记录的第 i 步；MLA/稀疏复用原缓冲（已写全部位置），
+        # 只把 pos 调回 "输入 i+1 个 token 后" 的位置（越界写由掩码屏蔽）
+        t = tokens.shape[1]
+        if t == 1:
+            step_pasts = [new_pasts]  # 单 token：并行结果即该步缓存
+        else:
+            step_pasts = []
+            for i in range(t):
+                plist: list = []
+                for li, (layer, old_p) in enumerate(zip(self.layers, pasts)):
+                    if li in lin_steps:
+                        plist.append(lin_steps[li][i])
+                    else:
+                        buf_c, buf_kr, pos = old_p
+                        plist.append((buf_c, buf_kr, pos + i + 1))
+                step_pasts.append(plist)
+        return self.final_norm(hh), new_pasts, step_pasts
 
     def _spec_eligible(self, input_ids: torch.Tensor, temperature: float) -> bool:
         """是否走投机解码：需开关开、batch=1、纯贪心（temperature=0）."""
@@ -432,8 +456,9 @@ class TinyLLM(nn.Module):
         """投机解码内循环（贪心；逐 token yield 新 id int）.
 
         每轮：主头出权威下一位 → 起草器补足后续候选 → `_decode_multi` 一次并行
-        验证 → 接受最长草稿前缀；部分接受时回滚缓存并逐 token 重放（保证
-        状态精确）。输出与 `_generate_inner` 的贪心逐位一致（单测锁定）。
+        验证 → 接受最长草稿前缀。部分接受时直接取 `step_pasts[accepted]`（并行
+        前向已按步记录缓存）跳位，**零重放**。输出与 `_generate_inner` 的贪心
+        逐位一致（单测锁定）。
         """
         from src.llm.local.spec_decode import build_draft_provider
 
@@ -457,8 +482,7 @@ class TinyLLM(nn.Module):
             drafts = provider.propose(ctx, h[:, -1:], k) if k > 0 else []
             feed = [t0] + list(drafts)
             y = torch.tensor([feed], dtype=torch.long, device=dev)
-            old_pasts = pasts
-            h_multi, pasts_multi = self._decode_multi(y, old_pasts)
+            h_multi, _, step_pasts = self._decode_multi(y, pasts)
             # 验证：逐位比草稿与主干贪心（seen 上下文逐步累积，惩罚口径一致）
             accepted = 0
             seen = list(ctx)
@@ -473,18 +497,10 @@ class TinyLLM(nn.Module):
                     break
             n_accepted += accepted
             committed = feed[:1 + accepted]
-            if accepted == len(drafts):
-                # 全接受：并行结果即最终状态，直接采用（零回滚）
-                h = h_multi[:, len(feed) - 1:len(feed)]
-                pasts = pasts_multi
-            else:
-                # 部分接受：缓存回退到本轮起点，逐 token 重放已提交前缀
-                # （MLA 缓冲按 pos 回退、线性状态是新建张量未被原地改，均安全）
-                h = h[:, -1:]
-                pasts = old_pasts
-                for tok in committed:
-                    ht = torch.tensor([[tok]], dtype=torch.long, device=dev)
-                    h, pasts = self._decode_step(ht, pasts)
+            # 无论全接受还是部分接受，都直接跳到"已提交前缀末位"那一步的缓存：
+            # h/缓存取自同一次并行验证，无需回滚重放（step_pasts 已按步对齐）。
+            h = h_multi[:, accepted:accepted + 1]
+            pasts = step_pasts[accepted]
             stop = False
             for tok in committed:
                 yield tok

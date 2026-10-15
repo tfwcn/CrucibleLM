@@ -77,10 +77,12 @@ class MtpDraftProvider(DraftProvider):
 
 
 class HybridDraftProvider(DraftProvider):
-    """MTP 起头 + ngram 补足：MTP 给第 1 位，ngram 顺延补足剩余位.
+    """MTP 起头 + ngram 补足（仅在 ngram 与 MTP 首猜一致时采纳其续写）.
 
-    第 1 位用 MTP（它天然就是 t+2 的预测）；之后把 MTP 猜测并入上下文，
-    用 ngram 继续抄，命中则一次凑满窗口。
+    实测：MTP 对 t+2 的首猜贪心命中率 ~0.6~0.8，而 ngram 首猜只有 ~0.04。
+    若把 MTP 猜测直接并入上下文取 ngram 续写，ngram 的后缀检索会被"没见过的
+    草稿"污染而几乎永不命中（旧实现的坑）。因此只在两者**首 token 一致**时，
+    才认为 ngram 找到的是一段可信续写，采纳它更长的自洽草稿；否则只用 MTP。
     """
 
     def __init__(self, model, min_match: int = 2, scan_limit: int = 1024):
@@ -88,14 +90,16 @@ class HybridDraftProvider(DraftProvider):
         self.ngram = NgramDraftProvider(min_match, scan_limit)
 
     def propose(self, context: list[int], h_last, k: int) -> list[int]:
-        """MTP 首猜，随后用 ngram 在"上下文 + 已猜"上续抄."""
+        """MTP 首猜与 ngram 续写一致则采纳 ngram（更长），否则退回 MTP 单猜."""
         if k <= 0:
             return []
-        drafts = self.mtp.propose(context, h_last, 1)
-        if len(drafts) < k:
-            merged = context + drafts
-            drafts += self.ngram.propose(merged, h_last, k - len(drafts))
-        return drafts[:k]
+        mt = self.mtp.propose(context, h_last, 1)      # t+2 首猜
+        ng = self.ngram.propose(context, h_last, k)    # 自洽续写（覆盖 t+2..）
+        if ng and mt and ng[0] == mt[0]:
+            return ng[:k]     # 一致：采纳更长的自洽续写
+        if mt:
+            return mt         # 不一致：MTP 首猜更准，只用它
+        return ng[:k]         # 无 MTP 头或无首猜：退回 ngram
 
 
 def build_draft_provider(model, source: str, min_match: int = 2) -> DraftProvider:

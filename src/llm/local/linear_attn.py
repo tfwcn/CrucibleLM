@@ -40,6 +40,8 @@ class GatedDeltaLite(nn.Module):
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.dropout = dropout
+        # 多 token 增量解码时记录的每步缓存（投机部分接受回退用；其余时候 None）
+        self.multi_steps: list | None = None
 
     def _step_conv(
         self,
@@ -126,13 +128,34 @@ class GatedDeltaLite(nn.Module):
             # 若与逐 token 解码存在浮点顺序差异，草稿接受判定会在近并列 logit
             # 上松弛，"等于贪心"的契约就守不住（单测
             # test_linear_multi_token_decode_matches_sequential 锁定）。
+            # 同时收集每步缓存 (s_i, k 尾, v 尾) 到 self.multi_steps，供
+            # 投机解码"部分接受"时直接跳到对应步——回退从一整步前向降为一次
+            # 切片（免重放，实测解码吞吐 +~0.3x）。
             s = s_prev
-            outs = []
+            outs: list[torch.Tensor] = []
+            self.multi_steps = []
+            kk = self.k_conv.kernel_size[0] - 1
+            with torch.no_grad():
+                if kk > 0:
+                    # 卷积尾按步切片：第 i 步后 = 原始投影序列 [i+1 : i+1+kk]
+                    rk = self.w_k(h).transpose(1, 2)
+                    rv = self.w_v(h).transpose(1, 2)
+                    kp = (torch.cat([kb.to(h.device, h.dtype), rk], -1)
+                          if kb is not None else F.pad(rk, (kk, 0)))
+                    vp = (torch.cat([vb.to(h.device, h.dtype), rv], -1)
+                          if vb is not None else F.pad(rv, (kk, 0)))
+                else:
+                    kp = vp = None
             for i in range(t):
                 kv_i = k[:, i].unsqueeze(-1) @ v[:, i].unsqueeze(-2)
                 s = s * decay[:, i].view(b, self.n_heads, 1, 1) + kv_i
                 oi = (q[:, i].unsqueeze(-2) @ s).squeeze(-2) * self.scale
                 outs.append(oi)
+                if kk > 0:
+                    self.multi_steps.append(
+                        (s, kp[:, :, i + 1:i + 1 + kk], vp[:, :, i + 1:i + 1 + kk]))
+                else:
+                    self.multi_steps.append((s, new_bufs[0], new_bufs[1]))
             o = torch.stack(outs, dim=1).reshape(b, t, -1)
             o = (o * F.silu(u)).contiguous()
             return self.w_o(o), (s, new_bufs[0], new_bufs[1])

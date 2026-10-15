@@ -313,6 +313,9 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   仅 batch=1、`temperature=0` 生效，输出与逐 token 贪心逐位一致。为支撑并行
   验证，MLA（`_valid_mask` 块内因果）、稀疏（`_decode` 取最后 t 个查询）、线性
   （`past≠None, t>1` 分支）三条解码路径补齐多 token 增量，`t==1` 逐位不变。
+  部分接受靠 `_decode_multi` 返回的 `step_pasts[i]` 直接跳位（零重放）。
+  实测加速：普通对话 ~1.45–1.5x、代码 ~1.6–1.7x（MTP 首猜命中 ~0.6–0.8）；
+  ngram 单用净亏（首猜命中 ~0.04），故 `hybrid` 仅在 ngram 与 MTP 首猜一致时采纳其更长续写。
 - **专家 offload**：开启后 MoE 从分组 bmm 切到"只算命中专家"的逐专家路径，数值一致；
   逐个 `ensure`（`capacity<命中数` 也不会误用已置 meta 的专家）。
 - **LES**：纯统计、零可训练参数；预测只影响搬运时序，不改变数值。
@@ -363,7 +366,7 @@ python scripts/migrate_model.py --src data/llm-ckpt --out data/llm-16L --add-lay
 python -m pytest tests/ -q  # 需要 torch，无 torch 自动跳过
 ```
 
-新增能力各有独立单测：`test_speculative.py`（起草器 + "等于贪心"契约 + 回滚）、
+新增能力各有独立单测：`test_speculative.py`（起草器 + "等于贪心"契约 + 部分接受跳位）、
 `test_offload.py`（CPU/磁盘数值等价 + LRU）、`test_les.py`（预测确定性 + 数值不变）、
 `test_vision_compress.py`（patch 往返 + 压缩形状 + 默认关兼容）、
 `test_multi_token_decode.py`（多 token 增量解码回归）。

@@ -21,7 +21,7 @@ GPU 算得飞快却大部分时间在等启动。
       起草器补 k-1 个后续候选 d2..dk
       喂 [t0, d2..dk] 一次并行前向（_decode_multi）
       得到主干在每个位置的贪心 → 与草稿逐位比
-      接受最长草稿前缀 + 主头的下一个 token → 提交，状态对齐
+      接受最长草稿前缀 + 主头的下一个 token → 提交，状态对齐（零重放）
 ```
 
 关键：**验证必须与逐 token 解码同算术**，否则主干"验证出的贪心"和"真贪心"
@@ -37,26 +37,45 @@ GPU 算得飞快却大部分时间在等启动。
 - 为支撑并行验证，三处解码路径补了多 token 能力（均带回归单测）：
   - `mla.py:_valid_mask`：`t>1` 时补块内因果掩码（原来只掩空位，会偷看同批未来）；
   - `sparse_attn.py:_decode`：查询改用最后 t 个位置（`total-t`）；
-  - `linear_attn.py`：新增 `past≠None, t>1` 分支，按单步同款递推（状态初值 `s_prev`）。
-- 回滚：部分接受时缓存回退到本轮起点，逐 token 重放已提交前缀。MLA 缓冲按
-  `pos` 回退即可（空位被掩码），线性层状态是新建张量（非原地改），故回退零拷贝。
+  - `linear_attn.py`：新增 `past≠None, t>1` 分支，按单步同款递推（状态初值 `s_prev`），
+    并把每步缓存 `(s_i, k 尾, v 尾)` 记进 `multi_steps`。
+- **零重放回退**：`_decode_multi` 额外返回 `step_pasts[i]`——"提交前 i+1 个 token 后"
+  每层的完整缓存（线性层取 `multi_steps[i]`；MLA 复用同一缓冲、只把 `pos` 调回
+  `pos+i+1`，越界写由掩码屏蔽）。部分接受时直接 `h=h_multi[:, A]`、
+  `pasts=step_pasts[A]` 跳位，**不再逐 token 重放**。实测这一步把拒答代价从
+  "一整步前向"降到零，吞吐 1.29x→1.45x（见下）。
 - 门槛：先跑 `scripts/measure_mtp_acceptance.py`，接受率 > 50% 才值得开。
+
+### 实测（约 128M、RTX 3080 Laptop、batch=1 贪心）
+
+| 场景 | 起草来源 | 加速 | 备注 |
+|---|---|---|---|
+| 普通中文对话 | mtp / hybrid | ~1.45–1.5x | MTP 首猜命中 ~0.6–0.8，输出逐位等于贪心 |
+| 代码 / 列表 | hybrid | ~1.6–1.7x | ngram 偶与 MTP 一致时采纳更长续写，多拿几位 |
+| 普通中文对话 | ngram | ~0.9x | ngram 首猜几乎全错（~0.04），净亏——别单独用 |
+| 任意 | off | 1.0x（基线） | 默认关，生成路径逐位不变 |
+
+结论：**MTP 是唯一高命中来源**（它天然预测 t+2）；ngram 仅对重复/模板文本有用，
+且必须"与 MTP 首猜一致才采纳"，否则会污染后缀检索（见 pitfalls）。
 
 ## 从想法到代码
 
 ```python
-# 起草 → 并行验证 → 接受最长前缀
+# 起草 → 并行验证 → 接受最长前缀 → 零重放跳位
 drafts = provider.propose(ctx, h[:, -1:], window - 1)   # ngram/mtp/hybrid
 feed = [t0] + drafts                                     # t0 为主头权威下一位
-h_multi, pasts = self._decode_multi(feed, pasts)         # 一次前向喂完整窗口
+h_multi, _, step_pasts = self._decode_multi(feed, pasts) # 一次前向喂完整窗口
 accepted = 最长前缀(草稿 == 主干在对应位置的贪心)
-# 全接受：直接用并行缓存；部分接受：回退起点逐 token 重放前缀
+h = h_multi[:, accepted]          # 已提交前缀末位的 hidden
+pasts = step_pasts[accepted]      # 同步缓存（并行前向按步记录，零重放）
 ```
 
 ## 代价与坑
 
 - 只有 batch=1 且 `temperature=0`（纯贪心）走此路径；采样/批量自动回落普通生成；
-- 起草命中率低时会有"验证一轮又重放"的额外开销——务先用接受率脚本卡门槛；
+- **起草源选错会净亏**：ngram 首猜命中率极低，单独用会 ~0.9x（每次验证一轮全拒）；
+  默认 `hybrid` 在 ngram 与 MTP 首猜不一致时只回退 MTP 单猜，故不亏；
+- 每步缓存（`multi_steps`）显存随窗口线性增长：`window` 别开太大（默认 5 足够）；
 - `repetition_penalty` 已按"seen 上下文逐步累积"对齐，验证时逐位应用，契约不破；
 - 多 token 解码的三处改动均默认不影响 `t==1`：`_valid_mask` 在 `t==1` 时与旧式
   逐位相同，稀疏/线性分支只在新代码路径生效（单测锁定）。
