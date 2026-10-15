@@ -57,12 +57,13 @@ class FineGrainedMoE(nn.Module):
         offload_dir: str = "",
         capacity: int = 0,
         prefetch: bool = False,
+        name: str = "expert",
     ):
         """开启专家 offload（构建 ExpertStore；由模型 setup_offload 调用）."""
         from src.llm.local.offload import ExpertStore
 
         self.store = ExpertStore(
-            self.experts, compute_device, target, offload_dir, capacity)
+            self.experts, compute_device, target, offload_dir, capacity, name)
         self.prefetch = prefetch
         return self
 

@@ -34,6 +34,7 @@ class ExpertStore:
         target: str = "cpu",
         offload_dir: str = "",
         capacity: int = 0,
+        name: str = "expert",
     ):
         if target not in ("cpu", "disk"):
             raise ValueError(f"offload_target 须为 cpu/disk，当前 {target}")
@@ -45,6 +46,10 @@ class ExpertStore:
         self.target = target
         self.offload_dir = offload_dir
         self.capacity = int(capacity)
+        # 落盘文件前缀：**必须每个 store 唯一**——多层共用一个 offload_dir 时，
+        # 若都用 expert_{i}.pt 会互相覆盖，后建层静默顶掉先建层的专家权重
+        # （实测整模偏差 0.15，教训见 docs/pitfalls/local-llm-training.md 15）
+        self.name = name
         # LRU：键为专家号，值占位（顺序即最近使用顺序）
         self._hot: "OrderedDict[int, None]" = OrderedDict()
         self.moves = 0  # 搬运计数（日志/测试用）
@@ -58,8 +63,8 @@ class ExpertStore:
                 e.to(self.cpu_device)
 
     def _disk_path(self, i: int) -> str:
-        """单个专家的落盘路径."""
-        return os.path.join(self.offload_dir, f"expert_{i}.pt")
+        """单个专家的落盘路径（前缀含 store 名，避免多层共用目录互相覆盖）."""
+        return os.path.join(self.offload_dir, f"{self.name}_{i}.pt")
 
     def _to_meta(self, module) -> None:
         """清空专家参数到 meta（不占内存；读取前须 to_empty 分配）."""

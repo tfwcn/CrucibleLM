@@ -91,6 +91,48 @@ def test_expert_store_invalid_target():
         ExpertStore(m.experts, "cpu", target="disk", offload_dir="")
 
 
+def test_expert_store_disk_paths_namespaced(tmp_path):
+    """多层共用一个 offload_dir 时，不同 store 的落盘文件不能互相覆盖.
+
+    回归：早期 `_disk_path` 恒为 `expert_{i}.pt`，后建层静默顶掉先建层权重。"""
+    m1 = _moe(seed=1)
+    m2 = _moe(seed=2)
+    ref1 = [e.w_gate.weight.detach().clone() for e in m1.experts]
+    ref2 = [e.w_gate.weight.detach().clone() for e in m2.experts]
+    s1 = ExpertStore(m1.experts, "cpu", target="disk",
+                     offload_dir=str(tmp_path), name="layer0")
+    s2 = ExpertStore(m2.experts, "cpu", target="disk",
+                     offload_dir=str(tmp_path), name="layer1")
+    for i in range(len(m1.experts)):
+        s1.ensure([i])
+        s2.ensure([i])
+        assert torch.equal(m1.experts[i].w_gate.weight, ref1[i])
+        assert torch.equal(m2.experts[i].w_gate.weight, ref2[i])
+
+
+def test_model_setup_offload_disk_end_to_end(tmp_path):
+    """整模型磁盘 offload：开/关 logits 与生成逐位一致（含多层 + 淘汰）."""
+    torch.manual_seed(0)
+    cfg = tiny_test_config()
+    m = TinyLLM(cfg)
+    m.eval()
+    x = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        base_logits = m(x)["logits"]
+        base = m.generate(x, max_new_tokens=16)
+    cfg.offload_enabled = True
+    cfg.offload_target = "disk"
+    cfg.offload_dir = str(tmp_path)
+    cfg.offload_capacity = 2  # < top_k，强制淘汰
+    m.setup_offload()
+    m.eval()
+    with torch.no_grad():
+        off_logits = m(x)["logits"]
+        off = m.generate(x, max_new_tokens=16)
+    assert torch.allclose(base_logits, off_logits, atol=1e-5)
+    assert torch.equal(base, off)
+
+
 def test_model_setup_offload_end_to_end(tmp_path):
     """整模型接入：offload 开/关 logits 一致、生成一致."""
     torch.manual_seed(0)

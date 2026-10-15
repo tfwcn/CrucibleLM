@@ -642,7 +642,7 @@ class TinyLLM(nn.Module):
             return self
         if compute_device is None:
             compute_device = next(self.parameters()).device
-        for layer in self.layers:
+        for li, layer in enumerate(self.layers):
             if cfg.offload_enabled:
                 layer.moe.enable_offload(
                     compute_device,
@@ -650,6 +650,7 @@ class TinyLLM(nn.Module):
                     offload_dir=cfg.offload_dir,
                     capacity=cfg.offload_capacity,
                     prefetch=cfg.offload_prefetch,
+                    name=f"layer{li}",
                 )
             if cfg.les_enabled:
                 layer.moe.enable_les(cfg.les_history, cfg.les_topn)
