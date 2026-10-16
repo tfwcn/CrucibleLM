@@ -305,9 +305,9 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | 开关（默认） | 作用 | 文件 |
 |---|---|---|
 | `draft_enabled`(False) / `draft_window`(5) / `draft_source`(hybrid) / `draft_ngram_min`(2) | 投机解码：MTP+n-gram 起草 + 主干并行验证，输出=逐 token 贪心 | `spec_decode.py` |
-| `offload_enabled`(False) / `offload_target`(cpu) / `offload_dir`("") / `offload_capacity`(0) / `offload_prefetch`(False) | 专家 offload 到 CPU/磁盘 + LRU 淘汰 | `offload.py` |
-| `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 预取 | `les.py` |
-| `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) | 视觉 token 压缩（结构预留，仅推理前缀） | `vision_compress.py` |
+| `offload_enabled`(False) / `offload_target`(cpu) / `offload_dir`("") / `offload_capacity`(0) / `offload_prefetch`(False) | 专家 offload 到 CPU/磁盘 + LRU 淘汰（capacity≤0 时全驻留→分组快路径） | `offload.py` |
+| `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
+| `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线） | `vision_compress.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
   仅 batch=1、`temperature=0` 生效，输出与逐 token 贪心逐位一致。为支撑并行
@@ -318,12 +318,16 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   ngram 单用净亏（首猜命中 ~0.04），故 `hybrid` 仅在 ngram 与 MTP 首猜一致时采纳其更长续写。
 - **专家 offload**：开启后 MoE 从分组 bmm 切到"只算命中专家"的逐专家路径，数值一致；
   逐个 `ensure`（`capacity<命中数` 也不会误用已置 meta 的专家）；磁盘目标落盘文件按
-  层命名空间隔离（`layer{li}_{i}.pt`），多层共用目录不互相覆盖。
-- **LES**：纯统计、零可训练参数；预测只影响搬运时序，不改变数值。预取走
-  `ensure(prefetch=True)`，**只填空闲容量、绝不淘汰**（否则挤掉工作集、搬运数暴涨）；
-  当前实现下对吞吐中性，异步搬运（独立 stream 重叠）为后续升级点。
-- **视觉压缩**：默认关时模型无该模块、`state_dict` 兼容；当前只接线推理前缀
-  （`encode_vision` + `forward(vision_embeds=...)`），训练 loss 路径未接线。
+  层命名空间隔离（`layer{li}_{i}.pt`），多层共用目录不互相覆盖；`capacity≤0`（声明
+  不淘汰）时初始化即全量搬入、forward 退回分组快路径（避免"部分专家永远 meta"）。
+- **LES**：纯统计、零可训练参数；预测只影响搬运时序，不改变数值。cpu target + CUDA
+  时走**独立 CUDA stream 异步搬运**（pinned 主副本 + event 等待，normal ensure 命中
+  时 `wait_event` 再用）；预取只回收"预取未用"的专家、**绝不淘汰工作集**，容量按
+  驻留集 `_resident` 计。实测随机（未训练）模型上中性偏负（预测不准 + 专家太小），
+  默认关；要变净收益需路由可预测 + 专家规模够大（见 `docs/details/les-expert-scheduling.md`）。
+- **视觉压缩**：默认关时模型无该模块、`state_dict` 兼容；**推理前缀 + 训练 loss 均已接线**
+  （`forward(targets=..., vision_embeds=...)` 只算文本段错位一位；`train_step(vision_images=...)`
+  经带梯度的 `model.vision` 编码），视觉段不进 CE。
 
 ## 直觉头/RAG（`heads.py` + `retrieval.py`，SFT 后启用）
 

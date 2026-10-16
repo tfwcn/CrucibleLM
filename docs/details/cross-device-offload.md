@@ -22,8 +22,13 @@
 命中 → 搬上热端 → 逐专家算完散射加回 → 换出最久未用的
 ```
 
-`cpu` 目标：冷专家物理驻 CPU；`disk` 目标：冷专家 state_dict 落盘、参数置 meta
-（真释放内存），命中时 `to_empty` 分配再 `load_state_dict` 读回。
+`cpu` 目标：冷专家主副本为 **pinned CPU 张量**（`_cold`），专家模块置 `meta`
+（省显存），命中时 `to_empty` 分配再 `load_state_dict` 读回；pinned 源让拷贝可异步。
+`disk` 目标：冷专家 state_dict 落盘，命中时 `to_empty` 分配再读回（同步）。
+
+**容量与快路径**：容量按"驻留集 `_resident`"（含预取）计。`capacity≤0`（声明不淘汰）
+时初始化即全量搬入，forward 稳定退回分组 bmm 快路径；`capacity>0` 时按 LRU 淘汰，
+淘汰优先回收"预取未用"的专家（见 `les-expert-scheduling.md`）。
 
 ## 我们的实现
 
@@ -38,8 +43,9 @@
 ## 从想法到代码
 
 ```python
-# moe.py：开启后走命中路径（逐个 ensure，不能用容量<命中数的批量 ensure）
-if self.store is not None:
+# moe.py：开启后走命中路径（逐个 ensure，不能用容量<命中数的批量 ensure）；
+# 若全部专家已驻留（capacity≤0 预热完成）则退回分组快路径
+if self.store is not None and not self.store.all_resident():
     return self._forward_offload(x)
 ...
 for e in torch.unique(top_i).tolist():
@@ -52,6 +58,9 @@ for e in torch.unique(top_i).tolist():
 - **必须逐个 ensure**：若先整批 ensure 再统一计算，`capacity < 命中数` 时后搬入
   的专家会把先搬入的挤回冷端，随后用到已置 meta 的专家 → 结果错（真踩过，
   单测 `capacity=2/3` 覆盖）；
+- **冷端主副本要 pinned**（cpu 目标）：否则 H2D 拷贝阻塞 host、无法异步；
+- **容量按 `_resident` 计**，不是 `_hot`：预取进的专家不进 `_hot`，只数 `_hot`
+  会让预取绕过上限撑爆显存；`_resident` 命中即跳过 `_load`，避免重复搬运；
 - 搬运本身有开销，命中率低时反而更慢——配合 LES 预取（见 `les-expert-scheduling.md`）；
 - `disk` 目标要给定目录；读回用 `to_empty` + `load_state_dict`（meta 参数不能
   直接 `copy_`）；

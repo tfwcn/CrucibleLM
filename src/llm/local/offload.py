@@ -57,13 +57,15 @@ class ExpertStore:
 
         # 异步预取支持：side stream + event 追踪
         self._stream = None
-        self._ready_events: dict[int, torch.cuda.Event] = {}  # 专家号 -> 拷贝完成事件
+        self._ready_events: dict[int, torch.cuda.Event] = {}  # 预取中：拷贝完成事件
         self._cold: dict[int, dict[str, torch.Tensor]] = {}  # 专家号 -> pinned CPU 主副本（仅 cpu target）
         if target == "cpu" and self.compute_device.type == "cuda":
             self._stream = torch.cuda.Stream(device=self.compute_device)
 
-        # LRU：键为专家号，值占位（顺序即最近使用顺序）
+        # _hot：被 ensure 真正命中的专家（LRU 序，队首最旧最易淘汰）；
+        # _resident：物理驻留算力设备的全部专家（含预取但未用的），容量按它计
         self._hot: "OrderedDict[int, None]" = OrderedDict()
+        self._resident: set[int] = set()
         self.moves = 0  # 搬运计数（日志/测试用）
 
         if target == "disk":
@@ -72,14 +74,20 @@ class ExpertStore:
                 torch.save(e.state_dict(), self._disk_path(i))
                 self._to_meta(e)
         else:
-            # cpu target：保留 pinned CPU 主副本，专家模块初始化为 meta（不占 GPU 内存）
+            # cpu target：保留 pinned CPU 主副本，专家模块初始化为 meta（不占显存）；
+            # 主副本一律落在 CPU（即便传入的专家当时在 GPU），否则 _cold 不构成"冷端"
             for i, e in enumerate(self.experts):
-                # 保存 pinned CPU 主副本
                 state = e.state_dict()
-                pinned_state = {k: v.pin_memory() if v.is_cuda else v.cpu().pin_memory()
-                                for k, v in state.items()}
-                self._cold[i] = pinned_state
+                self._cold[i] = {
+                    k: v.detach().to(self.cpu_device).pin_memory()
+                    for k, v in state.items()
+                }
                 self._to_meta(e)
+
+        # capacity<=0 = 声明"不淘汰"：反正迟早全驻留，直接在初始化时全量搬入，
+        # 让 forward 稳定走分组 bmm 快路径（避免"部分专家从未命中、永远 meta"）
+        if self.capacity <= 0:
+            self.ensure(range(len(self.experts)))
 
     def _disk_path(self, i: int) -> str:
         """单个专家的落盘路径（前缀含 store 名，避免多层共用目录互相覆盖）."""
@@ -89,10 +97,16 @@ class ExpertStore:
         """清空专家参数到 meta（不占内存；读取前须 to_empty 分配）."""
         module.to(torch.device("meta"))
 
+    def _await_ready(self, i: int) -> None:
+        """若专家 i 正在 side stream 上异步搬运，等待其完成并清除事件."""
+        ev = self._ready_events.pop(i, None)
+        if ev is not None and self._stream is not None:
+            torch.cuda.current_stream().wait_event(ev)
+
     def _load(self, i: int, async_: bool = False) -> None:
         """把专家 i 从冷端搬到算力设备（不更新 LRU，由 ensure 负责）.
 
-        async_=True 时：在 side stream 上异步拷贝，记录 event；
+        async_=True 时：在 side stream 上从 pinned CPU 主副本异步拷贝、记录事件；
         async_=False 时：同步拷贝（ensure 正常路径）。
         """
         e = self.experts[i]
@@ -101,79 +115,103 @@ class ExpertStore:
             e.to_empty(device=self.compute_device)
             e.load_state_dict(
                 torch.load(self._disk_path(i), map_location=self.compute_device))
-            self.moves += 1
-            return
-
-        # cpu 目标：从 pinned CPU 主副本拷贝到 GPU
-        if async_ and self._stream is not None:
-            # 异步拷贝：在 side stream 上执行
+        elif async_ and self._stream is not None:
+            # 异步拷贝：在 side stream 上执行（pinned 源 → 真正异步 H2D）
             with torch.cuda.stream(self._stream):
                 e.to_empty(device=self.compute_device)
-                # 从 pinned 主副本 load_state_dict（H2D 拷贝在 side stream 上）
                 e.load_state_dict(self._cold[i])
-                # 记录事件：拷贝完成
                 ev = torch.cuda.Event()
                 ev.record(self._stream)
                 self._ready_events[i] = ev
-            self.moves += 1
         else:
             # 同步拷贝
             e.to_empty(device=self.compute_device)
             e.load_state_dict(self._cold[i])
-            self.moves += 1
+        self._resident.add(i)
+        self.moves += 1
 
     def _evict(self, i: int) -> None:
-        """把专家 i 从算力设备退回冷端."""
+        """把专家 i 从算力设备退回冷端（若还在异步搬运，先等它落地再退）."""
+        self._await_ready(i)
         e = self.experts[i]
         if self.target == "disk":
             torch.save(e.state_dict(), self._disk_path(i))
-            self._to_meta(e)
-        else:
-            # cpu target：拷贝回 pinned 主副本（推理阶段权重不变，可 skip；但为通用性保留）
-            # 实际上推理时权重不变，evict 只需 meta 即可，无需拷贝回 _cold
-            self._to_meta(e)
+        # cpu/disk 均置 meta 释放显存；推理阶段权重不变，无需拷回 _cold
+        self._to_meta(e)
+        self._resident.discard(i)
+        self._hot.pop(i, None)
         self.moves += 1
+
+    def _evict_victim(self, protect: set[int], unused_only: bool = False) -> bool:
+        """挑一个专家腾位，返回是否成功淘汰.
+
+        - 优先"预取但未用"（`_resident−_hot`）——它们是投机搬运，可随时回收；
+        - `unused_only=False`（正常 ensure）时若无可回收的，再退 LRU 工作集；
+        - `unused_only=True`（预取）时**绝不退工作集**，返回 False 让调用方跳过。
+        protect（当前正要加载的专家号）绝不淘汰。
+        """
+        for i in [r for r in self._resident if r not in self._hot and r not in protect]:
+            self._evict(i)
+            return True
+        if unused_only:
+            return False
+        for i in list(self._hot.keys()):  # 队首 = 最久未用
+            if i not in protect:
+                self._evict(i)
+                return True
+        return False
 
     def ensure(self, ids, prefetch: bool = False) -> None:
         """保证列出的专家当前在算力设备上（命中即搬到热端，必要时 LRU 淘汰）.
 
-        `prefetch=True` 用于 LES 预取：**只填空闲容量、绝不淘汰**。预取是为了
-        把搬运延迟藏到计算前，若它反而把"马上要用的专家"挤回冷端，就会凭空
-        多出搬运（实测预取+淘汰使 moves 翻 3 倍、吞吐减半）。故预取在容量已满时
-        直接跳过，把淘汰权完全留给真正要用专家的那一步。
+        容量按 `_resident`（含预取）计，避免预取把显存撑爆。
 
-        异步预取（cpu+GPU）：prefetch 时在 side stream 启动拷贝并记录 event；
-        正常 ensure 时等待 event 完成（若存在）。
+        `prefetch=True`（LES 预取）：**只填空闲容量，绝不淘汰工作集**。预取是为
+        把搬运延迟藏到计算前，若它反而把"马上要用的专家"挤回冷端，就会凭空多出
+        搬运（实测预取+淘汰使 moves 翻 3 倍、吞吐减半）。故：
+          - 容量满时有"预取未用"的可回收，回收之；
+          - 没有可回收的（工作集占满），直接跳过，淘汰权留给真正要用专家的那步；
+          - 预取**不更新 `_hot`**，不改变工作集的"最近使用"时序。
 
-        注意：prefetch 只加载专家到算力设备，**不更新 LRU 顺序**（不加入 `_hot`），
-        避免 prefetch 本身改变命中专家的"最近使用"时序。
+        异步预取（cpu+GPU）：prefetch 在 side stream 启动拷贝并记录 event；
+        正常 ensure 命中同一专家时等待该 event 完成再使用（保证数值正确）。
         """
-        for i in ids:
-            i = int(i)
-            if i in self._hot:
-                self._hot.move_to_end(i)
+        todo = [int(i) for i in ids]
+        if prefetch:
+            for i in todo:
+                if i in self._resident:
+                    continue
+                if self.capacity > 0:
+                    if len(self._resident) >= self.capacity and \
+                            not self._evict_victim({i}, unused_only=True):
+                        break  # 无可回收空位：不淘汰工作集
+                self._load(i, async_=True)
+            return
+        for i in todo:
+            if i in self._resident:
+                self._await_ready(i)  # 可能是预取来的，等拷贝完成
+                if i in self._hot:
+                    self._hot.move_to_end(i)
+                else:
+                    self._hot[i] = None
                 continue
-            if prefetch and self.capacity > 0 and len(self._hot) >= self.capacity:
-                continue  # 预取不淘汰：无空位就不搬
-            # 若 prefetched 且有 event，等待拷贝完成
-            if i in self._ready_events:
-                if self._stream is not None:
-                    torch.cuda.current_stream().wait_event(self._ready_events[i])
-                del self._ready_events[i]
-            self._load(i, async_=prefetch)
-            # prefetch 不更新 _hot（不改变 LRU 时序）；正常 ensure 才更新
-            if not prefetch:
-                self._hot[i] = None
             if self.capacity > 0:
-                while len(self._hot) > self.capacity:
-                    old, _ = self._hot.popitem(last=False)
-                    self._evict(old)
+                while len(self._resident) >= self.capacity:
+                    if not self._evict_victim({i}):
+                        break
+            self._load(i, async_=False)
+            self._hot[i] = None
 
     def hot_ids(self) -> list[int]:
-        """当前驻留算力设备的专家号（最近使用序）."""
+        """当前被 ensure 命中（工作集）的专家号，最近使用序."""
         return list(self._hot.keys())
+
+    def all_resident(self) -> bool:
+        """所有专家是否都已驻留算力设备（全驻留时可退回分组 bmm 快路径）."""
+        return len(self._resident) >= len(self.experts)
 
     def stats(self) -> dict:
         """搬运统计（日志用）."""
-        return {"hot": len(self._hot), "moves": self.moves,
-                "target": self.target, "capacity": self.capacity}
+        return {"hot": len(self._hot), "resident": len(self._resident),
+                "moves": self.moves, "target": self.target,
+                "capacity": self.capacity}

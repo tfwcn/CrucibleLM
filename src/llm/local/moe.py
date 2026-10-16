@@ -132,10 +132,19 @@ class FineGrainedMoE(nn.Module):
         分组 bmm：每个 token 展开成 top-k 行，按专家排序后垫齐 batch，
         3 次 bmm 算完所有专家（替代 16 次逐专家 Python dispatch，
         解码主力开销），再按权重散射加回。数值与逐专家版一致（单测锁定）。
+
+        offload 开启时：默认走逐专家命中路径；若**全部专家都已驻留**算力设备
+        （容量足够、预热完成），则退回分组快路径（数值一致，省掉逐专家 dispatch）。
         """
         if self.store is not None:
-            # 开启 offload：走逐专家命中路径（只搬命中专家上算力设备）
-            return self._forward_offload(x)
+            if not self.store.all_resident():
+                # 还有冷专家：逐专家命中路径（只搬命中专家上算力设备）
+                return self._forward_offload(x)
+            # 全驻留：分组快路径
+        return self._forward_grouped(x)
+
+    def _forward_grouped(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """分组 bmm 前向（全部专家在算力设备时用；数值与逐专家版一致）."""
         orig_shape = x.shape
         d = x.shape[-1]
         flat = x.reshape(-1, d)  # (N, d)

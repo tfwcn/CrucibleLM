@@ -59,6 +59,23 @@ def test_offload_default_off_uses_grouped():
     assert m.store is None
 
 
+def test_all_resident_uses_grouped_fast_path():
+    """全驻留算力设备时退回分组 bmm 快路径，数值仍与朴素分组版一致."""
+    m = _moe()
+    x = torch.randn(4, 16, 64)
+    with torch.no_grad():
+        o_g, aux_g = m(x)
+    m2 = _moe()
+    m2.load_state_dict(m.state_dict())
+    m2.enable_offload("cpu", target="cpu", capacity=0)
+    m2.store.ensure(list(range(m2.n_experts)))  # 显式把全部专家搬上设备
+    assert m2.store.all_resident()
+    with torch.no_grad():
+        o_o, aux_o = m2(x)
+    assert torch.allclose(o_g, o_o, atol=1e-5), (o_g - o_o).abs().max()
+    assert torch.allclose(aux_g, aux_o)
+
+
 def test_expert_store_lru_eviction(tmp_path):
     """LRU：超容量淘汰最久未用；命中即提序."""
     m = _moe()
@@ -143,6 +160,55 @@ def test_expert_store_prefetch_fills_but_never_evicts(tmp_path):
     assert s2.hot_ids() == [0, 1]
 
 
+def test_expert_store_prefetch_reclaims_only_unused(tmp_path):
+    """预取可回收"预取未用"的空位，但绝不回收工作集；prefetch 与 ensure 不重复搬运."""
+    m = _moe()
+    store = ExpertStore(m.experts, "cpu", target="disk",
+                        offload_dir=str(tmp_path), capacity=3)
+    # 预取 [5,6]：工作集为空，直接填空位（驻留 2）
+    store.ensure([5, 6], prefetch=True)
+    assert store._resident == {5, 6}
+    assert store.hot_ids() == []  # 预取不进工作集
+    moves = store.moves
+    # 同一专家再次预取：已在设备上，不重复搬运
+    store.ensure([5], prefetch=True)
+    assert store.moves == moves
+    # 预取未用的 5/6 后来被正常 ensure 命中：resident 命中，不重复搬运
+    store.ensure([5])
+    assert store.moves == moves
+    assert store.hot_ids() == [5]
+    store.ensure([6])
+    assert store.moves == moves
+    assert store.hot_ids() == [5, 6]
+    # 补一个预取占满容量（resident 3）
+    store.ensure([0], prefetch=True)
+    assert store._resident == {0, 5, 6}
+    # 容量满：预取 1 回收"预取未用"的 0（不动工作集 5/6）
+    store.ensure([1], prefetch=True)
+    assert store._resident == {1, 5, 6}
+    assert store.hot_ids() == [5, 6]
+    # 正常 ensure([7]) 腾位：优先回收"预取未用"的 1，不动工作集
+    store.ensure([7])
+    assert 1 not in store._resident
+    assert store.hot_ids() == [5, 6, 7]
+
+
+def test_expert_store_prefetch_reclaim_unused_slot(tmp_path):
+    """容量满且存在"预取未用"时，预取可回收其空位继续预取."""
+    m = _moe()
+    store = ExpertStore(m.experts, "cpu", target="disk",
+                        offload_dir=str(tmp_path), capacity=2)
+    store.ensure([0])            # 工作集 {0}，驻留 {0}
+    store.ensure([5], prefetch=True)  # 驻留 {0,5}，5 为预取未用
+    assert store._resident == {0, 5}
+    # 容量满：预取 6 可回收未用的 5（不动工作集 0）
+    store.ensure([6], prefetch=True)
+    assert 0 in store._resident
+    assert 5 not in store._resident
+    assert 6 in store._resident
+    assert store.hot_ids() == [0]
+
+
 def test_expert_store_async_prefetch_cpu_cuda():
     """异步预取（cpu target + CUDA）：event 等待确保拷贝完成，数值正确.
 
@@ -151,36 +217,34 @@ def test_expert_store_async_prefetch_cpu_cuda():
     if not torch.cuda.is_available():
         pytest.skip("需要 CUDA")
 
+    dev = "cuda"
     torch.manual_seed(0)
-    m = _moe()  # 基准模型（专家在 CPU）
-    x = torch.randn(2, 8, 64, device="cuda")
+    m = _moe().to(dev)  # 基准模型（分组 bmm）
+    x = torch.randn(2, 8, 64, device=dev)
     with torch.no_grad():
         base_logits, base_aux = m(x)
 
-    # 独立测试 ExpertStore 的异步预取功能（不污染 m）
-    m_store = _moe()
-    store = ExpertStore(m_store.experts, "cuda", target="cpu", capacity=4)
+    # 独立测试 ExpertStore 的异步预取状态机（不污染 m 的专家）
+    ms = _moe()
+    store = ExpertStore(ms.experts, dev, target="cpu", capacity=4)
     store.ensure([0, 1], prefetch=True)
     assert 0 in store._ready_events
     assert 1 in store._ready_events
-    store.ensure([0, 1])
+    store.ensure([0, 1])  # 正常 ensure 等待 event 并清除
     assert 0 not in store._ready_events
     assert 1 not in store._ready_events
+    # 冷端主副本必须落在 CPU（pinned），而非 GPU
+    assert store._cold[0]["w_gate.weight"].device.type == "cpu"
+    assert store._cold[0]["w_gate.weight"].is_pinned()
 
-    # 数值等价性：offload 路径与分组 bmm 一致
-    m2 = _moe()
+    # 数值等价：offload(cpu target) 与分组 bmm 逐位一致
+    m2 = _moe().to(dev)
     m2.load_state_dict(m.state_dict())
-    m2.enable_offload("cuda", target="cpu", capacity=4)
+    m2.enable_offload(dev, target="cpu", capacity=4)
     with torch.no_grad():
         o_g, aux_g = m2(x)
-    m3 = _moe()
-    m3.load_state_dict(m.state_dict())
-    with torch.no_grad():
-        o_n, aux_n = m3(x)
-    assert torch.allclose(o_g, o_n, atol=1e-5)
-    assert torch.allclose(aux_g, aux_n)
-    # 与基准模型（无 offload）比较
-    assert torch.allclose(o_g, base_logits, atol=1e-5)
+    assert torch.allclose(o_g, base_logits, atol=1e-5), (o_g - base_logits).abs().max()
+    assert torch.allclose(aux_g, base_aux, atol=1e-5)
 
 
 def test_model_setup_offload_disk_end_to_end(tmp_path):
