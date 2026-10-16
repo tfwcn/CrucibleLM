@@ -310,6 +310,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线） | `vision_compress.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
+  实测自然语言 30–39%（不值得开）、代码 66%（值得开），**默认关、按负载决定**。
   仅 batch=1、`temperature=0` 生效，输出与逐 token 贪心逐位一致。为支撑并行
   验证，MLA（`_valid_mask` 块内因果）、稀疏（`_decode` 取最后 t 个查询）、线性
   （`past≠None, t>1` 分支）三条解码路径补齐多 token 增量，`t==1` 逐位不变。

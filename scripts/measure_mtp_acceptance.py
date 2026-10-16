@@ -7,6 +7,9 @@
 用法：
     python scripts/measure_mtp_acceptance.py --model data/llm-ckpt --text data/val.txt
     python scripts/measure_mtp_acceptance.py --preset tiny   # 无权重，仅冒烟（随机初始化）
+    # 带 memory/retro/hyper 的 SFT checkpoint：用 --run-yaml 复用其训练配置
+    python scripts/measure_mtp_acceptance.py --model data/llm-sft7/best/model \
+        --run-yaml data/llm-sft7/run.yaml
 """
 
 from __future__ import annotations
@@ -22,6 +25,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.llm.local.config import SmallLLMConfig, tiny_test_config
 from src.llm.local.infer import LocalChatBackend
 from src.llm.local.model import TinyLLM
+
+
+def apply_run_yaml(cfg: "SmallLLMConfig", path: str) -> None:
+    """把训练 run.yaml 里的结构开关套到配置上（简单 key: value，够用）.
+
+    只认与 state_dict 结构相关的键（memory/retro/hyper），其余忽略——载权重
+    只需结构一致，训练超参无关。
+    """
+    kv: dict[str, str] = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if ":" in line:
+            k, v = line.split(":", 1)
+            kv[k.strip()] = v.strip()
+    # enable_* 是布尔；memory_every 缺省取训练脚本默认 4
+    if kv.get("enable_memory", "false").lower() == "true":
+        cfg.memory_every = int(kv.get("memory_every", 4))
+        if kv.get("memory_slots"):
+            cfg.memory_slots = int(kv["memory_slots"])
+        if kv.get("memory_topk"):
+            cfg.memory_topk = int(kv["memory_topk"])
+    if kv.get("enable_retro", "false").lower() == "true":
+        cfg.retro_enabled = True
+        cfg.retro_every = int(kv.get("retro_every", 0))
+        if kv.get("retro_len"):
+            cfg.retro_chunk_len = int(kv["retro_len"])
+    if kv.get("hyper_streams"):
+        cfg.hyper_streams = int(kv["hyper_streams"])
 
 
 def measure(model: TinyLLM, ids: torch.Tensor) -> dict:
@@ -67,10 +98,14 @@ def main() -> None:
                     choices=["tiny", "base"], help="无 --model 时的随机配置")
     ap.add_argument("--max-chars", type=int, default=8000, help="最多评估多少字符")
     ap.add_argument("--dtype", type=str, default="", help="fp16/bf16（可选，省显存）")
+    ap.add_argument("--run-yaml", type=str, default="",
+                    help="训练 run.yaml；用于复用 memory/retro/hyper 结构开关载权重")
     args = ap.parse_args()
 
     if args.model:
         cfg = SmallLLMConfig()
+        if args.run_yaml:
+            apply_run_yaml(cfg, args.run_yaml)
         backend = LocalChatBackend.load(
             args.model, cfg, dtype=args.dtype or None)
         model, tok = backend.model, backend.tokenizer
