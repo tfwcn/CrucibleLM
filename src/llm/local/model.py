@@ -21,10 +21,16 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
     use_hyper = config.hyper_streams >= 2
     use_engram = (config.engram_every > 0
                   and layer_idx % config.engram_every == 0)
+    full = config.is_full_attn_layer(layer_idx)
+    # CSA2 跨层复用：每 csa_reuse_every 个全注意力层留 1 个 Full，其余 Reuse
+    csa_reuse = False
+    if full and config.csa_reuse_every > 1:
+        ordinal = layer_idx // max(1, config.full_attn_every)
+        csa_reuse = (ordinal % config.csa_reuse_every) != 0
     return HybridBlock(
         d_model=config.d_model,
         n_heads=config.n_heads,
-        full_attn=config.is_full_attn_layer(layer_idx),
+        full_attn=full,
         q_lora_rank=config.q_lora_rank,
         kv_lora_rank=config.kv_lora_rank,
         qk_rope_dim=config.qk_rope_dim,
@@ -56,6 +62,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         engram_table_size=config.engram_table_size,
         engram_conv=config.engram_conv,
         vocab_size=config.vocab_size,
+        csa_reuse=csa_reuse,
     )
 
 
@@ -88,6 +95,8 @@ class TinyLLM(nn.Module):
             build_block(config, i)
             for i in range(config.n_layers)
         ])
+        # CSA2 跨层复用：链接共享 KV 下投影并判定是否启用（供各路径统一判断）
+        self._link_csa_reuse()
         self.final_norm = RMSNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
@@ -111,6 +120,26 @@ class TinyLLM(nn.Module):
                 config.vision_tokens, config.vision_compress, config.n_heads,
                 config.dropout, config.vision_unshuffle)
         self._init_weights()
+
+    def _link_csa_reuse(self) -> None:
+        """CSA2：Reuse 层与最近的 Full 层共享 KV 下投影（`w_dkv`/`w_kr` 同权重对象）.
+
+        避免 Reuse 层留下永不更新的死参数，也让"复用"名实相符：Reuse 层借的是
+        同一份 latent 投影（各层仍用自己的上投影 `w_uk`/`w_uv` 展开 K/V）。
+        """
+        last_full = None
+        for layer in self.layers:
+            if not getattr(layer, "full_attn", False):
+                continue
+            if getattr(layer.attn, "csa_reuse", False) and last_full is not None:
+                layer.attn.w_dkv = last_full.attn.w_dkv
+                layer.attn.w_kr = last_full.attn.w_kr
+            else:
+                # 首个全注意力层（或 Reuse 无前置 Full）退化为 Full，保证有共享源
+                layer.attn.csa_reuse = False
+                last_full = layer
+        self._csa_active = any(
+            bool(getattr(layer.attn, "csa_reuse", False)) for layer in self.layers)
 
     def _init_weights(self) -> None:
         """GPT-2 式初始化：embedding 小方差 + 残差输出投影按深度缩放.
@@ -189,16 +218,24 @@ class TinyLLM(nn.Module):
                          if chunk_mask is not None else None)
         elif self._has_interleaved_retro():
             pass  # 评测/生成无检索：各层跳过，测 backbone 本体
+        shared = None  # CSA2：最近 Full 全注意力层的 latent 缓存（供 Reuse 层借用）
         for layer in self.layers:
             # 梯度检查点只在训练时生效（推理/生成走正常路径，保留解码缓存）；
             # 训练不返回解码缓存（return_state=False），省状态循环与两次投影
+            is_full = bool(getattr(layer, "full_attn", False))
+            is_reuse = is_full and bool(getattr(layer.attn, "csa_reuse", False))
+            reuse = shared if is_reuse else None
+            # CSA2 开启时 Full 层需返回缓存（reserve=0，不补零、数值不变）供 Reuse 借用
+            rs = bool(self._csa_active and is_full)
             if self.config.grad_ckpt and self.training:
-                h, aux_total = self._layer_ckpt(
-                    layer, h, aux_total, retro_mem, engram_ids)
+                h, aux_total, p = self._layer_ckpt(
+                    layer, h, aux_total, retro_mem, engram_ids, reuse, rs)
             else:
-                h, (_, aux) = layer(h, None, False, retro_mem,
-                                    engram_ids=engram_ids)
+                h, (p, aux) = layer(h, None, rs, retro_mem,
+                                    engram_ids=engram_ids, reuse=reuse)
                 aux_total = aux_total + aux
+            if self._csa_active and is_full and not is_reuse:
+                shared = p
         if hyper_n:
             h = h.mean(dim=2)  # 流聚合（均值即 H_pre，论文消融默认）
         h = self.final_norm(h)
@@ -295,17 +332,19 @@ class TinyLLM(nn.Module):
         self, layer: HybridBlock, h: torch.Tensor, aux_total: torch.Tensor,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
         engram_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        return_state: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple | None]:
         """单层梯度检查点：重算换显存（训练 past=None，不用解码缓存）."""
         from torch.utils.checkpoint import checkpoint
 
-        def fn(hh: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            out, (_, aux) = layer(hh, None, False, retro_mem,
-                                  engram_ids=engram_ids)
-            return out, aux
+        def fn(hh: torch.Tensor):
+            out, (p, aux) = layer(hh, None, return_state, retro_mem,
+                                  engram_ids=engram_ids, reuse=reuse)
+            return out, aux, p
 
-        h_new, aux = checkpoint(fn, h, use_reentrant=False)
-        return h_new, aux_total + aux
+        h_new, aux, p = checkpoint(fn, h, use_reentrant=False)
+        return h_new, aux_total + aux, p
 
     @torch.no_grad()
     def generate(
@@ -350,11 +389,17 @@ class TinyLLM(nn.Module):
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
         if hyper_n:
             h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
+        shared = None  # CSA2：最近 Full 全注意力层的 latent 缓存（供 Reuse 层借用）
         pasts: list = []
         for layer in self.layers:
+            is_full = bool(getattr(layer, "full_attn", False))
+            is_reuse = is_full and bool(getattr(layer.attn, "csa_reuse", False))
+            reuse = shared if is_reuse else None
             h, (p, _) = layer(h, retro_mem=retro_mem, reserve=reserve,
-                              engram_ids=input_ids)
+                              engram_ids=input_ids, reuse=reuse)
             pasts.append(p)
+            if self._csa_active and is_full and not is_reuse:
+                shared = p
         if hyper_n:
             h = h.mean(dim=2)
         return self.final_norm(h), pasts
@@ -678,8 +723,15 @@ class TinyLLM(nn.Module):
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
         if hyper_n:
             h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
+        shared = None  # CSA2：最近 Full 全注意力层的 latent 缓存
         for layer in self.layers:
-            h, _ = layer(h, None, False, engram_ids=input_ids)
+            is_full = bool(getattr(layer, "full_attn", False))
+            is_reuse = is_full and bool(getattr(layer.attn, "csa_reuse", False))
+            reuse = shared if is_reuse else None
+            rs = bool(self._csa_active and is_full)
+            h, (p, _) = layer(h, None, rs, engram_ids=input_ids, reuse=reuse)
+            if self._csa_active and is_full and not is_reuse:
+                shared = p
         if hyper_n:
             h = h.mean(dim=2)
         return self.final_norm(h)
@@ -773,10 +825,20 @@ class TinyLLM(nn.Module):
                 "total_m": round(total / 1e6, 1), "active_m": round(active / 1e6, 1)}
 
     def kv_cache_bytes(self, seq_len: int, dtype_bytes: int = 2) -> int:
-        """满上下文 KV/状态缓存字节数（MLA 层 latent + 线性层状态）."""
+        """满上下文 KV/状态缓存字节数（MLA 层 latent + 线性层状态）.
+
+        CSA2 跨层复用时，Reuse 层不新增 KV 缓存（借最近 Full 层），故只计 Full 层。
+        """
         c = self.config
         mla_per_layer = (c.kv_lora_rank + c.qk_rope_dim) * seq_len * dtype_bytes
         lin_per_layer = c.n_heads * (c.d_model // c.n_heads) ** 2 * dtype_bytes
         n_full = c.n_full_layers
         n_lin = c.n_layers - n_full
-        return n_full * mla_per_layer + n_lin * lin_per_layer
+        # 统计真正存 KV 的全注意力层（非 Reuse）
+        n_store = sum(
+            1 for layer in self.layers
+            if getattr(layer, "full_attn", False)
+            and not getattr(layer.attn, "csa_reuse", False))
+        if n_store == 0:
+            n_store = n_full
+        return n_store * mla_per_layer + n_lin * lin_per_layer

@@ -135,6 +135,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="每头哈希表大小（须素数，抗碰撞）")
     p.add_argument("--engram-conv", type=int, default=4,
                    help="短因果卷积核（0=不做卷积；作用在 id 决定的 V 上，解码无状态）")
+    p.add_argument("--csa-reuse-every", type=int, default=1,
+                   help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full（1=关，2=KV 减半）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -691,6 +693,10 @@ def main(argv=None) -> int:
         print(f"Engram 已开：每 {config.engram_every} 层一个，阶 {config.engram_orders}，"
               f"{config.engram_heads} 头/阶，表 {config.engram_table_size}（素数），"
               f"卷积核 {config.engram_conv}（恒等起点）", flush=True)
+    if args.csa_reuse_every > 1:
+        config.csa_reuse_every = args.csa_reuse_every
+        print(f"CSA2 跨层 KV 复用已开：每 {config.csa_reuse_every} 个全注意力层留 1 个 Full，"
+              f"其余 Reuse 借共享 latent（KV 缓存下降）", flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0
     if args.resume:

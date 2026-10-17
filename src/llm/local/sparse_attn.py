@@ -143,11 +143,28 @@ class SparseMLAModule(MLAModule):
         past: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         return_state: bool = True,
         reserve: int = 0,
+        reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple | None]:
-        """稀疏前向：短序列/解码缓存命中时退化为 dense 等价，超长才分块聚集."""
+        """稀疏前向：短序列/解码缓存命中时退化为 dense 等价，超长才分块聚集.
+
+        reuse: 跨层复用（CSA2）最近 Full 层的 latent 缓存；None=正常自算。
+        """
         b, t, _ = h.shape
         if past is not None:
             return self._decode(h, past)
+        if reuse is not None:
+            # 跨层复用：Q 自算、K/V 借共享 latent（短序列走 dense，超长走分块聚集）
+            if t <= self.sparse_threshold:
+                return super().forward(h, None, return_state, reserve, reuse)
+            q_full = self._q_only(h)
+            k_full, v_full = self._kv_from_latent(reuse[0], reuse[1], total=t)
+            outs = []
+            for s in range(0, t, self.sparse_chunk):
+                e = min(s + self.sparse_chunk, t)
+                outs.append(self._sparse_scores(
+                    q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t))
+            out = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, t, -1)
+            return self.w_o(out), (reuse if return_state else None)
         if t <= self.sparse_threshold:
             # 短序列：与 MLAModule 逐位一致（reserve 透传装箱）
             return super().forward(h, None, return_state, reserve)
@@ -178,9 +195,11 @@ class SparseMLAModule(MLAModule):
         """
         b, t, _ = h.shape
         buf_c, buf_kr, pos = past
-        w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
-        buf_c.index_copy_(1, w_idx, self.w_dkv(h))
-        buf_kr.index_copy_(1, w_idx, self.w_kr(h))
+        if not self.csa_reuse:
+            # Full 层：按位写自己的 latent；Reuse 层跳过（共享缓冲已由 Full 写好）
+            w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
+            buf_c.index_copy_(1, w_idx, self.w_dkv(h))
+            buf_kr.index_copy_(1, w_idx, self.w_kr(h))
         pos_next = pos + t
         # 实际长度（pattern 按实际算；一次同步，eager 可忽略；
         # compile 下此处 graph-break 但不重编）

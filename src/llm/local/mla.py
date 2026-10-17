@@ -67,6 +67,10 @@ class MLAModule(nn.Module):
         self.k_norm = RMSNorm(self.head_dim)
         self.w_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
         self.dropout = dropout
+        # CSA2 跨层复用：True 时本层为 "Reuse" 层——推理/解码复用最近 Full 层的
+        # latent 缓存，不重复写自己的 KV（由 build_block 按 csa_reuse_every 设）；
+        # False=Full（默认，自算自存）。纯超参，不进 state_dict。
+        self.csa_reuse = False
         # 预计算 RoPE 缓存（解耦部分维度小，可一次建好）
         cos, sin = build_rope_cache(max_seq_len, qk_rope_dim, rope_theta, yarn_scale)
         self.register_buffer("rope_cos", cos, persistent=False)
@@ -135,12 +139,113 @@ class MLAModule(nn.Module):
         k_rope = apply_rope(k_rope_raw, self.rope_cos, self.rope_sin).unsqueeze(2)
         return q, k, v, q_rope, k_rope, c_kv, k_rope_raw
 
+    def _q_only(self, h: torch.Tensor) -> torch.Tensor:
+        """只算 Q（含 RoPE，位置从 0 起），供跨层复用层（K/V 借共享 latent）."""
+        b, t, _ = h.shape
+        q_c = self.w_dq(h)
+        q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
+        q_rope = self.w_qr(q_c).view(b, t, self.n_heads, self.qk_rope_dim)
+        q_rope = apply_rope(q_rope, self.rope_cos, self.rope_sin)
+        return torch.cat([q, q_rope], dim=-1).transpose(1, 2)
+
+    def _kv_from_latent(
+        self, c_kv: torch.Tensor, k_rope_raw: torch.Tensor, total: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """由共享 latent 展开全头 K/V（跨层复用层只借 latent，不借上投影）.
+
+        `total` 非空时只取前 `total` 个位置（prefill 缓冲可能补零到 reserve）。
+        """
+        if total is not None:
+            c_kv = c_kv[:, :total]
+            k_rope_raw = k_rope_raw[:, :total]
+        b, T, _ = c_kv.shape
+        k = self.k_norm(self.w_uk(c_kv).view(b, T, self.n_heads, self.head_dim))
+        v = self.w_uv(c_kv).view(b, T, self.n_heads, self.head_dim)
+        k_rope = apply_rope(
+            k_rope_raw, self.rope_cos[:T], self.rope_sin[:T],
+        ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+        k_full = torch.cat([k, k_rope], dim=-1).transpose(1, 2)
+        return k_full, v.transpose(1, 2)
+
+    def _forward_reuse(
+        self, h: torch.Tensor,
+        reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        return_state: bool,
+    ) -> tuple[torch.Tensor, tuple | None]:
+        """跨层复用（prefill/训练）：Q 自算，K/V 借共享 latent，因果掩码同 prefill."""
+        b, t, _ = h.shape
+        buf_c, buf_kr, pos = reuse
+        total = buf_c.shape[1]
+        q_full = self._q_only(h)
+        k_full, v_full = self._kv_from_latent(buf_c, buf_kr)
+        # prefill 语义：查询即 prompt 全段（pos 从 0 起），掩码屏蔽补零空位 + 块内因果
+        zero = torch.zeros((), dtype=torch.long, device=h.device)
+        out = F.scaled_dot_product_attention(
+            q_full, k_full, v_full,
+            attn_mask=self._valid_mask(total, zero, t, h.device),
+            dropout_p=self.dropout,
+        )
+        out = out.transpose(1, 2).contiguous().view(b, t, -1)
+        return self.w_o(out), (reuse if return_state else None)
+
+    def _decode_attend(
+        self,
+        h: torch.Tensor,
+        past: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        write: bool = True,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """从静态缓冲读 K/V 做掩码注意力；`write=False` 用于跨层复用层（不重复写）."""
+        b, t, _ = h.shape
+        buf_c, buf_kr, pos = past
+        total = buf_c.shape[1]
+        if write:
+            # 范围写（t==1 即单槽；dynamo 安全，形状恒定）
+            w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
+            buf_c.index_copy_(1, w_idx, self.w_dkv(h))
+            buf_kr.index_copy_(1, w_idx, self.w_kr(h))
+        pos_next = pos + t
+        q_c = self.w_dq(h)
+        q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
+        q_rope = self.w_qr(q_c).view(b, t, self.n_heads, self.qk_rope_dim)
+        # 旋转相位按绝对位置 gather（dynamo 安全，不按值特化）；
+        # 下标钳制在 rope 缓存内（有效位本就 ≤ rope_len，旧约束不变）
+        rlen = self.rope_cos.shape[0]
+        q_idx = (pos.reshape(1) + torch.arange(t, device=h.device)).clamp(
+            max=rlen - 1)
+        q_rope = apply_rope(
+            q_rope,
+            self.rope_cos[q_idx],
+            self.rope_sin[q_idx],
+        )
+        k = self.k_norm(self.w_uk(buf_c).view(b, total, self.n_heads, self.head_dim))
+        v = self.w_uv(buf_c).view(b, total, self.n_heads, self.head_dim)
+        rlen = self.rope_cos.shape[0]
+        ridx = torch.arange(total, device=h.device).clamp(max=rlen - 1)
+        k_rope_hist = apply_rope(
+            buf_kr,
+            self.rope_cos[ridx],
+            self.rope_sin[ridx],
+        ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+        q_full = torch.cat([q, q_rope], dim=-1).transpose(1, 2)
+        k_full = torch.cat([k, k_rope_hist], dim=-1).transpose(1, 2)
+        v_full = v.transpose(1, 2)
+        # 解码时 query 只有 t 步，对全缓冲做掩码注意力即可
+        # （SDPA bool 掩码 True=放行；预留空位 False 屏蔽）
+        out = F.scaled_dot_product_attention(
+            q_full, k_full, v_full,
+            attn_mask=self._valid_mask(total, pos, t, h.device),
+            dropout_p=0.0,
+        )
+        out = out.transpose(1, 2).contiguous().view(b, t, -1)
+        return self.w_o(out), (buf_c, buf_kr, pos_next)
+
     def forward(
         self,
         h: torch.Tensor,
         past: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         return_state: bool = True,
         reserve: int = 0,
+        reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple | None]:
         """训练/Prefill 前向：全序列并行注意力.
 
@@ -148,56 +253,17 @@ class MLAModule(nn.Module):
         传入即增量解码（按位写、掩码读，不再 `cat` 增长）。
         reserve: prefill 预留总长（prompt + 后续解码，generate 由 max_new_tokens
         精确给出；0 表示恰好当前长度，解码前由调用方扩到够用）。
+        reuse: 跨层复用（CSA2）：`(buf_c, buf_kr, pos)` 为最近 Full 层的 latent 缓存，
+        本层借它出 K/V（只自算 Q）；None=正常自算。仅 prefill/训练（past=None）用。
         return_state=False 时不返回解码缓存（训练用不上，省两次投影）。
         返回 (输出, 新缓存或 None)。
         """
         b, t, _ = h.shape
         if past is not None:
-            # 增量解码：按位写入 latent + 共享 rope 键，只算当前步的 Q
-            buf_c, buf_kr, pos = past
-            total = buf_c.shape[1]
-            # 范围写（t==1 即单槽；dynamo 安全，形状恒定）
-            w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
-            buf_c.index_copy_(1, w_idx, self.w_dkv(h))
-            buf_kr.index_copy_(1, w_idx, self.w_kr(h))
-            pos_next = pos + t
-            q_c = self.w_dq(h)
-            q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
-            q_rope = self.w_qr(q_c).view(b, t, self.n_heads, self.qk_rope_dim)
-            # 旋转相位按绝对位置 gather（dynamo 安全，不按值特化）；
-            # 下标钳制在 rope 缓存内（有效位本就 ≤ rope_len，旧约束不变）
-            rlen = self.rope_cos.shape[0]
-            q_idx = (pos.reshape(1) + torch.arange(t, device=h.device)).clamp(
-                max=rlen - 1)
-            q_rope = apply_rope(
-                q_rope,
-                self.rope_cos[q_idx],
-                self.rope_sin[q_idx],
-            )
-            k = self.k_norm(self.w_uk(buf_c).view(b, total, self.n_heads, self.head_dim))
-            v = self.w_uv(buf_c).view(b, total, self.n_heads, self.head_dim)
-            # 全缓冲旋转键 + 有效位掩码（预留空位屏蔽，与 cat 版逐位一致）；
-            # rope 相位下标钳制在缓存内（预留 L 可超 rope_len，空位被掩码，
-            # 有效位此前已保证 ≤ rope_len，与旧约束一致）
-            rlen = self.rope_cos.shape[0]
-            ridx = torch.arange(total, device=h.device).clamp(max=rlen - 1)
-            k_rope_hist = apply_rope(
-                buf_kr,
-                self.rope_cos[ridx],
-                self.rope_sin[ridx],
-            ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)
-            q_full = torch.cat([q, q_rope], dim=-1).transpose(1, 2)
-            k_full = torch.cat([k, k_rope_hist], dim=-1).transpose(1, 2)
-            v_full = v.transpose(1, 2)
-            # 解码时 query 只有 1 步，对全缓冲做掩码注意力即可
-            # （SDPA bool 掩码 True=放行；预留空位 False 屏蔽）
-            out = F.scaled_dot_product_attention(
-                q_full, k_full, v_full,
-                attn_mask=self._valid_mask(total, pos, t, h.device),
-                dropout_p=0.0,
-            )
-            out = out.transpose(1, 2).contiguous().view(b, t, -1)
-            return self.w_o(out), (buf_c, buf_kr, pos_next)
+            # 增量解码；Reuse 层跳过写入、只读共享缓冲（由最近的 Full 层写好）
+            return self._decode_attend(h, past, write=not self.csa_reuse)
+        if reuse is not None:
+            return self._forward_reuse(h, reuse, return_state)
         # 训练/Prefill：全序列并行
         q, k, v, q_rope, k_rope, c_kv, k_rope_raw = self._qkv(h)
         k_rope_full = k_rope.expand(-1, -1, self.n_heads, -1)

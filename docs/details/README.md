@@ -9,6 +9,7 @@
 - [线性注意力：O(1) 状态的金鱼记忆](./linear-attention.md)
 - [Hybrid 交替：排班表](./hybrid.md)
 - [稀疏注意力：200K 跳读](./sparse-attention.md)
+- [CSA2 跨层 KV 复用：相邻层共享 latent](./csa-kv-reuse.md)
 - [RoPE 与 YaRN：位置和外推](./rope-yarn.md)
 
 ## 前馈与目标

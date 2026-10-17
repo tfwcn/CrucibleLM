@@ -54,6 +54,7 @@ class HybridBlock(nn.Module):
         engram_table_size: int = 8191,
         engram_conv: int = 4,
         vocab_size: int = 8192,
+        csa_reuse: bool = False,
     ):
         super().__init__()
         self.full_attn = full_attn
@@ -66,6 +67,8 @@ class HybridBlock(nn.Module):
                 sparse_threshold, sparse_window, sparse_sink,
                 sparse_stride, sparse_chunk,
             )
+            # CSA2 跨层复用：Reuse 层解码复用最近 Full 层的 latent 缓存（纯超参）
+            self.attn.csa_reuse = bool(csa_reuse)
         else:
             # Qwen3-Next 系线性注意力（超长自动切块递推）
             self.attn = GatedDeltaLite(d_model, n_heads, dropout, linear_chunk)
@@ -105,6 +108,7 @@ class HybridBlock(nn.Module):
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
         reserve: int = 0,
         engram_ids: torch.Tensor | None = None,
+        reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
         """前向：past 为解码缓存（MLA 传 latent 元组，线性层传状态矩阵）.
 
@@ -114,6 +118,7 @@ class HybridBlock(nn.Module):
         reserve: prefill 预留总长（只用于全注意力静态缓存装箱；线性层忽略）。
         engram_ids: 本层 Engram 的上下文 token id（(b,L)，右对齐到 h 末位）；
         None 或本层无 Engram 时跳过。
+        reuse: CSA2 跨层复用（最近 Full 层的 latent 缓存），仅全注意力 prefill 用。
         h: 无超连接时 (b, t, d)；有超连接时 (b, t, n, d) n 路流。
         """
         xs = h
@@ -125,7 +130,7 @@ class HybridBlock(nn.Module):
             h = self.engram(h, engram_ids)
         if past is None and self.full_attn:
             a_out, new_past = self.attn(  # type: ignore[call-arg]
-                self.norm1(h), past, return_state, reserve)
+                self.norm1(h), past, return_state, reserve, reuse)
         else:
             a_out, new_past = self.attn(self.norm1(h), past, return_state)  # type: ignore[arg-type]
         h = h + a_out

@@ -57,6 +57,10 @@ class SmallLLMConfig:
     sparse_sink: int = 128  # 注意力汇点（打头保留）
     sparse_stride: int = 512  # 膨胀跨步（窗口外每隔这么多保留一个）
     sparse_chunk: int = 2048  # 预填充分块（显存/速度折中）
+    # CSA2 跨层 KV 复用（DeepSeek-V4.1）：每 N 个全注意力层里 1 个 Full（自算 latent），
+    # 其余 Reuse（复用最近 Full 层的 latent，自算 Q/上投影，不重复存 KV 缓存）。
+    # 1=全 Full（默认，逐位兼容，无共享）；2=Full/Reuse 交替，KV 缓存减半。
+    csa_reuse_every: int = 1
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
