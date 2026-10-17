@@ -102,6 +102,12 @@ class SmallLLMConfig:
     draft_source: str = "hybrid"
     # ngram 起草的最短匹配后缀长度（太短会误命中，太长覆盖不足）
     draft_ngram_min: int = 2
+    # DSpark 置信调度验证（DeepSeek-V4.1 / arXiv 2607.05147）：按草稿存活置信度
+    # 动态定"这轮验多长"，提前截断看起来必被拒的后缀，省目标模型算力。
+    # 仅 draft_enabled 时生效；不改变最终序列（验证仍精确，单测锁定等于贪心）。
+    dspark_enabled: bool = False
+    dspark_conf_threshold: float = 0.5  # 累计存活概率下限（越小越激进；<=0=全验证）
+    dspark_min_verify: int = 1  # 每轮至少验证的草稿数（保底每轮有推进）
 
     # ===== 跨设备专家 offload（默认关；见 offload.py / docs/details/cross-device-offload.md）=====
     offload_enabled: bool = False

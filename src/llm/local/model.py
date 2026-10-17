@@ -569,11 +569,21 @@ class TinyLLM(nn.Module):
         前向已按步记录缓存）跳位，**零重放**。输出与 `_generate_inner` 的贪心
         逐位一致（单测锁定）。
         """
-        from src.llm.local.spec_decode import build_draft_provider
+        from src.llm.local.spec_decode import (
+            build_draft_provider,
+            schedule_verify_length,
+            scored_propose,
+        )
 
         cfg = self.config
         provider = build_draft_provider(self, cfg.draft_source, cfg.draft_ngram_min)
         window = max(1, int(cfg.draft_window))
+        # DSpark 置信调度（默认关）：按草稿存活置信度动态定本轮验证长度
+        dspark = bool(getattr(cfg, "dspark_enabled", False))
+        thr = float(getattr(cfg, "dspark_conf_threshold", 0.5))
+        min_v = int(getattr(cfg, "dspark_min_verify", 1))
+        n_proposed = 0
+        n_verified = 0
         dev = input_ids.device
         # 预留：每轮最多并行写 window 个位置，多留 window 防越界
         h, pasts = self._prefill(
@@ -588,7 +598,14 @@ class TinyLLM(nn.Module):
             t0 = int(self._sample_next(
                 h[:, -1:], 0.0, 0, repetition_penalty, ctx_t)[0, 0])
             k = window - 1
-            drafts = provider.propose(ctx, h[:, -1:], k) if k > 0 else []
+            if k > 0 and dspark:
+                # DSpark：取带置信度的草稿，按累计存活概率截断验证长度
+                drafts, confs = scored_propose(provider, ctx, h[:, -1:], k)
+                n_proposed += len(drafts)
+                drafts = list(drafts[:schedule_verify_length(confs, thr, min_v, k)])
+                n_verified += len(drafts)
+            else:
+                drafts = provider.propose(ctx, h[:, -1:], k) if k > 0 else []
             feed = [t0] + list(drafts)
             y = torch.tensor([feed], dtype=torch.long, device=dev)
             eids = self._engram_block_ids(ctx_t, y)
@@ -624,7 +641,11 @@ class TinyLLM(nn.Module):
                 break
         # 统计（日志/单测用：accepted 越接近 window×rounds 越省）
         self._spec_stats = {"rounds": rounds, "accepted": n_accepted,
-                            "emitted": n_new, "window": window}
+                            "emitted": n_new, "window": window,
+                            "dspark": dspark}
+        if dspark:
+            self._spec_stats["proposed"] = n_proposed
+            self._spec_stats["verified"] = n_verified
 
     def compile_decode(self, mode: str = "default") -> "TinyLLM":
         """编译单步解码（推理专用）.

@@ -14,6 +14,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
 | DeepSeek-V4.1 | CSA2 跨层 KV 复用 | `mla.py`/`sparse_attn.py`：Full/Reuse 交替，Reuse 借最近 Full 层 latent（`csa_reuse_every`，默认 1=关） |
 | DeepSeek-V4.1 | 3×3 pixel-unshuffle 视觉压缩 | `vision_compress.py`：`vision_unshuffle=3` 先按 3×3 重排降采样，视觉 token /9（默认 1=关） |
+| DeepSeek DSpark | 置信调度验证（spec decoding） | `spec_decode.py`：按草稿存活置信度动态定验证长度，截断必被拒后缀（`dspark_enabled`，默认关） |
 | Qwen3-Next | Hybrid 注意力（全/线性交替） | `block.py`：每 4 层 1 层 MLA，其余 `GatedDeltaLite` 线性层 |
 | Qwen3 系 | QK-Norm、短卷积 | MLA/线性层均有 RMSNorm；线性层 K/V 加 depthwise 短卷积 |
 | Qwen/DeepSeek 通用 | RoPE + YaRN 外推 | `rope.py`：`yarn_scale` 稀释高频，8k 上下文 |
@@ -318,7 +319,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 
 | 开关（默认） | 作用 | 文件 |
 |---|---|---|
-| `draft_enabled`(False) / `draft_window`(5) / `draft_source`(hybrid) / `draft_ngram_min`(2) | 投机解码：MTP+n-gram 起草 + 主干并行验证，输出=逐 token 贪心 | `spec_decode.py` |
+| `draft_enabled`(False) / `draft_window`(5) / `draft_source`(hybrid) / `draft_ngram_min`(2) / `dspark_enabled`(False) / `dspark_conf_threshold`(0.5) / `dspark_min_verify`(1) | 投机解码：MTP+n-gram 起草 + 主干并行验证（DSpark 置信调度验证），输出=逐 token 贪心 | `spec_decode.py` |
 | `offload_enabled`(False) / `offload_target`(cpu) / `offload_dir`("") / `offload_capacity`(0) / `offload_prefetch`(False) | 专家 offload 到 CPU/磁盘 + LRU 淘汰（capacity≤0 时全驻留→分组快路径） | `offload.py` |
 | `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
 | `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
@@ -332,6 +333,10 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   部分接受靠 `_decode_multi` 返回的 `step_pasts[i]` 直接跳位（零重放）。
   实测加速：普通对话 ~1.45–1.5x、代码 ~1.6–1.7x（MTP 首猜命中 ~0.6–0.8）；
   ngram 单用净亏（首猜命中 ~0.04），故 `hybrid` 仅在 ngram 与 MTP 首猜一致时采纳其更长续写。
+  **DSpark 置信调度**（`dspark_enabled`，默认关）：给每个草稿 token 一个存活置信度
+  （MTP=softmax 最大概率、ngram=`m/(m+1)`），只验证累计存活概率 ≥ `dspark_conf_threshold`
+  的最长前缀，提前截断"必被拒"后缀以省验证算力；不改输出（仍等于贪心），
+  `threshold<=0` 即退化回固定窗口。细节见 `docs/details/speculative-decoding.md`。
 - **专家 offload**：开启后 MoE 从分组 bmm 切到"只算命中专家"的逐专家路径，数值一致；
   逐个 `ensure`（`capacity<命中数` 也不会误用已置 meta 的专家）；磁盘目标落盘文件按
   层命名空间隔离（`layer{li}_{i}.pt`），多层共用目录不互相覆盖；`capacity≤0`（声明
