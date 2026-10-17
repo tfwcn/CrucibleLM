@@ -73,6 +73,20 @@ class SmallLLMConfig:
     # 超连接残差：0=关闭（标准单流残差）；≥2=n 路流混合（mHC-lite，见 hyperconn.py）
     hyper_streams: int = 0
 
+    # ===== Engram 条件记忆（n-gram 哈希查表，默认关；见 engram.py / docs/details/engram.md）=====
+    # 每 N 层插一个 Engram（论文最优在少数早期层）；0=关闭（无参数，旧 checkpoint 兼容）
+    engram_every: int = 0
+    # N-gram 阶（逗号分隔，须 ≥2）：n 表示用"过去 n-1 个 token + 当前"查表
+    engram_orders: str = "2,3"
+    # 每阶哈希头数（各头不同 seed → 分散碰撞）
+    engram_heads: int = 2
+    # 拼接后记忆向量维度 d_mem（须被 阶数×头数 整除）
+    engram_d_mem: int = 64
+    # 每头哈希表大小（须为素数，抗碰撞）
+    engram_table_size: int = 8191
+    # 短因果卷积核（0=不做卷积；论文 kernel=4）
+    engram_conv: int = 4
+
     # ===== 投机解码（推理加速，默认关；见 spec_decode.py / docs/details/speculative-decoding.md）=====
     # 关闭时生成路径逐位不变（单测锁定）
     draft_enabled: bool = False
@@ -112,11 +126,24 @@ class SmallLLMConfig:
     # 压缩方式：avgpool（自适应平均池化，无参数查询）/ perceiver（可学习查询 cross-attention）
     vision_compress: str = "avgpool"
     vision_d_in: int = 3  # 输入通道（RGB=3）
+    # 3×3 pixel-unshuffle（DeepSeek-V4.1）：r>1 时先按 r×r 重排降采样，patch 数除以 r²
+    # （r=3 → 视觉 token 省 9x）；1 表示不做（默认，逐位兼容）
+    vision_unshuffle: int = 1
 
     @property
     def head_dim(self) -> int:
         """每个头的维度."""
         return self.d_model // self.n_heads
+
+    @property
+    def engram_order_list(self) -> list[int]:
+        """解析 `engram_orders`（"2,3" → [2, 3]），忽略空项."""
+        out: list[int] = []
+        for part in str(self.engram_orders).split(","):
+            part = part.strip()
+            if part:
+                out.append(int(part))
+        return out
 
     def is_full_attn_layer(self, layer_idx: int) -> bool:
         """判断某层是否为 MLA 全注意力层（其余为线性注意力层）."""

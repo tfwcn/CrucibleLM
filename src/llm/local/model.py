@@ -19,6 +19,8 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
     use_retro = (config.retro_enabled and config.retro_every > 0
                  and layer_idx % config.retro_every == 0)
     use_hyper = config.hyper_streams >= 2
+    use_engram = (config.engram_every > 0
+                  and layer_idx % config.engram_every == 0)
     return HybridBlock(
         d_model=config.d_model,
         n_heads=config.n_heads,
@@ -47,6 +49,13 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         use_retro=use_retro,
         retro_heads=config.retro_heads,
         hyper_streams=config.hyper_streams if use_hyper else 0,
+        use_engram=use_engram,
+        engram_orders=config.engram_order_list,
+        engram_heads=config.engram_heads,
+        engram_d_mem=config.engram_d_mem,
+        engram_table_size=config.engram_table_size,
+        engram_conv=config.engram_conv,
+        vocab_size=config.vocab_size,
     )
 
 
@@ -100,7 +109,7 @@ class TinyLLM(nn.Module):
             self.vision = VisionCompressor(
                 config.d_model, config.vision_d_in, config.vision_patch,
                 config.vision_tokens, config.vision_compress, config.n_heads,
-                config.dropout)
+                config.dropout, config.vision_unshuffle)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -150,10 +159,17 @@ class TinyLLM(nn.Module):
                 "（RoPE 缓存盖不住）：请调大 max_seq_len 或直接用 longctx_config()（200K 预设）"
             )
         h = self.embed(input_ids)
+        # Engram 上下文 id（右对齐到 h 末位）；有视觉前缀时视觉位置用词表外哨兵占位，
+        # 文本 token 仍与 h 的文本段对齐（首个文本 token 的 n-gram 以哨兵打底）
+        engram_ids = input_ids
         # 视觉前缀（结构预留，默认 None）：视觉 token 已投影到 d_model，拼在文本前。
         # 训练时（targets 非空）视觉段不参与 loss：logits 只取文本段错位一位对齐
         if v_len:
             h = torch.cat([vision_embeds.to(h.dtype), h], dim=1)
+            engram_ids = torch.cat([
+                input_ids.new_full((input_ids.shape[0], v_len),
+                                   self.config.vocab_size),
+                input_ids], dim=1)
         # 超连接：embedding 展开成 n 路流（各路初始相同，对称性由 H 参数打破）；
         # 模块（注意/MoE/记忆/retro）只看均值流，FLOP 不变
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
@@ -177,9 +193,11 @@ class TinyLLM(nn.Module):
             # 梯度检查点只在训练时生效（推理/生成走正常路径，保留解码缓存）；
             # 训练不返回解码缓存（return_state=False），省状态循环与两次投影
             if self.config.grad_ckpt and self.training:
-                h, aux_total = self._layer_ckpt(layer, h, aux_total, retro_mem)
+                h, aux_total = self._layer_ckpt(
+                    layer, h, aux_total, retro_mem, engram_ids)
             else:
-                h, (_, aux) = layer(h, None, False, retro_mem)
+                h, (_, aux) = layer(h, None, False, retro_mem,
+                                    engram_ids=engram_ids)
                 aux_total = aux_total + aux
         if hyper_n:
             h = h.mean(dim=2)  # 流聚合（均值即 H_pre，论文消融默认）
@@ -229,6 +247,34 @@ class TinyLLM(nn.Module):
         """是否有 V2 交错融合层（retro_enabled 且 retro_every>0）."""
         return bool(self.config.retro_enabled and self.config.retro_every > 0)
 
+    def _has_engram(self) -> bool:
+        """是否有 Engram 条件记忆层（engram_every>0）."""
+        return any(getattr(layer, "engram", None) is not None for layer in self.layers)
+
+    def _engram_lookback(self) -> int:
+        """Engram 解码所需的最小右对齐上下文长度（卷积感受野 + 最大 N-gram 阶）."""
+        best = 0
+        for layer in self.layers:
+            eng = getattr(layer, "engram", None)
+            if eng is not None:
+                best = max(best, eng.lookback)
+        return best
+
+    def _engram_block_ids(
+        self, ctx_ids: torch.Tensor, tokens: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """拼 Engram 右对齐上下文 `ctx_ids` + `tokens`（无 Engram 层返回 None）.
+
+        `_decode_step`/`_decode_multi` 只对末 `len(tokens)` 位算 n-gram；这里补足
+        前 `lookback` 个 token，避免每步重扫全史（卷积+哈希都只依赖 id，无状态）。
+        """
+        if not self._has_engram():
+            return None
+        n = self._engram_lookback()
+        if n <= 0:
+            return tokens
+        return torch.cat([ctx_ids[:, -n:], tokens], dim=1)
+
     def hyper_gain(self) -> float | None:
         """超连接复合 Amax 增益（论文 Fig.3/7 指标），无超连接返回 None.
 
@@ -248,12 +294,14 @@ class TinyLLM(nn.Module):
     def _layer_ckpt(
         self, layer: HybridBlock, h: torch.Tensor, aux_total: torch.Tensor,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        engram_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """单层梯度检查点：重算换显存（训练 past=None，不用解码缓存）."""
         from torch.utils.checkpoint import checkpoint
 
         def fn(hh: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            out, (_, aux) = layer(hh, None, False, retro_mem)
+            out, (_, aux) = layer(hh, None, False, retro_mem,
+                                  engram_ids=engram_ids)
             return out, aux
 
         h_new, aux = checkpoint(fn, h, use_reentrant=False)
@@ -304,7 +352,8 @@ class TinyLLM(nn.Module):
             h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         pasts: list = []
         for layer in self.layers:
-            h, (p, _) = layer(h, retro_mem=retro_mem, reserve=reserve)
+            h, (p, _) = layer(h, retro_mem=retro_mem, reserve=reserve,
+                              engram_ids=input_ids)
             pasts.append(p)
         if hyper_n:
             h = h.mean(dim=2)
@@ -352,8 +401,12 @@ class TinyLLM(nn.Module):
     def _decode_step(
         self, nxt: torch.Tensor, pasts: list,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+        engram_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list]:
-        """单 token 步进各层：返回 (新 hidden, 新缓存），供流式/批量生成共用."""
+        """单 token 步进各层：返回 (新 hidden, 新缓存），供流式/批量生成共用.
+
+        engram_ids: Engram 上下文 id（(b, L≥max_order)，右对齐到本步 token）。
+        """
         hh = self.embed(nxt)
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
         if hyper_n:
@@ -364,9 +417,13 @@ class TinyLLM(nn.Module):
             # 为复用逻辑，重新拼 block 前向（单 token 开销可忽略）
             xxs = hh
             hh_in = layer.hyper.pre_mix(hh) if hyper_n and layer.hyper is not None else hh
-            hh_norm = layer.norm1(hh_in)
+            hh = hh_in
+            if layer.engram is not None and engram_ids is not None:
+                # Engram 与 block.forward 同序（注意力之前残差并联）
+                hh = layer.engram(hh, engram_ids)
+            hh_norm = layer.norm1(hh)
             a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
-            hh = hh_in + a_out
+            hh = hh + a_out
             m_out, _ = layer.moe(layer.norm2(hh))
             hh = hh + m_out
             if layer.memory is not None:
@@ -389,7 +446,8 @@ class TinyLLM(nn.Module):
     def _decode_multi(
         self, tokens: torch.Tensor, pasts: list,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
-    ) -> tuple[torch.Tensor, list]:
+        engram_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list, list]:
         """并行验证：一次前向喂 t 个 token，返回 (全段 hidden (b,t,d), 新缓存).
 
         投机解码专用：与逐 token `_decode_step` **同一算术**（MLA 多查询 SDPA
@@ -410,11 +468,15 @@ class TinyLLM(nn.Module):
         for li, (layer, p) in enumerate(zip(self.layers, pasts)):
             xxs = hh
             hh_in = layer.hyper.pre_mix(hh) if hyper_n and layer.hyper is not None else hh
-            hh_norm = layer.norm1(hh_in)
+            hh = hh_in
+            if layer.engram is not None and engram_ids is not None:
+                # Engram 与 block.forward 同序（并行验证的算术也必须一致）
+                hh = layer.engram(hh, engram_ids)
+            hh_norm = layer.norm1(hh)
             a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
             if isinstance(layer.attn, GatedDeltaLite):
                 lin_steps[li] = layer.attn.multi_steps
-            hh = hh_in + a_out
+            hh = hh + a_out
             m_out, _ = layer.moe(layer.norm2(hh))
             hh = hh + m_out
             if layer.memory is not None:
@@ -484,7 +546,9 @@ class TinyLLM(nn.Module):
             drafts = provider.propose(ctx, h[:, -1:], k) if k > 0 else []
             feed = [t0] + list(drafts)
             y = torch.tensor([feed], dtype=torch.long, device=dev)
-            h_multi, _, step_pasts = self._decode_multi(y, pasts)
+            eids = self._engram_block_ids(ctx_t, y)
+            h_multi, _, step_pasts = self._decode_multi(
+                y, pasts, engram_ids=eids)
             # 验证：逐位比草稿与主干贪心（seen 上下文逐步累积，惩罚口径一致）
             accepted = 0
             seen = list(ctx)
@@ -557,10 +621,11 @@ class TinyLLM(nn.Module):
         for _ in range(max_new_tokens):
             nxt = self._sample_next(h[:, -1:], temperature, top_k,
                                     repetition_penalty, cur)
+            eids = self._engram_block_ids(cur, nxt)
             cur = torch.cat([cur, nxt], dim=1)
             if eos_id is not None and bool((nxt == eos_id).all()):
                 break
-            h, pasts = self._decode_step(nxt, pasts)
+            h, pasts = self._decode_step(nxt, pasts, engram_ids=eids)
         return cur
 
     @torch.no_grad()
@@ -592,11 +657,12 @@ class TinyLLM(nn.Module):
                        else input_ids)
                 nxt = self._sample_next(h[:, -1:], temperature, top_k,
                                         repetition_penalty, cur)
+                eids = self._engram_block_ids(cur, nxt)
                 yield int(nxt[0, 0])
                 if eos_id is not None and bool((nxt == eos_id).all()):
                     break
                 seen.append(nxt)
-                h, pasts = self._decode_step(nxt, pasts)
+                h, pasts = self._decode_step(nxt, pasts, engram_ids=eids)
         finally:
             if was_training:
                 self.train()
@@ -613,7 +679,7 @@ class TinyLLM(nn.Module):
         if hyper_n:
             h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         for layer in self.layers:
-            h, _ = layer(h, None, False)
+            h, _ = layer(h, None, False, engram_ids=input_ids)
         if hyper_n:
             h = h.mean(dim=2)
         return self.final_norm(h)
@@ -686,10 +752,20 @@ class TinyLLM(nn.Module):
             sum(p.numel() for p in layer.hyper.parameters())
             for layer in self.layers
             if getattr(layer, "hyper", None) is not None)
+        # Engram：只有投影/卷积/归一参与计算，查表每 token 仅 gather 一行（d_mem），
+        # 巨大的哈希表不进"激活参数"
+        engram_active = 0
+        for layer in self.layers:
+            eng = getattr(layer, "engram", None)
+            if eng is None:
+                continue
+            table = sum(t.weight.numel() for t in eng.tables)
+            engram_active += (sum(p.numel() for p in eng.parameters())
+                              - table + c.engram_d_mem)
         active = (
             self.embed.weight.numel()
             + per_layer_active * c.n_layers
-            + mem_active + retro_active + hyper_active
+            + mem_active + retro_active + hyper_active + engram_active
             + self.final_norm.weight.numel()
             + (0 if c.tie_embeddings else self.lm_head.weight.numel())
         )

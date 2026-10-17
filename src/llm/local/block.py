@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from src.llm.local.engram import EngramMemory
 from src.llm.local.linear_attn import GatedDeltaLite
 from src.llm.local.hyperconn import HyperConnRes
 from src.llm.local.memory import ProductKeyMemory
@@ -46,6 +47,13 @@ class HybridBlock(nn.Module):
         use_retro: bool = False,
         retro_heads: int = 8,
         hyper_streams: int = 0,
+        use_engram: bool = False,
+        engram_orders: tuple[int, ...] | list[int] = (2, 3),
+        engram_heads: int = 2,
+        engram_d_mem: int = 64,
+        engram_table_size: int = 8191,
+        engram_conv: int = 4,
+        vocab_size: int = 8192,
     ):
         super().__init__()
         self.full_attn = full_attn
@@ -82,6 +90,12 @@ class HybridBlock(nn.Module):
             HyperConnRes(d_model, hyper_streams)
             if hyper_streams >= 2 else None
         )
+        # Engram 条件记忆（默认 None；开后在注意力之前残差并联，恒等起点）
+        self.engram: EngramMemory | None = (
+            EngramMemory(d_model, vocab_size, engram_orders, engram_heads,
+                         engram_d_mem, engram_table_size, engram_conv, dropout)
+            if use_engram else None
+        )
 
     def forward(
         self,
@@ -90,6 +104,7 @@ class HybridBlock(nn.Module):
         return_state: bool = True,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
         reserve: int = 0,
+        engram_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
         """前向：past 为解码缓存（MLA 传 latent 元组，线性层传状态矩阵）.
 
@@ -97,11 +112,17 @@ class HybridBlock(nn.Module):
         retro_mem=(mem_h, mem_mask)：V2 交错融合的 frozen chunk 编码；
         None 或本层无融合块时跳过（backbone 本体，评测/生成路径）。
         reserve: prefill 预留总长（只用于全注意力静态缓存装箱；线性层忽略）。
+        engram_ids: 本层 Engram 的上下文 token id（(b,L)，右对齐到 h 末位）；
+        None 或本层无 Engram 时跳过。
         h: 无超连接时 (b, t, d)；有超连接时 (b, t, n, d) n 路流。
         """
         xs = h
         h_in = self.hyper.pre_mix(h) if self.hyper is not None else h
         h = h_in
+        if self.engram is not None and engram_ids is not None:
+            # Engram 在注意力之前：先把静态模式"查"出来（论文：早期注入最优，
+            # 替主干省下早期层的特征组装）；h_in 不变，超连接写回仍以 h_in 为基准
+            h = self.engram(h, engram_ids)
         if past is None and self.full_attn:
             a_out, new_past = self.attn(  # type: ignore[call-arg]
                 self.norm1(h), past, return_state, reserve)

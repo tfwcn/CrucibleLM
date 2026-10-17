@@ -8,6 +8,10 @@
 职责边界：本模块只管"图像 → 视觉 token 序列"这一段结构，
 不含图像编码器预训练配方；默认关（`vision_enabled=False`）时模型里
 根本不存在该模块，旧 checkpoint 逐位兼容（与 memory/retro 同风格）。
+
+视觉侧借鉴 DeepSeek-V4.1 的 **3×3 pixel-unshuffle**：先把每个 r×r 邻域重排进通道
+（空间分辨率降到 1/r，patch 数除以 r²），再 patchify/压缩，`vision_unshuffle=r`
+（默认 1 = 不做、逐位不变）。这是论文里把视觉 token 数直接 /9 的那一步。
 """
 
 from __future__ import annotations
@@ -80,14 +84,22 @@ class VisionCompressor(nn.Module):
         mode: str = "avgpool",
         n_heads: int = 4,
         dropout: float = 0.0,
+        unshuffle: int = 1,
     ):
         super().__init__()
         if mode not in ("avgpool", "perceiver"):
             raise ValueError(f"vision_compress 须为 avgpool/perceiver，当前 {mode}")
+        if int(unshuffle) < 1:
+            raise ValueError(
+                f"vision_unshuffle 须 ≥1（1=不做像素重排），当前 {unshuffle}")
         self.mode = mode
         self.patch = int(patch)
         self.n_tokens = int(n_tokens)
-        self.patch_embed = nn.Linear(in_channels * patch * patch, d_model)
+        # 3×3 pixel-unshuffle（DeepSeek-V4.1）：把每个 r×r 邻域重排进通道，空间分辨率
+        # 降到 1/r、patch 数除以 r²（r=3 → 视觉 token 省 9x）；r=1 时跳过、逐位不变。
+        self.unshuffle = int(unshuffle)
+        c_eff = in_channels * self.unshuffle * self.unshuffle
+        self.patch_embed = nn.Linear(c_eff * patch * patch, d_model)
         # 位置嵌入按最大 4096 patch 预留（足够 2048×2048/patch16=16384? 取 4096 覆盖常见尺寸）
         self.pos_embed = nn.Parameter(torch.zeros(1, 4096, d_model))
         nn.init.normal_(self.pos_embed, std=0.02)
@@ -99,7 +111,17 @@ class VisionCompressor(nn.Module):
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """(B,C,H,W) → (B, n_tokens, d_model)."""
-        tokens = patchify(images, self.patch)  # (B,N,C*P*P)
+        if self.unshuffle > 1:
+            r = self.unshuffle
+            if images.dim() != 4:
+                raise ValueError(f"期望 (B,C,H,W)，实际 {tuple(images.shape)}")
+            h, w = images.shape[-2], images.shape[-1]
+            if h % r or w % r:
+                raise ValueError(
+                    f"H/W({h},{w}) 必须是 unshuffle({r}) 的整数倍")
+            # 像素重排： (B,C,H,W) → (B, C*r², H/r, W/r)，随后 patch 数除以 r²
+            images = F.pixel_unshuffle(images, r)
+        tokens = patchify(images, self.patch)  # (B,N,C'*P*P)
         n = tokens.shape[1]
         if n > self.pos_embed.shape[1]:
             raise ValueError(

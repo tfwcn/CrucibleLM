@@ -29,7 +29,7 @@
 - 文件：`vision_compress.py`（`patchify`/`unpatchify` + `VisionCompressor`）、
   `model.py`（`TinyLLM.vision` 可选模块 + `encode_vision` + `forward(vision_embeds=...)`）；
 - 配置：`vision_enabled`（默认关）、`vision_tokens`、`vision_patch`、
-  `vision_compress`、`vision_d_in`；
+  `vision_compress`、`vision_d_in`、`vision_unshuffle`；
 - 默认关时模型里根本不存在该模块，`state_dict` 与旧 checkpoint 逐位兼容
   （与 memory/retro 的"默认 None"同风格）；
 - **推理**：`encode_vision`（`no_grad`）+ `forward(vision_embeds=...)`，视觉 token
@@ -41,10 +41,26 @@
 - 训练侧入口 `train.py:train_step(..., vision_images=...)`：经 `model.vision`（**带梯度**）
   编码，编码器参数一起吃梯度（`encode_vision` 是 no_grad 的推理版，勿用于训练）。
 
+### 3×3 pixel-unshuffle 预降采样（借鉴 DeepSeek-V4.1）
+
+论文在视觉前段先做一次 **3×3 pixel-unshuffle**：把每个 3×3 邻域按顺序重排进通道
+（空间分辨率降到 1/3），**patch 数直接除以 9**，再送 MLP 投影——这是它把视觉 token
+数压下来的那一步。我们等价移植为 `vision_unshuffle=r`（默认 1=不做）：
+
+```
+images (B,C,H,W) --pixel_unshuffle(r)--> (B, C*r², H/r, W/r) --patchify--> patch 数 /r²
+```
+
+`r=1` 时跳过该步、输入通道不变，与旧行为逐位一致（单测 `..._unshuffle1_matches_reference`
+卡死）；`r=3` 时 `patch_embed` 的输入通道自动变成 `C*9`。要求 `H/W` 同时被 `r` 与
+`patch` 整除，否则前向报错（fail-fast）。
+
 ## 从想法到代码
 
 ```python
-tokens = patchify(images, self.patch)              # (B,N,C*P*P)
+if self.unshuffle > 1:                              # 3×3 pixel-unshuffle（默认 1=跳过）
+    images = F.pixel_unshuffle(images, self.unshuffle)     # (B,C,H,W)→(B,C*9,H/3,W/3)
+tokens = patchify(images, self.patch)              # patch 数随 r² 减少
 h = self.patch_embed(tokens) + self.pos_embed[:, :N]
 pooled = F.adaptive_avg_pool1d(h.transpose(1, 2), self.n_tokens)   # avgpool 路径
 return self.out_norm(pooled.transpose(1, 2))       # (B, n_tokens, d_model)

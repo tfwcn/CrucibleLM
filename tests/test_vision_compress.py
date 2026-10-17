@@ -4,6 +4,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+import torch.nn.functional as F
+
 from src.llm.local.config import tiny_test_config
 from src.llm.local.model import TinyLLM
 from src.llm.local.vision_compress import (
@@ -63,6 +65,69 @@ def test_compressor_invalid_mode():
     """非法压缩方式：构建即报错."""
     with pytest.raises(ValueError, match="avgpool/perceiver"):
         VisionCompressor(d_model=16, mode="magic")
+
+
+def test_unshuffle_reduces_patch_count():
+    """3×3 pixel-unshuffle：patch 数除以 r²（24×24/patch4：36 → 4）."""
+    x = torch.randn(1, 3, 24, 24)
+    assert patchify(x, 4).shape[1] == 36
+    reduced = F.pixel_unshuffle(x, 3)
+    assert reduced.shape == (1, 27, 8, 8)      # C*9, H/3, W/3
+    assert patchify(reduced, 4).shape[1] == 4  # (8/4)²
+
+
+@pytest.mark.parametrize("mode", ["avgpool", "perceiver"])
+def test_compressor_unshuffle_shapes(mode):
+    """开 unshuffle=3 仍输出固定 token 数并投影到 d_model，数值有限."""
+    c = VisionCompressor(d_model=32, patch=4, n_tokens=8, mode=mode, unshuffle=3)
+    c.eval()
+    with torch.no_grad():
+        out = c(torch.randn(2, 3, 24, 24))  # 缩到 (8×8)/patch4 = 4 patch
+    assert out.shape == (2, 8, 32)
+    assert torch.isfinite(out).all()
+
+
+def test_compressor_unshuffle_validation():
+    """unshuffle<1 或 H/W 非整数倍：构建/前向报错（fail-fast）."""
+    with pytest.raises(ValueError, match="vision_unshuffle"):
+        VisionCompressor(d_model=16, unshuffle=0)
+    c = VisionCompressor(d_model=16, patch=4, n_tokens=4, unshuffle=3)
+    with pytest.raises(ValueError, match="整数倍"):
+        c(torch.randn(1, 3, 24, 20))  # 20 不被 3 整除
+
+
+def test_compressor_unshuffle1_matches_reference():
+    """unshuffle=1（默认）路径与"无重排"的参考实现逐位一致（旧行为不变）."""
+    c = VisionCompressor(d_model=16, patch=4, n_tokens=4, mode="avgpool")
+    c.eval()
+    x = torch.randn(1, 3, 16, 16)
+    with torch.no_grad():
+        out = c(x)
+        # 参考：不做 unshuffle，直接 patchify → embed → 池化
+        t = patchify(x, 4)
+        h = c.patch_embed(t) + c.pos_embed[:, :t.shape[1], :]
+        pooled = F.adaptive_avg_pool1d(
+            h.transpose(1, 2), c.n_tokens).transpose(1, 2)
+        ref = c.out_norm(pooled)
+    assert torch.equal(out, ref)
+
+
+def test_vision_model_unshuffle_config():
+    """模型层接线：vision_unshuffle 透传到编码器且输出有限."""
+    torch.manual_seed(0)
+    cfg = tiny_test_config()
+    cfg.vision_enabled = True
+    cfg.vision_tokens = 4
+    cfg.vision_patch = 4
+    cfg.vision_unshuffle = 3
+    m = TinyLLM(cfg)
+    m.eval()
+    assert m.vision.unshuffle == 3
+    with torch.no_grad():
+        ve = m.encode_vision(torch.randn(1, 3, 24, 24))
+    assert ve.shape == (1, 4, cfg.d_model)
+    assert torch.isfinite(ve).all()
+
 
 
 def test_vision_perceiver_grad_finite():

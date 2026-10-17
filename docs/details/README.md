@@ -28,6 +28,7 @@
 ## 外挂记忆与检索
 
 - [Product-Key 记忆层](./memory.md)
+- [Engram 条件记忆（n-gram 哈希）](./engram.md)
 - [RETRO：开卷考试](./retro.md)
 - [SessionCache：跨 turn 存折](./session-cache.md)
 

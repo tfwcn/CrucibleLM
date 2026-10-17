@@ -124,6 +124,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--memory-every", type=int, default=4, help="记忆层插入间隔（N 层一个）")
     p.add_argument("--memory-slots", type=int, default=4096, help="记忆槽位数")
     p.add_argument("--memory-topk", type=int, default=8, help="每 token 激活槽数")
+    p.add_argument("--engram-every", type=int, default=0,
+                   help="Engram 条件记忆：每 N 层插一个（0=关闭；论文推荐只放少数早期层）")
+    p.add_argument("--engram-orders", default="2,3",
+                   help="Engram 的 N-gram 阶（逗号分隔，须 ≥2，如 2,3）")
+    p.add_argument("--engram-heads", type=int, default=2, help="每阶哈希头数")
+    p.add_argument("--engram-d-mem", type=int, default=64,
+                   help="拼接后记忆维（须被 阶数×头数 整除）")
+    p.add_argument("--engram-table-size", type=int, default=8191,
+                   help="每头哈希表大小（须素数，抗碰撞）")
+    p.add_argument("--engram-conv", type=int, default=4,
+                   help="短因果卷积核（0=不做卷积；作用在 id 决定的 V 上，解码无状态）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -659,6 +670,27 @@ def main(argv=None) -> int:
         config.hyper_streams = args.hyper_streams
         print(f"超连接残差已开：{config.hyper_streams} 路流（mHC-lite，恒等起点）",
               flush=True)
+    if args.engram_every:
+        from src.llm.local.engram import is_prime
+
+        config.engram_every = max(args.engram_every, 1)
+        config.engram_orders = args.engram_orders
+        config.engram_heads = args.engram_heads
+        config.engram_d_mem = args.engram_d_mem
+        config.engram_table_size = args.engram_table_size
+        config.engram_conv = max(args.engram_conv, 0)
+        if not is_prime(config.engram_table_size):
+            raise SystemExit(
+                f"--engram-table-size 须为素数，当前 {config.engram_table_size}"
+                "（可取 8191/65537）")
+        groups = len(config.engram_order_list) * config.engram_heads
+        if groups <= 0 or config.engram_d_mem % groups:
+            raise SystemExit(
+                f"--engram-d-mem 须被 阶数×头数={groups} 整除，"
+                f"当前 {config.engram_d_mem}")
+        print(f"Engram 已开：每 {config.engram_every} 层一个，阶 {config.engram_orders}，"
+              f"{config.engram_heads} 头/阶，表 {config.engram_table_size}（素数），"
+              f"卷积核 {config.engram_conv}（恒等起点）", flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0
     if args.resume:

@@ -11,6 +11,8 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek V3/V4 | MLA 低秩 KV 压缩 + 解耦 RoPE | `mla.py`：KV 压缩到 `kv_lora_rank=128` + 共享 rope 键，缓存省约 9x |
 | DeepSeek V3/V4 | 细粒度 MoE + 共享专家 | `moe.py`：16 小专家 top-4 + 1 共享专家 + aux 负载均衡 |
 | DeepSeek V3 | MTP 多 token 预测 | `model.py:MTPHead`：训练时额外预测 t+2，推理关闭 |
+| DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
+| DeepSeek-V4.1 | 3×3 pixel-unshuffle 视觉压缩 | `vision_compress.py`：`vision_unshuffle=3` 先按 3×3 重排降采样，视觉 token /9（默认 1=关） |
 | Qwen3-Next | Hybrid 注意力（全/线性交替） | `block.py`：每 4 层 1 层 MLA，其余 `GatedDeltaLite` 线性层 |
 | Qwen3 系 | QK-Norm、短卷积 | MLA/线性层均有 RMSNorm；线性层 K/V 加 depthwise 短卷积 |
 | Qwen/DeepSeek 通用 | RoPE + YaRN 外推 | `rope.py`：`yarn_scale` 稀释高频，8k 上下文 |
@@ -191,9 +193,20 @@ model = TinyLLM(longctx_config())  # 推理：generate() 支持 200K（含稀疏
 Muon 存盘与 AdamW 不互通，切换优化器删 `optim.pt` 重开动量即可（权重不受影响）；
 Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
 
-## 记忆层与 RETRO（`memory.py` / `retro.py`，可选，默认关）
+## 记忆层与 RETRO（`engram.py` / `memory.py` / `retro.py`，可选，默认关）
 
-三条外挂能力，默认全关，逐个 flag 放开，互不依赖：
+多条外挂能力，默认全关，逐个 flag 放开，互不依赖：
+
+- **Engram 条件记忆**（`--engram-every N --engram-orders 2,3 --engram-heads H
+  --engram-d-mem D --engram-table-size P --engram-conv K`）：与 MoE 并列的第二条稀疏轴。
+  每 N 层插一个 Engram，把局部 n-gram 经多头哈希查素数表取回记忆，用当前 hidden 门控后
+  残差加回（注意力之前）。`W_V`/卷积零初始化 → **恒等起点**，开开关不破坏已有权重。
+  只有投影/卷积/归一参与计算、表每 token 只 gather 一行（`d_mem`），故表再大也不涨激活
+  参数。注意卷积**放在门控之前**、作用在仅由 id 决定的 `V=W_V e` 上，换取解码**无跨步
+  状态**（否则要像线性层一样存卷积尾，`_decode_step` 得同步）；`_decode_step`/
+  `_decode_multi` 已同步接入，`prefill+逐 token 解码 == 全前向` 单测锁定。
+  `engram_table_size` 须素数、`engram_d_mem` 须被 阶数×头数 整除，否则启动报错。
+  细节见 `docs/details/engram.md`。
 
 - **Product-Key 记忆层**（`--enable-memory --memory-every N --memory-slots M
   --memory-topk K`）：每 N 层插一个记忆层，把 hidden 投到 M 个 slot 上取 top-K 读出。
@@ -307,7 +320,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `draft_enabled`(False) / `draft_window`(5) / `draft_source`(hybrid) / `draft_ngram_min`(2) | 投机解码：MTP+n-gram 起草 + 主干并行验证，输出=逐 token 贪心 | `spec_decode.py` |
 | `offload_enabled`(False) / `offload_target`(cpu) / `offload_dir`("") / `offload_capacity`(0) / `offload_prefetch`(False) | 专家 offload 到 CPU/磁盘 + LRU 淘汰（capacity≤0 时全驻留→分组快路径） | `offload.py` |
 | `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
-| `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线） | `vision_compress.py` |
+| `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
   实测自然语言 30–39%（不值得开）、代码 66%（值得开），**默认关、按负载决定**。
