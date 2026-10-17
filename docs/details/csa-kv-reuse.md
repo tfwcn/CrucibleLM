@@ -71,6 +71,20 @@ if reuse is not None:                       # prefill/训练：K/V 借共享 lat
     return self._forward_reuse(h, reuse, return_state)   # Q 自算，K/V 用 reuse
 ```
 
+## 实测记录（本机 128M 续训）
+
+与 Engram 同一套对照设置（真实 128M 中途权重续训，`seq_len=512`、`batch=8`、
+`lr=1e-4`、同一 seed 与数据顺序），基线 vs `csa_reuse_every=2`。
+
+**结果（600 步 ≈ 2.46M token）**：Reuse 版 `val_loss` 起于基线之上（末步 4.3347
+vs 4.3133，约 +0.021，此后 lr 已衰减到接近 0，差距基本冻结）。差距随训练在收窄
+（step 50 约 +0.046 → step 600 约 +0.021），符合预期：Reuse 层继承了"为全注意力
+训练好的"权重，却只借 Full 层的 latent，需要重新适配。
+
+**判读**：这次对照只说明"在很短预算内、衰减 lr 下，训练权重迁移到压缩结构后**未完全
+回补**"，不能说明收敛后的质量代价。要给它公正评价需要**更长预算 + 更平的 lr**，
+或直接从头训一个 Reuse 版。KV 侧的收益是确定的（见下），质量侧待补。
+
 ## 代价与坑
 
 - **必须紧跟一个 Full 源**：Reuse 层借用"最近的 Full 层"，所以第一个全注意力层永远
