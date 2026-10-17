@@ -208,7 +208,9 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   状态**（否则要像线性层一样存卷积尾，`_decode_step` 得同步）；`_decode_step`/
   `_decode_multi` 已同步接入，`prefill+逐 token 解码 == 全前向` 单测锁定。
   `engram_table_size` 须素数、`engram_d_mem` 须被 阶数×头数 整除，否则启动报错。
-  细节见 `docs/details/engram.md`。
+  **实测（本机 128M 续训，600/2500 步、表 8191/65521）：中性**——与基线 val_loss 差
+  全程 ±0.002，既不涨点也不掉点（单遍 Web 文本无 n-gram 重现 → 表无可学目标）；
+  详见 `docs/details/engram.md` 与 pitfalls 第 21 条。
 
 - **Product-Key 记忆层**（`--enable-memory --memory-every N --memory-slots M
   --memory-topk K`）：每 N 层插一个记忆层，把 hidden 投到 M 个 slot 上取 top-K 读出。
@@ -323,7 +325,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `offload_enabled`(False) / `offload_target`(cpu) / `offload_dir`("") / `offload_capacity`(0) / `offload_prefetch`(False) | 专家 offload 到 CPU/磁盘 + LRU 淘汰（capacity≤0 时全驻留→分组快路径） | `offload.py` |
 | `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
 | `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
-| `csa_reuse_every`(1) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent（2=KV 减半） | `mla.py`/`sparse_attn.py`/`model.py` |
+| `csa_reuse_every`(1) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，KV −33%） | `mla.py`/`sparse_attn.py`/`model.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
   实测自然语言 30–39%（不值得开）、代码 66%（值得开），**默认关、按负载决定**。
@@ -354,8 +356,10 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   留 1 个 Full，其余为 Reuse——借最近 Full 层的 latent 缓存出 K/V（只自算 Q）。Reuse 层
   与 Full 层**共享 `w_dkv`/`w_kr` 权重对象**（无死参数），仍保留各自的上投影/Q/输出；
   解码时 Reuse 层的缓存就是共享缓冲，只跳过写入。`kv_cache_bytes` 只计非 Reuse 层。
-  默认关时逐位兼容；开启后参数量变小、缓存下降。细节见
-  `docs/details/csa-kv-reuse.md`。
+  默认关时逐位兼容；开启后参数量变小、缓存下降。
+  **实测（本机 128M 续训 2500 步）**：8192 上下文 KV 8.75MB → 6.13MB（**−30%**），
+  代价 val_loss **+0.012（相对 +0.27%）**且收敛后不归零——是**可辩护的取舍，不是无损**。
+  细节见 `docs/details/csa-kv-reuse.md`。
 
 ## 直觉头/RAG（`heads.py` + `retrieval.py`，SFT 后启用）
 
