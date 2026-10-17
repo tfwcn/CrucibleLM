@@ -323,9 +323,10 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   不淘汰）时初始化即全量搬入、forward 退回分组快路径（避免"部分专家永远 meta"）。
 - **LES**：纯统计、零可训练参数；预测只影响搬运时序，不改变数值。cpu target + CUDA
   时走**独立 CUDA stream 异步搬运**（pinned 主副本 + event 等待，normal ensure 命中
-  时 `wait_event` 再用）；预取只回收"预取未用"的专家、**绝不淘汰工作集**，容量按
-  驻留集 `_resident` 计。实测随机（未训练）模型上中性偏负（预测不准 + 专家太小），
-  默认关；要变净收益需路由可预测 + 专家规模够大（见 `docs/details/les-expert-scheduling.md`）。
+  时 `wait_event` 再用）；预取**只填空槽、绝不淘汰任何专家**（含"预取未用"，否则
+  会 churn），容量按驻留集 `_resident` 计。实测真实 128M 上中性偏负（0.05–0.11x 慢；
+  瓶颈是逐专家 dispatch 而非搬运），默认关；要变净收益需 offload 是"省显存才能跑"
+  的刚需 + 路由可预测（见 `docs/details/les-expert-scheduling.md`）。
 - **视觉压缩**：默认关时模型无该模块、`state_dict` 兼容；**推理前缀 + 训练 loss 均已接线**
   （`forward(targets=..., vision_embeds=...)` 只算文本段错位一位；`train_step(vision_images=...)`
   经带梯度的 `model.vision` 编码），视觉段不进 CE。

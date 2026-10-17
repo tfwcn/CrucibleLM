@@ -160,12 +160,12 @@ def test_expert_store_prefetch_fills_but_never_evicts(tmp_path):
     assert s2.hot_ids() == [0, 1]
 
 
-def test_expert_store_prefetch_reclaims_only_unused(tmp_path):
-    """预取可回收"预取未用"的空位，但绝不回收工作集；prefetch 与 ensure 不重复搬运."""
+def test_expert_store_prefetch_fills_free_slots_only(tmp_path):
+    """预取只填空槽、绝不淘汰任何专家；prefetch 与 ensure 不重复搬运."""
     m = _moe()
     store = ExpertStore(m.experts, "cpu", target="disk",
                         offload_dir=str(tmp_path), capacity=3)
-    # 预取 [5,6]：工作集为空，直接填空位（驻留 2）
+    # 预取 [5,6]：工作集为空，直接填空槽（驻留 2）
     store.ensure([5, 6], prefetch=True)
     assert store._resident == {5, 6}
     assert store.hot_ids() == []  # 预取不进工作集
@@ -183,29 +183,45 @@ def test_expert_store_prefetch_reclaims_only_unused(tmp_path):
     # 补一个预取占满容量（resident 3）
     store.ensure([0], prefetch=True)
     assert store._resident == {0, 5, 6}
-    # 容量满：预取 1 回收"预取未用"的 0（不动工作集 5/6）
+    # 容量满：预取 1 不淘汰任何专家（含"预取未用"的 0）→ 跳过
+    moves = store.moves
     store.ensure([1], prefetch=True)
-    assert store._resident == {1, 5, 6}
-    assert store.hot_ids() == [5, 6]
-    # 正常 ensure([7]) 腾位：优先回收"预取未用"的 1，不动工作集
-    store.ensure([7])
     assert 1 not in store._resident
+    assert store._resident == {0, 5, 6}
+    assert store.moves == moves
+    # 正常 ensure([7]) 腾位：优先回收"预取未用"的 0（不重复搬运不变量已被上面覆盖）
+    store.ensure([7])
+    assert 0 not in store._resident
     assert store.hot_ids() == [5, 6, 7]
 
 
-def test_expert_store_prefetch_reclaim_unused_slot(tmp_path):
-    """容量满且存在"预取未用"时，预取可回收其空位继续预取."""
+def test_expert_store_prefetch_no_churn_when_capacity_generous(tmp_path):
+    """容量宽裕时预取不应反复搬入/回收（回归：曾致真实 128M 搬运 173→9382）."""
+    m = _moe()
+    store = ExpertStore(m.experts, "cpu", target="disk",
+                        offload_dir=str(tmp_path), capacity=6)  # > 工作集
+    # 模拟工作集 {0,1}，反复预取互不相同的专家：预取只在空槽时搬入，不淘汰
+    store.ensure([0, 1])
+    for k in range(2, 8):
+        store.ensure([k], prefetch=True)
+    # 预取最多把空槽（6-2=4 个）填满，之后跳过；绝不出现反复搬运
+    assert len(store._resident) <= 6
+    assert store.hot_ids() == [0, 1]  # 工作集未被预取扰动
+
+
+def test_expert_store_prefetch_skips_when_full_without_evict(tmp_path):
+    """容量满时预取跳过（不回收"预取未用"，避免 churn）；工作集不受扰动."""
     m = _moe()
     store = ExpertStore(m.experts, "cpu", target="disk",
                         offload_dir=str(tmp_path), capacity=2)
     store.ensure([0])            # 工作集 {0}，驻留 {0}
     store.ensure([5], prefetch=True)  # 驻留 {0,5}，5 为预取未用
     assert store._resident == {0, 5}
-    # 容量满：预取 6 可回收未用的 5（不动工作集 0）
+    moves = store.moves
+    # 容量满：预取 6 直接跳过（既不回收未用 5，也不动工作集 0）
     store.ensure([6], prefetch=True)
-    assert 0 in store._resident
-    assert 5 not in store._resident
-    assert 6 in store._resident
+    assert store._resident == {0, 5}
+    assert store.moves == moves
     assert store.hot_ids() == [0]
 
 

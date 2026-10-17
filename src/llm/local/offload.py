@@ -142,19 +142,16 @@ class ExpertStore:
         self._hot.pop(i, None)
         self.moves += 1
 
-    def _evict_victim(self, protect: set[int], unused_only: bool = False) -> bool:
+    def _evict_victim(self, protect: set[int]) -> bool:
         """挑一个专家腾位，返回是否成功淘汰.
 
         - 优先"预取但未用"（`_resident−_hot`）——它们是投机搬运，可随时回收；
-        - `unused_only=False`（正常 ensure）时若无可回收的，再退 LRU 工作集；
-        - `unused_only=True`（预取）时**绝不退工作集**，返回 False 让调用方跳过。
+        - 无可回收的再退 LRU 工作集（队首 = 最久未用）；
         protect（当前正要加载的专家号）绝不淘汰。
         """
         for i in [r for r in self._resident if r not in self._hot and r not in protect]:
             self._evict(i)
             return True
-        if unused_only:
-            return False
         for i in list(self._hot.keys()):  # 队首 = 最久未用
             if i not in protect:
                 self._evict(i)
@@ -166,12 +163,13 @@ class ExpertStore:
 
         容量按 `_resident`（含预取）计，避免预取把显存撑爆。
 
-        `prefetch=True`（LES 预取）：**只填空闲容量，绝不淘汰工作集**。预取是为
-        把搬运延迟藏到计算前，若它反而把"马上要用的专家"挤回冷端，就会凭空多出
-        搬运（实测预取+淘汰使 moves 翻 3 倍、吞吐减半）。故：
-          - 容量满时有"预取未用"的可回收，回收之；
-          - 没有可回收的（工作集占满），直接跳过，淘汰权留给真正要用专家的那步；
-          - 预取**不更新 `_hot`**，不改变工作集的"最近使用"时序。
+        `prefetch=True`（LES 预取）：**只填空槽，绝不淘汰任何专家**。预取是为把搬运
+        延迟藏到计算前；若它反而淘汰（无论是工作集还是"预取未用"），都会凭空多出搬运：
+        - 淘汰工作集 → 挤掉"马上要用的专家"，搬运数暴涨、吞吐减半；
+        - 回收"预取未用" → 形成"预测→搬入→没用→回收→再预测"的 churn，容量越宽裕越烈
+          （真实 128M、capacity=12 实测搬运 173→9382、吞吐 1.64x→2.28x）。
+        故容量满时预取直接跳过，淘汰权只留给真正要用专家的那一步；预取**不更新 `_hot`**，
+        不改变工作集的"最近使用"时序。
 
         异步预取（cpu+GPU）：prefetch 在 side stream 启动拷贝并记录 event；
         正常 ensure 命中同一专家时等待该 event 完成再使用（保证数值正确）。
@@ -181,10 +179,11 @@ class ExpertStore:
             for i in todo:
                 if i in self._resident:
                     continue
-                if self.capacity > 0:
-                    if len(self._resident) >= self.capacity and \
-                            not self._evict_victim({i}, unused_only=True):
-                        break  # 无可回收空位：不淘汰工作集
+                # 预取只填空槽，**不淘汰任何专家**（含预取未用）：一旦允许预取回收，
+                # 会形成"预测→搬入→没用→回收→再预测"的 churn，容量越宽裕越烈
+                # （真实 128M、capacity=12 实测搬运 173→9382、吞吐 1.64x→2.28x）。
+                if self.capacity > 0 and len(self._resident) >= self.capacity:
+                    break  # 无空槽：跳过，淘汰权留给真正要用专家的那一步
                 self._load(i, async_=True)
             return
         for i in todo:
