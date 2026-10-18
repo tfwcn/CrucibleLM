@@ -704,8 +704,10 @@ def test_moe_grouped_matches_naive():
     from src.llm.local.moe import FineGrainedMoE
 
     torch.manual_seed(1)
+    # 朴素参考实现的是旧口径路由（softmax+greedy+aux），故显式关免辅助损失路由；
+    # aux-free 的“分组=朴素”由 test_moe_aux_free 覆盖
     m = FineGrainedMoE(64, n_experts=4, top_k=2, expert_hidden=16,
-                       n_shared=1, aux_coef=0.01)
+                       n_shared=1, aux_coef=0.01, router_aux_free=False)
     m.eval()
     x = torch.randn(2, 8, 64)
     out, aux = m(x)

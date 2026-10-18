@@ -339,6 +339,27 @@ n-gram 共享：同一个桶每步收到方向相反的梯度，AdamW 的 `m/√
 - 同类的还有**改前向数学但不改键**的开关（如 `swiglu_limit`：只在专家内部 clamp 预激活，
   键名形状全不变）——同样必须靠 `sync_arch_from_checkpoint` 来源对齐，旧 run 回退到
   特性前的值（SwiGLU 限幅→0），否则新默认 10.0 会静默改掉旧 run 的前向数字。
+- 路由也属这一类（`router_aux_free`/`routed_scaling_factor`/`norm_topk_prob`）——已登记进
+  `config._ARCH_SWITCHES`，一侧登记即自动纳入 `sync_arch_from_checkpoint` 与训练脚本
+  通用来源对齐（`resolve_arch_switches`），无需逐开关手写保护。
+
+## 26. 免辅助损失偏置别进 `state_dict`，且负载统计要"赋值"不要"累加"
+
+**现象**：新增逐专家路由偏置 `expert_bias` 后，若 `register_buffer(..., persistent=True)`，
+它会出现在 `state_dict()` 里——旧 checkpoint（无此键）严格载入直接报缺键，破坏"装载键兼容"。
+
+**机制**：偏置是**训练期自适应状态**，不是架构权重：V4.1 的 `noaux_tc` 靠它调价均衡，但
+它每步都在变、且与权重无固定对应关系。
+
+**教训**：
+- `expert_bias` 用 **非持久化 buffer**（`persistent=False`）：不进 `state_dict`、装载键兼容
+  （旧 checkpoint 照常 strict 载入）；代价是**续训时偏置归零**，靠 `router_aux_free` 的
+  sign 式更新在数步内重新自适应——这是"键兼容 vs 续跑精确"的取舍，本项目选键兼容。
+- 负载统计（逐专家命中占比）在**前向里用赋值**保存（`self._last_load = f`），**不要累加**：
+  梯度检查点会在反向**重算前向**，累加语义会把同一批负载计两次（偏置更新量翻倍）。
+  赋值语义下重算写下同一个值 → 幂等。
+- 偏置更新在 `optimizer.step()` 之后、每优化器步一次；用**最近一次训练前向**的负载
+  （`sign` 式对噪声鲁棒），只影响选择、不进反向，因此不污染主任务梯度。
 
 ## 24. 续训对比时"重新加热"会掩盖真实差距——别把暂态读成"再训就补上了"
 

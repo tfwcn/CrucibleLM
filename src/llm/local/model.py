@@ -43,6 +43,10 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         n_shared=config.n_shared,
         aux_coef=config.aux_loss_coef,
         swiglu_limit=config.swiglu_limit,
+        router_aux_free=config.router_aux_free,
+        router_bias_lr=config.router_bias_lr,
+        routed_scaling_factor=config.routed_scaling_factor,
+        norm_topk_prob=config.norm_topk_prob,
         dropout=config.dropout,
         sparse_threshold=config.sparse_threshold,
         sparse_window=config.sparse_window,
@@ -284,6 +288,17 @@ class TinyLLM(nn.Module):
     def _has_interleaved_retro(self) -> bool:
         """是否有 V2 交错融合层（retro_enabled 且 retro_every>0）."""
         return bool(self.config.retro_enabled and self.config.retro_every > 0)
+
+    @torch.no_grad()
+    def update_router_bias(self) -> None:
+        """按最近一次训练前向的负载更新各层路由偏置（免辅助损失负载均衡）.
+
+        每个优化器步调用一次；`router_aux_free=False` 时各层为无操作。
+        """
+        for layer in self.layers:
+            moe = getattr(layer, "moe", None)
+            if moe is not None:
+                moe.update_router_bias()
 
     def _has_engram(self) -> bool:
         """是否有 Engram 条件记忆层（engram_every>0）."""

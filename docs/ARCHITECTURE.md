@@ -11,6 +11,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek V3/V4 | MLA 低秩 KV 压缩 + 解耦 RoPE | `mla.py`：KV 压缩到 `kv_lora_rank=128` + 共享 rope 键，缓存省约 9x |
 | DeepSeek V3/V4 | 细粒度 MoE + 共享专家 | `moe.py`：16 小专家 top-4 + 1 共享专家 + aux 负载均衡 |
 | DeepSeek-V4.1 | SwiGLU 预激活限幅 | `moe.py`：gate/up 对称 `clamp(±swiglu_limit)` 压激活离群值（`swiglu_limit`，**默认 10=开**，0=关） |
+| DeepSeek-V4.1 | 免辅助损失路由（sqrtsoftplus + noaux_tc） | `moe.py`：打分 `sqrt(softplus(z))`，按 `打分+逐专家偏置` 选 top-k，权重取原始打分归一化 ×`routed_scaling_factor`；偏置 sign 式按负载调价、不进梯度（`router_aux_free`，**默认开**，关=旧 softmax+aux loss） |
 | DeepSeek V3 | MTP 多 token 预测 | `model.py:MTPHead`：训练时额外预测 t+2，推理关闭 |
 | DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
 | DeepSeek-V4.1 | CSA2 跨层 KV 复用 | `mla.py`/`sparse_attn.py`：Full/Reuse 交替，Reuse 借最近 Full 层 latent（`csa_reuse_every`，**默认 2=开**，1=关） |
@@ -25,6 +26,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 - 词表 8192（小词表是 100M 可行的关键），`d_model=768`，12 层，12 头
 - MLA：`q_lora_rank=192`，`kv_lora_rank=128`，`qk_rope_dim=32`
 - MoE：16 专家 / top-4 / 专家 hidden 192 / 1 共享专家；SwiGLU 预激活限幅 `swiglu_limit=10.0`（V4.1，默认开，0=关）
+- 路由：免辅助损失 `router_aux_free=True`（V4.1 sqrtsoftplus + noaux_tc；`routed_scaling_factor=1.5`、`router_bias_lr=1e-3`），关=旧 softmax + aux loss
 - 上下文 8192（YaRN scale=2），embedding 与输出头绑定省约 6M
 
 ## 用法
@@ -332,6 +334,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
 | `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
 | `csa_reuse_every`(2) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，实测 8192 ctx KV −30%、32768 −32%）。**默认 2=开**（实测有代价的净收益），1=关 | `mla.py`/`sparse_attn.py`/`model.py` |
+| `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
   实测自然语言 30–39%（不值得开）、代码 66%（值得开），**默认关、按负载决定**。

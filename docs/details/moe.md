@@ -20,22 +20,31 @@ MoE 的思路：把 FFN 切成一堆小专家，router 按输入挑几个干活�
 ## 原理
 
 ```
-logits = router(x)              # (N, 16)，分诊打分
-top_w, top_i = topk(softmax, 4) # 前 4 名 + 权重（归一化）
+logits = router(x)                     # (N, 16)，分诊打分
+# 默认（V4.1 免辅助损失）：
+score = sqrt(softplus(logits))          # 打分
+top_i = topk(score + 偏置, 4)           # 选择：打分 + 逐专家"价格"
+top_w = normalize(gather(score, top_i)) * 1.5
+# 旧口径：top_w, top_i = topk(softmax(logits), 4)（归一化 + aux loss）
 out = Σ w_e · Expert_e(x)  +  Shared(x)
 ```
 
 - **共享专家**：所有 token 都过，保证基础能力不塌（router 学歪了也有兜底）；
-- **aux loss**：`mean(p) 与负载分布的点积 × 16 × 0.01`，惩罚"少数专家包揽一切"
-  （路由坍缩）。实测 aux 恒 0.12 左右就是健康的；
+- **均衡（默认免辅助损失）**：`router_aux_free=True` 时改用 `sqrtsoftplus + noaux_tc`——
+  给每个专家一个"价格"（偏置），按 `打分+价格` 选 top-k，价格按负载 sign 式升降且不进梯度；
+  详见[免辅助损失路由](./router-aux-free.md)；
+- **aux loss（旧口径）**：`router_aux_free=False` 时用 `mean(p) 与负载分布的点积 × 16 × 0.01`
+  惩罚"少数专家包揽一切"（路由坍缩），实测恒 0.12 左右是健康线；
 - **分组 bmm**（性能）：每个 token 展开成 4 行，按专家排序垫齐，一次 bmm
   算完所有专家（替代 16 次逐专家 Python dispatch），13→22.5 tok/s，
   数值与朴素版一致（单测锁定）。
 
 ## 我们的实现
 
-- 文件：`src/llm/local/moe.py`（`FineGrainedMoE` + `SwiGLUExpert`）
-- 参数：`n_experts=16`、`top_k=4`、`expert_hidden=192`、`n_shared=1`、`aux_coef=0.01`
+- 文件：`src/llm/local/moe.py`（`FineGrainedMoE` + `SwiGLUExpert`）；路由唯一入口 `_route`
+  （分组 bmm 与逐专家/offload 两条路径共用，避免两份拷贝）
+- 参数：`n_experts=16`、`top_k=4`、`expert_hidden=192`、`n_shared=1`、`aux_coef=0.01`；
+  路由 `router_aux_free=True`、`routed_scaling_factor=1.5`、`router_bias_lr=1e-3`、`norm_topk_prob=True`
 - 专家加宽用 Net2WiderNet（复制单元 + 下投影列平分，见《架构迁移》）；
 - AMP 下 `top_w` 常为 fp32，权重先对齐到输入精度再聚合，否则 index 报错
   或隐式提升把残差流抬成 fp32（注释里有，抄的时候别删）。
@@ -45,7 +54,10 @@ out = Σ w_e · Expert_e(x)  +  Shared(x)
 "分诊"即 top-k，"会诊"即加权和；性能版把 16 次循环压成 3 次 bmm：
 
 ```python
-top_w, top_i = topk(softmax(router(x)), 4)   # 分诊
+# 默认（免辅助损失）：打分 sqrt(softplus)，选择带"价格"，权重不带
+score = sqrt(softplus(router(x)))
+top_i = topk(score + bias, 4);  w = normalize(gather(score, top_i)) * 1.5
+# 旧口径：top_w, top_i = topk(softmax(router(x)), 4)（含 aux loss）
 # 朴素版：for e in 16: w = (top_i == e) 加权求和；expert(x)  # 16 次 dispatch
 # 分组版：token 展开×4 → 按专家排序垫齐 → 3 次 bmm → 散射加回
 gate = silu(canvas @ Wg) * (canvas @ Wu); out = gate @ Wd
@@ -55,10 +67,11 @@ gate = silu(canvas @ Wg) * (canvas @ Wu); out = gate @ Wd
 
 - 推理要存 16 个专家的权重（128M 里大头），batch=1 时 12 个没命中的白占显存——
   小 batch 下 MoE 的"省"只体现在速度，不体现在显存。
-- aux 太大（>0.2）说明路由在偷懒；太小（→0）可能是 top-k 退化成固定组合。
-  aux 恒 0.12 是健康线，写进监控。
+- 旧口径（`router_aux_free=False`）下：aux 太大（>0.2）说明路由在偷懒；太小（→0）可能是
+  top-k 退化成固定组合；aux 恒 0.12 是健康线。默认的免辅助损失模式 `aux_loss` 恒 0，
+  改看逐专家命中占比 / 偏置漂移判断均衡（见《免辅助损失路由》）。
 - 实测结论：零休眠（见《神经元复壮》）——16 个专家全员有活，不用裁。
 
 ## 一句话总结
 
-分诊 + 会诊 + 全科兜底，48M 的钱买 128M 的见识，前提是 aux 别让医生们躺平。
+分诊 + 会诊 + 全科兜底，48M 的钱买 128M 的见识；均衡不靠罚款（aux）而靠"调价"（偏置，默认开）。

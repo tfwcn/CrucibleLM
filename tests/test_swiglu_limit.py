@@ -102,7 +102,8 @@ def test_grouped_matches_naive_under_clamp():
     """分组 bmm 与朴素全量在限幅下一致；且梯度有限."""
     torch.manual_seed(2)
     m = FineGrainedMoE(32, n_experts=6, top_k=2, expert_hidden=12,
-                       n_shared=2, aux_coef=0.01, swiglu_limit=1.0)
+                       n_shared=2, aux_coef=0.01, swiglu_limit=1.0,
+                       router_aux_free=False)
     m.eval()
     x = 20.0 * torch.randn(2, 10, 32)  # 大输入确保限幅触发
     out, aux = m(x)
@@ -178,10 +179,12 @@ def test_resolve_swiglu_limit_branches(tmp_path):
         d.update(kw)
         return argparse.Namespace(**d)
 
-    cfg = SmallLLMConfig()  # 架构默认 = 10.0
-    assert T.resolve_swiglu_limit(ns(swiglu_limit=3.0), cfg) == (3.0, "explicit")
-    assert T.resolve_swiglu_limit(ns(swiglu_limit=0.0), cfg) == (0.0, "explicit")
-    assert T.resolve_swiglu_limit(ns(), cfg) == (10.0, "default")
+    # 注意：resolve_* 会就地写入 config（对齐来源），故每次用独立配置
+    assert T.resolve_swiglu_limit(
+        ns(swiglu_limit=3.0), SmallLLMConfig()) == (3.0, "explicit")
+    assert T.resolve_swiglu_limit(
+        ns(swiglu_limit=0.0), SmallLLMConfig()) == (0.0, "explicit")
+    assert T.resolve_swiglu_limit(ns(), SmallLLMConfig()) == (10.0, "default")
     assert T.resolve_swiglu_limit(
         ns(config_json="x.json"), _cfg(swiglu_limit=4.0)) == (4.0, "config_json")
     # 续训能读到 hparams → 沿用
@@ -190,15 +193,17 @@ def test_resolve_swiglu_limit_branches(tmp_path):
     ckpt = tmp_path / "model.pt"
     ckpt.write_bytes(b"")
     assert T.resolve_swiglu_limit(
-        ns(init_checkpoint=str(ckpt)), cfg) == (6.0, "checkpoint")
+        ns(init_checkpoint=str(ckpt)), SmallLLMConfig()) == (6.0, "checkpoint")
     # 续训但无架构信息 → 保守按 0（不静默改前向）
     empty = tmp_path / "noarch"
     empty.mkdir()
     (empty / "model.pt").write_bytes(b"")
     assert T.resolve_swiglu_limit(
-        ns(init_checkpoint=str(empty / "model.pt")), cfg) == (0.0, "conservative")
+        ns(init_checkpoint=str(empty / "model.pt")),
+        SmallLLMConfig()) == (0.0, "conservative")
     assert T.resolve_swiglu_limit(
-        ns(sft_init=str(empty / "model.pt")), cfg) == (0.0, "conservative")
+        ns(sft_init=str(empty / "model.pt")),
+        SmallLLMConfig()) == (0.0, "conservative")
 
 
 def _cfg(**over):

@@ -41,6 +41,19 @@ class SmallLLMConfig:
     # 处理：续训/装载从 checkpoint 的 hparams.json 沿用，读不到按 0（旧行为），见
     # sync_arch_from_checkpoint。docs/details/swiglu-limit.md
     swiglu_limit: float = 10.0
+
+    # ===== 路由（DeepSeek-V4.1：sqrtsoftplus 打分 + noaux_tc 免辅助损失 + routed scaling）=====
+    # True=免辅助损失路由（V4.1）：score=sqrt(softplus(logits))，按 score+逐专家偏置 选
+    # top-k，权重取原始 score 归一化后 ×routed_scaling_factor；不产生 aux loss，改由偏置
+    # 按负载 sign 式均衡（update_router_bias）。False=旧口径（softmax + greedy + aux loss）。
+    # 默认开；旧 run 靠 hparams 对齐（fallback False=旧语义）。
+    router_aux_free: bool = True
+    # 免辅助损失偏置更新率 γ（sign 式；0=冻结偏置）
+    router_bias_lr: float = 1e-3
+    # 路由权重缩放（V4.1 routed_scaling_factor=1.5；仅 router_aux_free 生效）
+    routed_scaling_factor: float = 1.5
+    # top-k 权重是否归一化（V4.1=true；旧口径恒归一化）
+    norm_topk_prob: bool = True
     # MTP 额外预测步数（1 表示除 t+1 外再预测 t+2）
     mtp_depth: int = 1
     # MTP loss 权重
@@ -213,6 +226,8 @@ def tiny_test_config() -> "SmallLLMConfig":
         csa_reuse_every=1,
         # 同理：极小配置不做 SwiGLU 限幅，避免随机权重下前向数值随生产默认漂移
         swiglu_limit=0.0,
+        # 同理：极小配置走旧口径路由（softmax+aux），契约不随生产默认（aux-free）漂移
+        router_aux_free=False,
     )
 
 
@@ -288,9 +303,20 @@ def _norm_nonneg_float(v) -> float:
     return f if f > 0 else 0.0
 
 
+def _norm_bool(v) -> bool:
+    """布尔归一化：兼容 JSON 的 true/false 与字符串 "1/true/yes/on"."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on", "y", "t")
+    return bool(v)
+
+
 _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "csa_reuse_every": (1, _norm_csa),
     "swiglu_limit": (0.0, _norm_nonneg_float),
+    # 路由开关（V4.1）；旧 checkpoint 缺字段 → 回退旧口径（aux loss + 无缩放 + 归一化）
+    "router_aux_free": (False, _norm_bool),
+    "routed_scaling_factor": (1.0, _norm_nonneg_float),
+    "norm_topk_prob": (True, _norm_bool),
 }
 
 
@@ -302,8 +328,8 @@ def sync_arch_from_checkpoint(config: "SmallLLMConfig", path) -> list[str]:
     或对旧 run 强加 SwiGLU 限幅）。故加载既有权重的脚本应先调用本函数对齐来源。
 
     读不到任何配置返回 []，调用方用当前默认值；**找到配置但缺某字段**时，说明该
-    checkpoint 早于该特性，回退到"特性前"的值（CSA2→1、SwiGLU 限幅→0），保证旧
-    run 语义逐位不变。
+    checkpoint 早于该特性，回退到"特性前"的值（CSA2→1、SwiGLU 限幅→0、免辅助损失
+    路由→关 + 缩放 1.0），保证旧 run 语义逐位不变。
     """
     data = _read_saved_config(path)
     if data is None:

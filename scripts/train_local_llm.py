@@ -143,6 +143,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="SwiGLU gate/up 预激活对称限幅（DeepSeek-V4.1=10.0；0=关；"
                         "不传时新训练取架构默认=10.0，续训/迁移沿用 checkpoint，"
                         "读不到则保守按 0=不限幅）")
+    p.add_argument("--router-aux-free", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="免辅助损失路由（V4.1：sqrtsoftplus + noaux_tc + routed scaling）；"
+                        "--no-router-aux-free 回到旧口径（softmax + aux loss）。"
+                        "不传时新训练取架构默认=开，续训/迁移沿用 checkpoint")
+    p.add_argument("--routed-scaling-factor", type=float, default=None,
+                   help="路由权重缩放（V4.1=1.5；仅免辅助损失路由生效）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -236,44 +243,54 @@ def _restore_arch_switch(args: argparse.Namespace, key: str) -> object | None:
     return None
 
 
+def resolve_arch_switches(args: argparse.Namespace,
+                          config: SmallLLMConfig) -> dict[str, str]:
+    """续训/迁移：把 config 的架构开关按来源对齐，返回 字段→来源.
+
+    优先级：同名 CLI 显式 > `--config-json` > checkpoint 的 hparams.json >（续训/
+    迁移/SFT 载入则保守用"特性前"的值，新训练用架构默认）。开关清单唯一来源
+    `config._ARCH_SWITCHES`——新增开关只登记一次即自动获得来源对齐，避免逐开关手写
+    漏掉保护（如把旧 run 静默换架构/改前向数学）。来源取值 `explicit`/`config_json`/
+    `checkpoint`/`conservative`/`default`，供日志区分"用户指定"与"自动沿用"。
+    """
+    from src.llm.local.config import _ARCH_SWITCHES
+
+    resuming = bool(args.resume or args.init_checkpoint
+                    or getattr(args, "sft_init", ""))
+    sources: dict[str, str] = {}
+    for field, (fallback, norm) in _ARCH_SWITCHES.items():
+        cli = getattr(args, field, None)
+        if cli is not None:
+            setattr(config, field, norm(cli))
+            sources[field] = "explicit"
+        elif getattr(args, "config_json", ""):
+            setattr(config, field, norm(getattr(config, field)))
+            sources[field] = "config_json"
+        else:
+            restored = _restore_arch_switch(args, field)
+            if restored is not None:
+                setattr(config, field, norm(restored))
+                sources[field] = "checkpoint"
+            elif resuming:
+                setattr(config, field, norm(fallback))
+                sources[field] = "conservative"
+            else:
+                sources[field] = "default"
+    return sources
+
+
 def resolve_csa_reuse_every(args: argparse.Namespace,
                             config: SmallLLMConfig) -> tuple[int, str]:
-    """定本次训练实际使用的 `csa_reuse_every` 与来源（无副作用，便于单测）.
-
-    优先级：命令行显式 > `--config-json` > checkpoint 的 hparams.json >（续训/迁移/SFT
-    载入则保守按 1，新训练则用架构默认）。返回 (值, 来源)，来源取值 `explicit`/
-    `config_json`/`checkpoint`/`conservative`/`default`，供日志区分是"用户指定"还是"自动沿用"。
-    """
-    if args.csa_reuse_every is not None:
-        return max(args.csa_reuse_every, 1), "explicit"
-    if getattr(args, "config_json", ""):
-        return max(config.csa_reuse_every, 1), "config_json"
-    restored = _restore_arch_switch(args, "csa_reuse_every")
-    if restored is not None:
-        return max(int(restored), 1), "checkpoint"
-    if args.resume or args.init_checkpoint or getattr(args, "sft_init", ""):
-        return 1, "conservative"
-    return max(config.csa_reuse_every, 1), "default"
+    """（兼容包装）CSA2 档位与来源；实现见 `resolve_arch_switches`."""
+    src = resolve_arch_switches(args, config)["csa_reuse_every"]
+    return config.csa_reuse_every, src
 
 
 def resolve_swiglu_limit(args: argparse.Namespace,
                          config: SmallLLMConfig) -> tuple[float, str]:
-    """定本次训练实际使用的 `swiglu_limit` 与来源（无副作用，便于单测）.
-
-    优先级同 CSA2：命令行显式 > `--config-json` > checkpoint 的 hparams.json >（续训/
-    迁移/SFT 载入则保守按 0=不限幅，新训练则用架构默认 10.0）。来源取值与
-    `resolve_csa_reuse_every` 一致，供日志区分"用户指定"与"自动沿用"。
-    """
-    if getattr(args, "swiglu_limit", None) is not None:
-        return max(float(args.swiglu_limit), 0.0), "explicit"
-    if getattr(args, "config_json", ""):
-        return max(config.swiglu_limit, 0.0), "config_json"
-    restored = _restore_arch_switch(args, "swiglu_limit")
-    if restored is not None:
-        return max(float(restored), 0.0), "checkpoint"
-    if args.resume or args.init_checkpoint or getattr(args, "sft_init", ""):
-        return 0.0, "conservative"
-    return max(config.swiglu_limit, 0.0), "default"
+    """（兼容包装）SwiGLU 限幅与来源；实现见 `resolve_arch_switches`."""
+    src = resolve_arch_switches(args, config)["swiglu_limit"]
+    return config.swiglu_limit, src
 
 
 def load_tokenizer(args: argparse.Namespace, config: SmallLLMConfig,
@@ -766,31 +783,37 @@ def main(argv=None) -> int:
         print(f"Engram 已开：每 {config.engram_every} 层一个，阶 {config.engram_orders}，"
               f"{config.engram_heads} 头/阶，表 {config.engram_table_size}（素数），"
               f"卷积核 {config.engram_conv}（恒等起点）", flush=True)
-    # CSA2：显式值优先；未指定时——新训练用架构默认（开），续训/迁移沿用 checkpoint，
-    # 读不到 checkpoint 架构则保守按 1（不动旧 run 的结构）。
-    every, src = resolve_csa_reuse_every(args, config)
-    args.csa_reuse_every = every
-    config.csa_reuse_every = every
-    if src == "checkpoint":
+    # 架构开关统一来源对齐（清单唯一来源 config._ARCH_SWITCHES）：显式 CLI > config-json >
+    # checkpoint 的 hparams.json 沿用 >（续训/迁移保守用特性前的值 / 新训练用架构默认）。
+    # 新增开关只在 _ARCH_SWITCHES 登记一次即自动获得保护，避免逐开关手写漏掉。
+    arch_src = resolve_arch_switches(args, config)
+    from src.llm.local.config import _ARCH_SWITCHES
+    for field in _ARCH_SWITCHES:
+        setattr(args, field, getattr(config, field))
+    every = config.csa_reuse_every
+    limit = config.swiglu_limit
+    if arch_src.get("csa_reuse_every") == "checkpoint":
         print(f"CSA2：沿用 checkpoint 架构 csa_reuse_every={every}", flush=True)
-    elif src == "conservative":
+    elif arch_src.get("csa_reuse_every") == "conservative":
         print("CSA2：checkpoint 无架构记录，按关闭（1）处理，避免静默换架构",
               flush=True)
     if every > 1:
         print(f"CSA2 跨层 KV 复用已开：每 {every} 个全注意力层留 1 个 Full，"
               f"其余 Reuse 借共享 latent（KV 缓存下降）", flush=True)
-    # SwiGLU 限幅：同 CSA2 策略（显式优先；新训练默认 10.0；续训/迁移沿用 checkpoint，
-    # 读不到则保守按 0=不限幅，避免静默改旧 run 的前向数学）。
-    limit, lsrc = resolve_swiglu_limit(args, config)
-    args.swiglu_limit = limit
-    config.swiglu_limit = limit
-    if lsrc == "checkpoint":
+    if arch_src.get("swiglu_limit") == "checkpoint":
         print(f"SwiGLU 限幅：沿用 checkpoint 架构 swiglu_limit={limit}", flush=True)
-    elif lsrc == "conservative":
+    elif arch_src.get("swiglu_limit") == "conservative":
         print("SwiGLU 限幅：checkpoint 无架构记录，按关闭（0）处理，避免静默改前向",
               flush=True)
     if limit > 0:
         print(f"SwiGLU 限幅已开：gate/up 预激活对称截断到 ±{limit}", flush=True)
+    if config.router_aux_free:
+        print(f"路由：免辅助损失（sqrtsoftplus + noaux_tc，权重 ×"
+              f"{config.routed_scaling_factor}，偏置 lr {config.router_bias_lr}）",
+              flush=True)
+    else:
+        print(f"路由：旧口径（softmax + greedy + aux loss {config.aux_loss_coef}）",
+              flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0
     if args.resume:
@@ -1126,6 +1149,9 @@ def main(argv=None) -> int:
                 break
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optim.step()
+            # 免辅助损失路由：按本步负载更新路由偏置（aux_free 关闭时无操作）
+            if hasattr(model, "update_router_bias"):
+                model.update_router_bias()
             step += 1
             # 回放池投喂：取最后 micro 的逐 token loss，最难 1 块入池
             if replay_buf is not None and "token_losses" in out:

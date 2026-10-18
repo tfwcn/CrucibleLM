@@ -155,12 +155,14 @@ def test_resolve_csa_reuse_every_branches(tmp_path):
         d.update(kw)
         return argparse.Namespace(**d)
 
-    cfg = _prod_cfg()  # 架构默认 = 2
+    # 注意：resolve_* 会就地写入 config（对齐来源），故每次用独立配置
     # 1) 命令行显式优先（给出即用，含显式关=1）
-    assert T.resolve_csa_reuse_every(ns(csa_reuse_every=3), cfg) == (3, "explicit")
-    assert T.resolve_csa_reuse_every(ns(csa_reuse_every=1), cfg) == (1, "explicit")
+    assert T.resolve_csa_reuse_every(
+        ns(csa_reuse_every=3), _prod_cfg()) == (3, "explicit")
+    assert T.resolve_csa_reuse_every(
+        ns(csa_reuse_every=1), _prod_cfg()) == (1, "explicit")
     # 2) 全新训练 → 架构默认（开）
-    assert T.resolve_csa_reuse_every(ns(), cfg) == (2, "default")
+    assert T.resolve_csa_reuse_every(ns(), _prod_cfg()) == (2, "default")
     # 2b) --config-json 视为显式来源（其值优先于 checkpoint 沿用）
     assert T.resolve_csa_reuse_every(
         ns(config_json="x.json"), _prod_cfg(csa_reuse_every=1)) == (1, "config_json")
@@ -170,16 +172,16 @@ def test_resolve_csa_reuse_every_branches(tmp_path):
     ckpt = tmp_path / "model.pt"
     ckpt.write_bytes(b"")
     assert T.resolve_csa_reuse_every(
-        ns(init_checkpoint=str(ckpt)), cfg) == (1, "checkpoint")
+        ns(init_checkpoint=str(ckpt)), _prod_cfg()) == (1, "checkpoint")
     # 4) 续训但 checkpoint 无架构信息 → 保守按 1（不静默换架构）
     empty = tmp_path / "noarch"
     empty.mkdir()
     (empty / "model.pt").write_bytes(b"")
     assert T.resolve_csa_reuse_every(
-        ns(init_checkpoint=str(empty / "model.pt")), cfg) == (1, "conservative")
+        ns(init_checkpoint=str(empty / "model.pt")), _prod_cfg()) == (1, "conservative")
     # 5) --sft-init 严格载入同样走保守策略（无架构信息时按 1）
     assert T.resolve_csa_reuse_every(
-        ns(sft_init=str(empty / "model.pt")), cfg) == (1, "conservative")
+        ns(sft_init=str(empty / "model.pt")), _prod_cfg()) == (1, "conservative")
 
 
 def test_csa_reuse_every_one_is_off():

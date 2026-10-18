@@ -154,6 +154,9 @@ def train_step(
         loss.backward()
     grad_norm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
+    # 免辅助损失路由：按本步负载更新偏置（aux_free 关闭时无操作）
+    if hasattr(model, "update_router_bias"):
+        model.update_router_bias()
     return {
         "loss": float(loss.detach()),
         "main_loss": float(out.get("main_loss", loss).detach()) if torch.is_tensor(out.get("main_loss", None)) else out.get("main_loss"),

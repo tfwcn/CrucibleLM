@@ -15,6 +15,7 @@
 ## 前馈与目标
 
 - [细粒度 MoE](./moe.md)
+- [免辅助损失路由：给专家调"价格"](./router-aux-free.md)
 - [SwiGLU 限幅：给激活套笼头](./swiglu-limit.md)
 - [MoE 可解释性：双负区间、休眠与生长](./moe-interpretability.md)
 - [MTP：多看一步](./mtp.md)
