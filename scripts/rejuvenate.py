@@ -40,7 +40,7 @@ def main(argv=None) -> int:
     """手术主流程."""
     import torch
 
-    from src.llm.local.config import SmallLLMConfig
+    from src.llm.local.config import SmallLLMConfig, sync_csa_reuse_from_checkpoint
     from src.llm.local.infer import SimpleTokenizer
     from src.llm.local.model import TinyLLM
     from src.llm.local.rejuvenate import apply_rejuvenation
@@ -51,6 +51,8 @@ def main(argv=None) -> int:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     config = SmallLLMConfig()
+    # 按来源权重对齐 CSA2（该开关不改 state_dict 键，装错不报错只会静默变语义）
+    sync_csa_reuse_from_checkpoint(config, args.src)
     config.memory_every = args.memory_every
     if args.retro_every > 0:
         config.retro_enabled = True

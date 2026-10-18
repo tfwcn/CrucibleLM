@@ -12,7 +12,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek V3/V4 | 细粒度 MoE + 共享专家 | `moe.py`：16 小专家 top-4 + 1 共享专家 + aux 负载均衡 |
 | DeepSeek V3 | MTP 多 token 预测 | `model.py:MTPHead`：训练时额外预测 t+2，推理关闭 |
 | DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
-| DeepSeek-V4.1 | CSA2 跨层 KV 复用 | `mla.py`/`sparse_attn.py`：Full/Reuse 交替，Reuse 借最近 Full 层 latent（`csa_reuse_every`，默认 1=关） |
+| DeepSeek-V4.1 | CSA2 跨层 KV 复用 | `mla.py`/`sparse_attn.py`：Full/Reuse 交替，Reuse 借最近 Full 层 latent（`csa_reuse_every`，**默认 2=开**，1=关） |
 | DeepSeek-V4.1 | 3×3 pixel-unshuffle 视觉压缩 | `vision_compress.py`：`vision_unshuffle=3` 先按 3×3 重排降采样，视觉 token /9（默认 1=关） |
 | DeepSeek DSpark | 置信调度验证（spec decoding） | `spec_decode.py`：按草稿存活置信度动态定验证长度，截断必被拒后缀（`dspark_enabled`，默认关） |
 | Qwen3-Next | Hybrid 注意力（全/线性交替） | `block.py`：每 4 层 1 层 MLA，其余 `GatedDeltaLite` 线性层 |
@@ -325,7 +325,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `offload_enabled`(False) / `offload_target`(cpu) / `offload_dir`("") / `offload_capacity`(0) / `offload_prefetch`(False) | 专家 offload 到 CPU/磁盘 + LRU 淘汰（capacity≤0 时全驻留→分组快路径） | `offload.py` |
 | `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
 | `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
-| `csa_reuse_every`(1) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，KV −33%） | `mla.py`/`sparse_attn.py`/`model.py` |
+| `csa_reuse_every`(2) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，实测 8192 ctx KV −30%、32768 −32%）。**默认 2=开**（实测有代价的净收益），1=关 | `mla.py`/`sparse_attn.py`/`model.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
   实测自然语言 30–39%（不值得开）、代码 66%（值得开），**默认关、按负载决定**。
@@ -352,14 +352,19 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 - **视觉压缩**：默认关时模型无该模块、`state_dict` 兼容；**推理前缀 + 训练 loss 均已接线**
   （`forward(targets=..., vision_embeds=...)` 只算文本段错位一位；`train_step(vision_images=...)`
   经带梯度的 `model.vision` 编码），视觉段不进 CE。
-- **CSA2 跨层 KV 复用**：`csa_reuse_every=N`（默认 1=全 Full=关）时，每 N 个全注意力层
+- **CSA2 跨层 KV 复用**：`csa_reuse_every=N`（默认 **2=开**；1=全 Full=关）时，每 N 个全注意力层
   留 1 个 Full，其余为 Reuse——借最近 Full 层的 latent 缓存出 K/V（只自算 Q）。Reuse 层
   与 Full 层**共享 `w_dkv`/`w_kr` 权重对象**（无死参数），仍保留各自的上投影/Q/输出；
   解码时 Reuse 层的缓存就是共享缓冲，只跳过写入。`kv_cache_bytes` 只计非 Reuse 层。
-  默认关时逐位兼容；开启后参数量变小、缓存下降。
-  **实测（本机 128M 续训 2500 步）**：8192 上下文 KV 8.75MB → 6.13MB（**−30%**），
-  代价 val_loss **+0.012（相对 +0.27%）**且收敛后不归零——是**可辩护的取舍，不是无损**。
-  细节见 `docs/details/csa-kv-reuse.md`。
+  关（=1）时逐位兼容；开启后参数量变小、缓存下降。
+  架构开关随 checkpoint 走：训练脚本未显式传 `--csa-reuse-every` 时，续训/迁移会从
+  checkpoint 的 `hparams.json` 沿用其架构；读不到则保守按 1，避免"默认值升级"把旧 run
+  静默换架构。`preset tiny`（CPU 单测）固定全 Full，不受生产默认影响。
+  **实测（本机 128M 续训 2500 步 + 续训判定 2 轮）**：8192 上下文 KV 8.75MB → 6.13MB
+  （**−30%**；32768 −32%，参数 −0.1%），代价 val_loss **+0.012（相对 +0.27%）**。
+  续训判定（lr 2e-5/1e-5 各一轮，同 seed 同数据）：差距随收敛深度增长（r=−0.45），
+  两个独立 lr 复现同一残差——是**小而稳的固有容量差额，非适配滞后**；故是**可辩护的
+  取舍，不是无损**。细节见 `docs/details/csa-kv-reuse.md`。
 
 ## 直觉头/RAG（`heads.py` + `retrieval.py`，SFT 后启用）
 

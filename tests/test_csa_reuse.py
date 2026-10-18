@@ -1,7 +1,8 @@
-"""CSA2 跨层 KV 复用单测 — 默认关兼容 / 按序分配 / 参数共享 / 解码一致 / 因果.
+"""CSA2 跨层 KV 复用单测 — 默认开/显式关 / 按序分配 / 参数共享 / 解码一致 / 因果.
 
 CPU 可跑。核心契约：
-- 默认 `csa_reuse_every=1` → 全 Full，`_csa_active=False`，与旧 checkpoint 逐位兼容；
+- 生产默认 `csa_reuse_every=2` → 有 Reuse 层（`_csa_active=True`）；
+  显式 `=1` → 全 Full，与旧 checkpoint 逐位兼容；
 - Reuse 层复用最近 Full 层的 latent，只自算 Q/上投影，**不重复存 KV 缓存**；
 - Reuse 层与 Full 层共享 `w_dkv`/`w_kr` 权重对象（避免死参数）；
 - `prefill + 逐 token 解码 == 全前向`、`_decode_multi == 逐 token`、投机 == 贪心。
@@ -11,7 +12,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from src.llm.local.config import tiny_test_config
+from src.llm.local.config import (
+    SmallLLMConfig,
+    sync_csa_reuse_from_checkpoint,
+    tiny_test_config,
+)
 from src.llm.local.model import TinyLLM
 
 
@@ -31,13 +36,122 @@ def _reuse_layers(m):
             if getattr(L.attn, "csa_reuse", False)]
 
 
-# --------------------------- 默认关 / 分配 ---------------------------
-def test_csa_default_off_no_reuse():
-    """默认关：无 Reuse 层、`_csa_active=False`（旧命令逐位不变）."""
-    m = TinyLLM(tiny_test_config())
-    assert m._csa_active is False
-    assert _reuse_layers(m) == []
-    assert all(getattr(L.attn, "csa_reuse", False) is False for L in m.layers)
+# --------------------------- 默认开 / 显式关 / 分配 ---------------------------
+def _prod_cfg(**over):
+    """生产默认结构的小模型（默认 csa_reuse_every=2）."""
+    base = dict(
+        vocab_size=256, d_model=128, n_layers=4, full_attn_every=2,
+        n_heads=4, q_lora_rank=32, kv_lora_rank=32, qk_rope_dim=16,
+        n_experts=8, top_k=2, expert_hidden=64, n_shared=1,
+        mtp_depth=1, max_seq_len=256, yarn_scale=1.0,
+    )
+    base.update(over)
+    return SmallLLMConfig(**base)
+
+
+def test_csa_default_is_on():
+    """生产默认 `csa_reuse_every=2` → 默认就有 Reuse 层（无需传参）."""
+    assert SmallLLMConfig().csa_reuse_every == 2
+    m = TinyLLM(_prod_cfg())
+    assert m._csa_active is True
+    # full_attn_every=2：层 0/2 为全注意力，ordinal 0=Full、1=Reuse
+    assert _reuse_layers(m) == [2]
+
+
+def test_tiny_preset_stays_baseline():
+    """CPU 极小配置固定全 Full：单测结构契约不随生产默认漂移."""
+    assert tiny_test_config().csa_reuse_every == 1
+
+
+def test_sync_csa_reuse_from_checkpoint(tmp_path):
+    """加载既有权重时按来源对齐 CSA2；无来源则不动（返回 False）."""
+    import json
+
+    cfg = SmallLLMConfig()  # 默认 2
+    (tmp_path / "hparams.json").write_text(
+        json.dumps({"config": {"csa_reuse_every": 1}}), encoding="utf-8")
+    ckpt = tmp_path / "model.pt"
+    ckpt.write_bytes(b"")
+    assert sync_csa_reuse_from_checkpoint(cfg, str(ckpt)) is True
+    assert cfg.csa_reuse_every == 1
+    # config.json（migrate 输出的扁平 dict）优先于 hparams
+    (tmp_path / "config.json").write_text(
+        json.dumps({"csa_reuse_every": 3}), encoding="utf-8")
+    assert sync_csa_reuse_from_checkpoint(cfg, str(ckpt)) is True
+    assert cfg.csa_reuse_every == 3
+    # 无来源 → False，配置保持不变
+    empty = tmp_path / "nope"
+    empty.mkdir()
+    cfg2 = SmallLLMConfig()
+    assert sync_csa_reuse_from_checkpoint(cfg2, str(empty)) is False
+    assert cfg2.csa_reuse_every == 2
+
+
+def test_restore_arch_switch_reads_hparams(tmp_path):
+    """续训/迁移时从 hparams.json 读回架构开关；读不到返回 None."""
+    import argparse
+    import json
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import train_local_llm as T
+
+    ckpt = tmp_path / "model.pt"
+    ckpt.write_bytes(b"")
+    ns = lambda **kw: argparse.Namespace(  # noqa: E731
+        **{"resume": False, "ckpt_dir": "", "init_checkpoint": "", **kw})
+    assert T._restore_arch_switch(ns(init_checkpoint=str(ckpt)),
+                                  "csa_reuse_every") is None
+    (tmp_path / "hparams.json").write_text(
+        json.dumps({"config": {"csa_reuse_every": 2}}), encoding="utf-8")
+    assert T._restore_arch_switch(ns(init_checkpoint=str(ckpt)),
+                                  "csa_reuse_every") == 2
+    assert T._restore_arch_switch(ns(resume=True, ckpt_dir=str(tmp_path)),
+                                  "csa_reuse_every") == 2
+
+
+def test_resolve_csa_reuse_every_branches(tmp_path):
+    """决策优先级：命令行显式 > checkpoint 架构 > 续训保守 1 / 新训默认开."""
+    import argparse
+    import json
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import train_local_llm as T
+
+    def ns(**kw):
+        d = dict(csa_reuse_every=None, resume=False, ckpt_dir="",
+                 init_checkpoint="", sft_init="", config_json="")
+        d.update(kw)
+        return argparse.Namespace(**d)
+
+    cfg = _prod_cfg()  # 架构默认 = 2
+    # 1) 命令行显式优先（给出即用，含显式关=1）
+    assert T.resolve_csa_reuse_every(ns(csa_reuse_every=3), cfg) == (3, "explicit")
+    assert T.resolve_csa_reuse_every(ns(csa_reuse_every=1), cfg) == (1, "explicit")
+    # 2) 全新训练 → 架构默认（开）
+    assert T.resolve_csa_reuse_every(ns(), cfg) == (2, "default")
+    # 2b) --config-json 视为显式来源（其值优先于 checkpoint 沿用）
+    assert T.resolve_csa_reuse_every(
+        ns(config_json="x.json"), _prod_cfg(csa_reuse_every=1)) == (1, "config_json")
+    # 3) 续训能读到 hparams → 沿用 checkpoint 架构（这里记为关）
+    (tmp_path / "hparams.json").write_text(
+        json.dumps({"config": {"csa_reuse_every": 1}}), encoding="utf-8")
+    ckpt = tmp_path / "model.pt"
+    ckpt.write_bytes(b"")
+    assert T.resolve_csa_reuse_every(
+        ns(init_checkpoint=str(ckpt)), cfg) == (1, "checkpoint")
+    # 4) 续训但 checkpoint 无架构信息 → 保守按 1（不静默换架构）
+    empty = tmp_path / "noarch"
+    empty.mkdir()
+    (empty / "model.pt").write_bytes(b"")
+    assert T.resolve_csa_reuse_every(
+        ns(init_checkpoint=str(empty / "model.pt")), cfg) == (1, "conservative")
+    # 5) --sft-init 严格载入同样走保守策略（无架构信息时按 1）
+    assert T.resolve_csa_reuse_every(
+        ns(sft_init=str(empty / "model.pt")), cfg) == (1, "conservative")
 
 
 def test_csa_reuse_every_one_is_off():

@@ -71,9 +71,15 @@ def main(argv=None) -> int:
     tok._chars = json.loads(Path(args.vocab).read_text(encoding="utf-8"))
     tok._ids = {ch: i + 4 for i, ch in enumerate(tok._chars)}
     tok.vocab_size = len(tok._chars) + 4
-    from src.llm.local.config import SmallLLMConfig, tiny_test_config
+    from src.llm.local.config import (
+        SmallLLMConfig,
+        sync_csa_reuse_from_checkpoint,
+        tiny_test_config,
+    )
 
     cfg = tiny_test_config() if args.preset == "tiny" else SmallLLMConfig()
+    # 按来源权重对齐 CSA2（该开关不改 state_dict 键，装错不报错只会静默变语义）
+    sync_csa_reuse_from_checkpoint(cfg, args.model)
     tok.vocab_size = len(tok._chars) + 4  # 文件只存 _chars，容量另算
     # cfg.vocab_size 保持预设容量（8192）：训练扩词复用空行不改形状，
     # 建模必须同宽，否则 embed/lm_head 严格载入必炸（init_memory.py 同规则）

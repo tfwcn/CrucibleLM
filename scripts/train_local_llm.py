@@ -135,8 +135,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="每头哈希表大小（须素数，抗碰撞）")
     p.add_argument("--engram-conv", type=int, default=4,
                    help="短因果卷积核（0=不做卷积；作用在 id 决定的 V 上，解码无状态）")
-    p.add_argument("--csa-reuse-every", type=int, default=1,
-                   help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full（1=关，2=KV 减半）")
+    p.add_argument("--csa-reuse-every", type=int, default=None,
+                   help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
+                        "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
+                        "读不到 checkpoint 架构则保守按 1）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -201,6 +203,53 @@ def build_config(args: argparse.Namespace) -> SmallLLMConfig:
     config = tiny_test_config() if args.preset == "tiny" else SmallLLMConfig()
     config.max_seq_len = max(config.max_seq_len, args.seq_len + 8)
     return config
+
+
+def _restore_arch_switch(args: argparse.Namespace, key: str) -> int | None:
+    """续训/迁移时从 checkpoint 的 hparams.json 取回架构开关.
+
+    架构开关（如 `csa_reuse_every`）会改变权重共享关系，一旦随"默认值升级"变化，
+    旧 run 的 `--resume` 就会被静默换架构。故命令行未显式指定时，优先沿用
+    checkpoint 记录的值；读不到返回 None，由调用方决定保守策略。
+    """
+    dirs: list[Path] = []
+    if args.resume:
+        dirs.append(Path(args.ckpt_dir))
+    for attr in ("init_checkpoint", "sft_init"):
+        src = getattr(args, attr, "")
+        if src:
+            dirs.append(Path(src).parent)
+    for d in dirs:
+        hp = d / "hparams.json"
+        if not hp.exists():
+            continue
+        try:
+            cfg = json.loads(hp.read_text(encoding="utf-8")).get("config", {})
+        except (OSError, ValueError):
+            continue
+        if key in cfg:
+            return int(cfg[key])
+    return None
+
+
+def resolve_csa_reuse_every(args: argparse.Namespace,
+                            config: SmallLLMConfig) -> tuple[int, str]:
+    """定本次训练实际使用的 `csa_reuse_every` 与来源（无副作用，便于单测）.
+
+    优先级：命令行显式 > `--config-json` > checkpoint 的 hparams.json >（续训/迁移/SFT
+    载入则保守按 1，新训练则用架构默认）。返回 (值, 来源)，来源取值 `explicit`/
+    `config_json`/`checkpoint`/`conservative`/`default`，供日志区分是"用户指定"还是"自动沿用"。
+    """
+    if args.csa_reuse_every is not None:
+        return max(args.csa_reuse_every, 1), "explicit"
+    if getattr(args, "config_json", ""):
+        return max(config.csa_reuse_every, 1), "config_json"
+    restored = _restore_arch_switch(args, "csa_reuse_every")
+    if restored is not None:
+        return max(restored, 1), "checkpoint"
+    if args.resume or args.init_checkpoint or getattr(args, "sft_init", ""):
+        return 1, "conservative"
+    return max(config.csa_reuse_every, 1), "default"
 
 
 def load_tokenizer(args: argparse.Namespace, config: SmallLLMConfig,
@@ -693,9 +742,18 @@ def main(argv=None) -> int:
         print(f"Engram 已开：每 {config.engram_every} 层一个，阶 {config.engram_orders}，"
               f"{config.engram_heads} 头/阶，表 {config.engram_table_size}（素数），"
               f"卷积核 {config.engram_conv}（恒等起点）", flush=True)
-    if args.csa_reuse_every > 1:
-        config.csa_reuse_every = args.csa_reuse_every
-        print(f"CSA2 跨层 KV 复用已开：每 {config.csa_reuse_every} 个全注意力层留 1 个 Full，"
+    # CSA2：显式值优先；未指定时——新训练用架构默认（开），续训/迁移沿用 checkpoint，
+    # 读不到 checkpoint 架构则保守按 1（不动旧 run 的结构）。
+    every, src = resolve_csa_reuse_every(args, config)
+    args.csa_reuse_every = every
+    config.csa_reuse_every = every
+    if src == "checkpoint":
+        print(f"CSA2：沿用 checkpoint 架构 csa_reuse_every={every}", flush=True)
+    elif src == "conservative":
+        print("CSA2：checkpoint 无架构记录，按关闭（1）处理，避免静默换架构",
+              flush=True)
+    if every > 1:
+        print(f"CSA2 跨层 KV 复用已开：每 {every} 个全注意力层留 1 个 Full，"
               f"其余 Reuse 借共享 latent（KV 缓存下降）", flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0

@@ -22,7 +22,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.llm.local.config import SmallLLMConfig, tiny_test_config
+from src.llm.local.config import (
+    SmallLLMConfig,
+    sync_csa_reuse_from_checkpoint,
+    tiny_test_config,
+)
 from src.llm.local.model import TinyLLM
 
 
@@ -71,6 +75,9 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = tiny_test_config() if args.preset == "tiny" else SmallLLMConfig()
+    if args.model:
+        # 按真实权重对齐 CSA2（该开关不改 state_dict 键，装错不报错只会静默变语义）
+        sync_csa_reuse_from_checkpoint(cfg, args.model)
     if args.run_yaml:
         from scripts.measure_mtp_acceptance import apply_run_yaml
 

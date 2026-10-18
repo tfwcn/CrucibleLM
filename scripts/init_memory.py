@@ -67,7 +67,7 @@ def main(argv=None) -> int:
     """校准主流程."""
     import torch
 
-    from src.llm.local.config import SmallLLMConfig
+    from src.llm.local.config import SmallLLMConfig, sync_csa_reuse_from_checkpoint
     from src.llm.local.data import SFT_PROMPT, iter_local_sft
     from src.llm.local.infer import SimpleTokenizer
     from src.llm.local.memory import init_memory_from_activations
@@ -87,6 +87,8 @@ def main(argv=None) -> int:
     # 含记忆层的模型 + 旧权重覆写（vocab_size 保持预设容量 8192，
     # 与训练脚本同口径：SFT 扩词复用空行不改形状，覆写要求形状逐位一致）
     config = SmallLLMConfig()
+    # 按来源权重对齐 CSA2（该开关不改 state_dict 键，装错不报错只会静默变语义）
+    sync_csa_reuse_from_checkpoint(config, args.src)
     config.memory_every = args.memory_every
     config.memory_slots = args.memory_slots
     config.memory_topk = args.memory_topk

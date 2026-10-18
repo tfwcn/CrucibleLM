@@ -59,8 +59,12 @@ class SmallLLMConfig:
     sparse_chunk: int = 2048  # 预填充分块（显存/速度折中）
     # CSA2 跨层 KV 复用（DeepSeek-V4.1）：每 N 个全注意力层里 1 个 Full（自算 latent），
     # 其余 Reuse（复用最近 Full 层的 latent，自算 Q/上投影，不重复存 KV 缓存）。
-    # 1=全 Full（默认，逐位兼容，无共享）；2=Full/Reuse 交替，KV 缓存减半。
-    csa_reuse_every: int = 1
+    # 实测（本机 128M 续训 2500 步）：8192 上下文 KV −30%，val_loss +0.012（相对 +0.27%），
+    # 收敛后差距不归零——是"有代价的收益"，故默认开（2），要无损兼容或对照时传 1。
+    # 1=全 Full（逐位兼容旧 checkpoint，无共享）；2=Full/Reuse 交替。
+    # 注意：改默认值只影响"新建模型"；续训/迁移时训练脚本会从 checkpoint 的
+    # hparams.json 沿用架构，读不到则保守按 1 处理，避免静默换架构。
+    csa_reuse_every: int = 2
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
@@ -199,6 +203,8 @@ def tiny_test_config() -> "SmallLLMConfig":
         mtp_depth=1,
         max_seq_len=256,
         yarn_scale=1.0,
+        # CPU 极小配置保持"全 Full"基线：单测断言的是结构契约，不该随生产默认值漂移
+        csa_reuse_every=1,
     )
 
 
@@ -215,3 +221,46 @@ def longctx_config() -> "SmallLLMConfig":
         sparse_stride=512,
         sparse_chunk=2048,
     )
+
+
+def _read_saved_config(path) -> dict | None:
+    """读 checkpoint 同目录保存的配置字典（`config.json` 优先，其次 `hparams.json` 的 `config`）.
+
+    `path` 可以是权重文件、权重前缀或所在目录。读不到返回 None。
+    """
+    import json
+    from pathlib import Path
+
+    p = Path(path)
+    d = p if p.is_dir() else p.parent
+    for name, wrap in (("config.json", None), ("hparams.json", "config")):
+        f = d / name
+        if not f.exists():
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if wrap:
+            data = data.get(wrap) if isinstance(data, dict) else None
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def sync_csa_reuse_from_checkpoint(config: "SmallLLMConfig", path) -> bool:
+    """按 checkpoint 对齐 CSA2 开关（唯一"改共享关系但不改 state_dict 键"的结构开关）.
+
+    `csa_reuse_every` 只改变 Full/Reuse 层的权重共享，不改变键名与形状——装错架构
+    **不会报错**，只会静默改变语义（如把 Reuse 层的 KV 投影换成相邻 Full 层的）。
+    故加载既有权重的脚本应先调用本函数对齐来源；读不到来源返回 False，调用方用默认值。
+    """
+    data = _read_saved_config(path)
+    if not data or "csa_reuse_every" not in data:
+        return False
+    try:
+        config.csa_reuse_every = max(int(data["csa_reuse_every"]), 1)
+    except (TypeError, ValueError):
+        return False
+    return True
+

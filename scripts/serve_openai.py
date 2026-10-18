@@ -35,7 +35,7 @@ def main(argv=None) -> int:
     """服务主流程."""
     import torch
 
-    from src.llm.local.config import SmallLLMConfig
+    from src.llm.local.config import SmallLLMConfig, sync_csa_reuse_from_checkpoint
     from src.llm.local.infer import LocalChatBackend
     from src.llm.local.server import OpenAIServer
 
@@ -46,6 +46,8 @@ def main(argv=None) -> int:
         config = SmallLLMConfig(**json.loads(Path(args.config).read_text(encoding="utf-8")))
     else:
         config = SmallLLMConfig()
+        # 无显式配置时按权重目录对齐 CSA2（否则可能静默装错架构）
+        sync_csa_reuse_from_checkpoint(config, args.model)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     backend = LocalChatBackend.load(args.model, config)
     backend.model = backend.model.to(device)

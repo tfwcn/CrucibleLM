@@ -43,7 +43,7 @@ def main(argv=None) -> int:
     """扫描主流程."""
     import torch
 
-    from src.llm.local.config import SmallLLMConfig
+    from src.llm.local.config import SmallLLMConfig, sync_csa_reuse_from_checkpoint
     from src.llm.local.data import SFT_PROMPT, iter_local_sft
     from src.llm.local.infer import SimpleTokenizer
     from src.llm.local.model import TinyLLM
@@ -60,6 +60,8 @@ def main(argv=None) -> int:
     tok.vocab_size = len(tok._chars) + 4
 
     config = SmallLLMConfig()
+    # 按来源权重对齐 CSA2（该开关不改 state_dict 键，装错不报错只会静默变语义）
+    sync_csa_reuse_from_checkpoint(config, args.src)
     config.memory_every = args.memory_every
     if args.retro_every > 0:
         config.retro_enabled = True
