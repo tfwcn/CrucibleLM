@@ -13,7 +13,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek V3/V4 | 细粒度 MoE + 共享专家 | `moe.py`：16 小专家 top-4 + 1 共享专家 + aux 负载均衡 |
 | DeepSeek-V4.1 | SwiGLU 预激活限幅 | `moe.py`：gate/up 对称 `clamp(±swiglu_limit)` 压激活离群值（`swiglu_limit`，**默认 10=开**，0=关） |
 | DeepSeek-V4.1 | 免辅助损失路由（sqrtsoftplus + noaux_tc） | `moe.py`：打分 `sqrt(softplus(z))`，按 `打分+逐专家偏置` 选 top-k，权重取原始打分归一化 ×`routed_scaling_factor`；偏置 sign 式按负载调价、不进梯度（`router_aux_free`，**默认开**，关=旧 softmax+aux loss） |
-| DeepSeek V3 | MTP 多 token 预测 | `model.py:MTPHead`：训练时额外预测 t+2，推理关闭 |
+| DeepSeek V3 / V4.1 | MTP 多 token 预测（深度 3） | `model.py:MTPHead`：第 1 级押 t+2（键兼容旧实现），更深级（`mtp.extra.*`）链式喂"下一 token 嵌入"押到 t+1+depth（V4.1 `num_nextn_predict_layers=3`）；推理只用第 1 级（`mtp_depth`，**默认 1**=旧口径，>1 改键需重训） |
 | DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
 | DeepSeek-V4.1 | CSA2 跨层 KV 复用 | `mla.py`/`sparse_attn.py`：Full/Reuse 交替，Reuse 借最近 Full 层 latent（`csa_reuse_every`，**默认 2=开**，1=关） |
 | DeepSeek-V4.1 | 3×3 pixel-unshuffle 视觉压缩 | `vision_compress.py`：`vision_unshuffle=3` 先按 3×3 重排降采样，视觉 token /9（默认 1=关） |
@@ -29,6 +29,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 - MoE：16 专家 / top-4 / 专家 hidden 192 / 1 共享专家；SwiGLU 预激活限幅 `swiglu_limit=10.0`（V4.1，默认开，0=关）
 - 路由：免辅助损失 `router_aux_free=True`（V4.1 sqrtsoftplus + noaux_tc；`routed_scaling_factor=1.5`、`router_bias_lr=1e-3`），关=旧 softmax + aux loss
 - 上下文 8192（YaRN scale=2），embedding 与输出头绑定省约 6M
+- MTP：`mtp_depth=1`（押 t+2，键兼容旧 run）；V4.1 用 3（`num_nextn_predict_layers`），开需重训（改键）
 
 ## 用法
 
@@ -337,6 +338,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `csa_reuse_every`(2) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，实测 8192 ctx KV −30%、32768 −32%）。**默认 2=开**（实测有代价的净收益），1=关 | `mla.py`/`sparse_attn.py`/`model.py` |
 | `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 | `o_groups`(1) / `o_lora_rank`(0) | MLA 分组低秩输出投影（V4.1：8/1024）：按头分组、每组压到 `o_lora_rank` 再拼接升维。**默认关**（改 `state_dict` 键，旧 ckpt 无法直接载入）；开启需重训或 `scripts/migrate_model.py --o-groups G --o-lora-rank r`（SVD 迁移，近似）。详见 `docs/details/mla-grouped-output.md` | `mla.py`/`migrate.py` |
+| `mtp_depth`(1) | MTP 预测深度（V4.1 `num_nextn_predict_layers=3`）：第 1 级押 t+2（键兼容），更深级链式喂"下一 token 嵌入"押到 t+1+depth，多级 loss 取均值。**默认 1**（>1 新增 `mtp.extra.*`、改键，旧 ckpt 需重训）；`--mtp-depth` 三态，续训从 hparams 沿用。详见 `docs/details/mtp.md` | `model.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
   实测自然语言 30–39%（不值得开）、代码 66%（值得开），**默认关、按负载决定**。

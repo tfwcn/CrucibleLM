@@ -32,7 +32,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 9 | MLA 分组输出投影 `o_lora_rank` + `o_groups` | ✅ | `mla.py` |
 | 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | 🔶 mHC-lite | `hyperconn.py` |
 | 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | 🔶 小表 + 短卷积 | `engram.py` |
-| 12 | MTP 深度 3 | 🔶 深度 1 | `model.py` |
+| 12 | MTP 深度 3 | ✅ | `model.py` |
 | 13 | DSpark 独立训练草稿模块（3 层 + Markov 头 + 置信头 + 吞吐调度） | 🔶 仅解码启发式 | `spec_decode.py` |
 | 14 | head-wise Muon（Q/K 按头分块） | 🔶 整块 Muon | `optim.py` |
 | 15 | Sinkhorn 更新（embedding/head 用 momentum+Sinkhorn 替 Adam） | ❌ | `optim.py` |

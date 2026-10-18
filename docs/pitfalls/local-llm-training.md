@@ -417,7 +417,7 @@ n-gram 共享：同一个桶每步收到方向相反的梯度，AdamW 的 `m/√
 **机制**：开关分两类，保护手段不同：
 - **改语义/共享关系、不改键**（`csa_reuse_every`、`swiglu_limit`、路由三件套）：装错**不报错**，
   只会静默换架构/改前向数字 → 必须靠 `sync_arch_from_checkpoint` 来源对齐，默认可以开；
-- **改结构、改键**（`o_groups`/`o_lora_rank`、`memory_every`、`hyper_streams` 等）：装错会
+- **改结构、改键**（`o_groups`/`o_lora_rank`、`mtp_depth`、`memory_every`、`hyper_streams` 等）：装错会
   strict 载入**大声报缺键** → 不会静默出错，但**默认必须关**（否则旧 run 无法续），
   属需迁移/重训的 opt-in。
 

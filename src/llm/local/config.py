@@ -63,7 +63,10 @@ class SmallLLMConfig:
     routed_scaling_factor: float = 1.5
     # top-k 权重是否归一化（V4.1=true；旧口径恒归一化）
     norm_topk_prob: bool = True
-    # MTP 额外预测步数（1 表示除 t+1 外再预测 t+2）
+    # MTP 额外预测步数：1=只预测 t+2（旧口径，键兼容）；D>1=级联预测 t+2…t+1+D
+    # （DeepSeek-V4.1 num_nextn_predict_layers=3）。**默认 1**：D>1 每级新增浅层头
+    # `mtp.extra.*`，**改变 state_dict 键**，旧 checkpoint 需重训，故属 opt-in；
+    # 推理/起草只用第 1 级，主干前向不变（MTP 是训练期辅助目标）。
     mtp_depth: int = 1
     # MTP loss 权重
     mtp_loss_weight: float = 0.3
@@ -338,6 +341,8 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     # MLA 分组输出投影（V4.1）；改 state_dict 键（w_o → w_o_d/w_o_u），旧 ckpt 回退 1/0=关
     "o_groups": (1, _norm_at_least_one_int),
     "o_lora_rank": (0, _norm_nonneg_int),
+    # MTP 深度（V4.1=3）；改 state_dict 键（depth>1 增 mtp.extra.*），旧 ckpt 回退 1
+    "mtp_depth": (1, _norm_nonneg_int),
 }
 
 

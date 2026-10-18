@@ -73,22 +73,61 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
     )
 
 
-class MTPHead(nn.Module):
-    """MTP 多 token 预测头（DeepSeek 系训练加速技巧，推理时关闭）.
+class _MTPLevel(nn.Module):
+    """MTP 第 ≥2 级：上一级 hidden ⊕ 下一 token 嵌入 → 变换（DeepSeek 式值输入）.
 
-    用主干末 hidden 预测 t+2 的 token：一个浅层块 + 复用词表投影。
+    比第 1 级多喂一个"下一 token 的嵌入"——让更深一级的预测能挂上真实 token 信息，
+    而不是只靠上一级的 hidden 硬猜。
     """
 
     def __init__(self, config: SmallLLMConfig):
         super().__init__()
-        self.depth = config.mtp_depth
+        self.norm_h = RMSNorm(config.d_model)
+        self.norm_e = RMSNorm(config.d_model)
+        self.proj = nn.Linear(2 * config.d_model, config.d_model, bias=False)
+
+    def forward(self, h_prev: torch.Tensor, tok_emb: torch.Tensor) -> torch.Tensor:
+        """拼接（归一化后的上一级 hidden、下一 token 嵌入）再做线性变换."""
+        return self.proj(torch.cat(
+            [self.norm_h(h_prev), self.norm_e(tok_emb)], dim=-1))
+
+
+class MTPHead(nn.Module):
+    """MTP 多 token 预测头（DeepSeek 系训练加速技巧，推理时关闭）.
+
+    第 1 级（键名 `norm`/`proj`，与旧实现逐位一致）：主干 hidden 预测 t+2；
+    更深级（`extra.{i}`，仅 depth>1 时存在）：上一级 hidden ⊕ 下一 token 嵌入，
+    预测更远一步（DeepSeek-V4.1 `num_nextn_predict_layers`；本项目用线性变换替代
+    整层 Transformer 块）。
+    """
+
+    def __init__(self, config: SmallLLMConfig):
+        super().__init__()
+        self.depth = max(int(config.mtp_depth), 0)
         self.norm = RMSNorm(config.d_model)
         # 浅层变换：让 MTP 头有独立于主 head 的表达空间
         self.proj = nn.Linear(config.d_model, config.d_model, bias=False)
+        # 更深级（depth>1）；depth=1 时为空 ModuleList，state_dict 键与旧实现一致
+        self.extra = nn.ModuleList([
+            _MTPLevel(config) for _ in range(max(self.depth - 1, 0))
+        ])
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """输入主干 hidden，输出 MTP 用的 hidden（logits 由主模型词表头复用）."""
+        """第 1 级前向（推理/起草用）：主干 hidden → 预测 t+2 的 hidden."""
         return self.proj(self.norm(h))
+
+    def forward_all(
+        self, h0: torch.Tensor, tok_embeds: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """逐级前向，返回各级 hidden（长度 = depth），供训练多目标 loss.
+
+        h0：第 1 级输入（主干 hidden）；
+        tok_embeds：第 d 级（d≥2）所需的"下一 token"嵌入，长度 depth-1（按级递增）。
+        """
+        outs = [self.forward(h0)]
+        for level, emb in zip(self.extra, tok_embeds):
+            outs.append(level(outs[-1], emb))
+        return outs
 
 
 class TinyLLM(nn.Module):
@@ -177,7 +216,7 @@ class TinyLLM(nn.Module):
     ) -> dict:
         """前向：训练时传 targets 返回组合 loss，推理时只返回 logits.
 
-        loss = 主 CE(t+1) + mtp_weight * MTP CE(t+2) + 各层 aux_loss 之和。
+        loss = 主 CE(t+1) + mtp_weight * MTP 各级 CE(t+2..t+1+depth) 均值 + 各层 aux_loss 之和。
         return_token_losses=True 时附带逐 token 主 loss（RHO 选择用，
         ignore 位为 0 且反向无梯度，自然不会被选中）。
         mem/mem_mask: v1 单点检索记忆 (b, M, d)/(b, M)，仅 retro_enabled
@@ -273,16 +312,29 @@ class TinyLLM(nn.Module):
         out["_main_mean"] = main_loss
         if return_token_losses:
             out["token_losses"] = ce_tokens.view(input_ids.shape[0], -1)
-        # MTP loss：用位置 i 的 hidden 预测 i+2 的 token（同样只取文本段）
-        if self.mtp is not None and targets.shape[1] > 2:
-            mtp_h = self.mtp(h[:, v_len:h.shape[1] - 2])
-            mtp_logits = self.lm_head(mtp_h)
-            mtp_loss = F.cross_entropy(
-                mtp_logits.reshape(-1, self.config.vocab_size),
-                targets[:, 2:].reshape(-1),
-            )
-            loss = loss + self.config.mtp_loss_weight * mtp_loss
-            out["mtp_loss"] = mtp_loss.detach()
+        # MTP loss：第 d 级用位置 i 的 hidden 预测 i+d+1 的 token（只取文本段）。
+        # 第 1 级复现旧口径（逐位一致）；更深级额外喂入下一 token 嵌入。
+        if self.mtp is not None:
+            depth = self.mtp.depth
+            n = input_ids.shape[1] - 1 - depth  # 可用位置数（各级共用）
+            if n > 0:
+                # 第 d（≥2）级所需的"下一 token"嵌入 = input_ids[:, i+d]（用输入序列，
+                # 避开 SFT 的 -100 掩码无法查表的问题）
+                tok_embeds = [self.embed(input_ids[:, d:d + n])
+                              for d in range(2, depth + 1)]
+                level_h = self.mtp.forward_all(
+                    h[:, v_len:v_len + n], tok_embeds)
+                level_losses = [
+                    F.cross_entropy(
+                        self.lm_head(hd).reshape(-1, self.config.vocab_size),
+                        targets[:, d + 1:d + 1 + n].reshape(-1),
+                    )
+                    for d, hd in enumerate(level_h, start=1)
+                ]
+                mtp_loss = torch.stack(level_losses).mean()
+                loss = loss + self.config.mtp_loss_weight * mtp_loss
+                out["mtp_loss"] = mtp_loss.detach()
+                out["mtp_level_losses"] = [x.detach() for x in level_losses]
         loss = loss + aux_total
         out["loss"] = loss
         return out

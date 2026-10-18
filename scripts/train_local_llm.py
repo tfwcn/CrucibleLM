@@ -156,6 +156,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "新训练默认关=1）")
     p.add_argument("--o-lora-rank", type=int, default=None,
                    help="每组中间维 o_lora_rank（V4.1=1024；仅 o_groups>1 生效）")
+    p.add_argument("--mtp-depth", type=int, default=None,
+                   help="MTP 预测深度（V4.1 num_nextn_predict_layers=3；>1 每级新增浅层头，"
+                        "**改变 state_dict 键**，旧 checkpoint 需重训；不传时沿用/默认 1）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -827,6 +830,11 @@ def main(argv=None) -> int:
         print(f"MLA 输出分组低秩已开：{config.o_groups} 组，每组中间维 "
               f"{config.o_lora_rank}（输出投影参数下降；键已变，旧 ckpt 需迁移）",
               flush=True)
+    if arch_src.get("mtp_depth") == "checkpoint":
+        print(f"MTP：沿用 checkpoint 深度 mtp_depth={config.mtp_depth}", flush=True)
+    if config.mtp_depth > 1:
+        print(f"MTP 深度已开：级联预测 t+2…t+{config.mtp_depth + 1}"
+              f"（每级一个浅层头；键已变，旧 ckpt 需重训）", flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0
     if args.resume:
