@@ -4,7 +4,7 @@
 
 ## 一句话定位
 
-CrucibleLM（坩埚）——融合最新 LLM 架构的**实验性**小模型：MLA + Hybrid 线性注意力 + 稀疏 + 细粒度 MoE + MTP，约 128M 参数，单卡 16G 可从零训练，200K 上下文推理就绪。实验品，不是稳定版。
+CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **DeepSeek-V4.1-Flash**，逐项独立实现并验证它的整套技术（CED / CSA2 三模式 / 分层稀疏 indexer / FP4 KV / SwiGLU-limit / 免辅助损失路由 / Single-Pass mHC / Engram / MTP-3 / DSpark / head-wise Muon / Sinkhorn 更新 / 视觉压缩），把原理、实现、代价、单测沉淀成可复现的技术档案。规模（现 ~128M、单卡 16G）只是"能跑起来"的参考，**不是目标**——为跑通技术允许超预算。
 
 | 层 | 技术栈 |
 |---|---|
@@ -12,6 +12,37 @@ CrucibleLM（坩埚）——融合最新 LLM 架构的**实验性**小模型：M
 | 数据 | datasets（HF 流式）/ modelscope（魔搭落盘）/ pyarrow |
 | 老师 | transformers 4.5x（MiniCPM 自带 modeling 与 v5 互斥，勿升级） |
 | 单测 | pytest（需 torch，无 torch 自动跳过） |
+
+## 项目目标（技术优先：V4.1 全特性对齐）
+
+**目标**：以 `DeepSeek-V4.1-Flash` 技术报告《Pushing the Limits of KV Cache Compression》及其 HF `config.json` 为对标，把下表每一项在本仓库**独立实现 + 单测锁定 + 写清原理与代价**。规模不设上限，为跑通技术允许超预算。
+
+**清单（✅ 已有 / 🔶 部分或简化 / ❌ 待做）**
+
+| # | 技术点 | 现状 | 落点 |
+|---|---|---|---|
+| 1 | SwiGLU 限幅 `swiglu_limit` | ❌ | `moe.py` |
+| 2 | 免辅助损失路由（sqrtsoftplus + noaux_tc + routed_scaling） | ❌ | `moe.py` |
+| 3 | CSA2 三模式 Full/Reindex/Reuse | 🔶 仅 Full/Reuse | `mla.py` |
+| 4 | 逐层压缩比 `compress_ratios` + KV 源层（非均匀） | 🔶 每 N 层统一 | `config.py`/`model.py` |
+| 5 | 分层稀疏 indexer（学习式 top-K + 块级候选池） | 🔶 固定 sink/window/stride | `sparse_attn.py` |
+| 6 | CED 编码器-解码器（上半层全局 KV 由 L/2 层投影，省近半预填充） | ❌ | `model.py`/`block.py` |
+| 7 | 每层 SWA + SWA Bounded Replay | 🔶 hybrid 骨架 | `sparse_attn.py` |
+| 8 | FP4 主 KV（MXFP4 + QAT）+ FP8 SWA KV | ❌ | `mla.py`/`optim.py` |
+| 9 | MLA 分组输出投影 `o_lora_rank` + `o_groups` | ❌ | `mla.py` |
+| 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | 🔶 mHC-lite | `hyperconn.py` |
+| 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | 🔶 小表 + 短卷积 | `engram.py` |
+| 12 | MTP 深度 3 | 🔶 深度 1 | `model.py` |
+| 13 | DSpark 独立训练草稿模块（3 层 + Markov 头 + 置信头 + 吞吐调度） | 🔶 仅解码启发式 | `spec_decode.py` |
+| 14 | head-wise Muon（Q/K 按头分块） | 🔶 整块 Muon | `optim.py` |
+| 15 | Sinkhorn 更新（embedding/head 用 momentum+Sinkhorn 替 Adam） | ❌ | `optim.py` |
+| 16 | 视觉：patch14 + 3×3 downsample | 🔶 downsample 对齐 | `vision_compress.py` |
+| 17 | 1M 上下文（64K 稀疏起训 + YaRN 外推） | 🔶 默认 8K / 长上下文 200K | `config.py` + 训练 |
+| 18 | 可控推理努力（1–100 整数档） | ❌ | 推理 / 后训练 |
+
+**每项交付模板**：`docs/details/<技术>.md`（含"从想法到代码"）+ 单测（数学/因果/Finite）+ `docs/ARCHITECTURE.md` 开关行；踩坑进 `docs/pitfalls/`。默认开按约定 5；**前向数学变更**（1/3/4/6/7/8/9/10/11）必须重跑冒烟，并给出"旧 checkpoint 来源对齐或显式关闭"路径（沿用 `hparams.json`）。
+
+**建议顺序**：先隔离性强、可回退的（1/2/9/12），再骨架级（6/7/3/4/5），最后记忆与量化（11/13/8/14/15/16/17/18）。
 
 ## 操作约束
 
