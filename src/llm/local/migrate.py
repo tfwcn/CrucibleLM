@@ -30,7 +30,7 @@ def add_identity_layers(model: TinyLLM, n_add: int) -> None:
         layer = build_block(config, base + i)
         # 置零残差输出：注意力输出投影 + 所有专家（含共享）的下投影
         with torch.no_grad():
-            layer.attn.w_o.weight.zero_()
+            layer.attn.out_proj_weight().zero_()
             for expert in list(layer.moe.experts) + list(layer.moe.shared):
                 expert.w_down.weight.zero_()
         model.layers.append(layer)
@@ -101,3 +101,49 @@ def svd_split(
     down = (u[:, :rank] * sq.unsqueeze(0)).to(weight.dtype)
     up = (sq.unsqueeze(1) * vh[:rank, :]).to(weight.dtype)
     return down, up, round(1 - energy, 4)
+
+
+def group_output_projection(
+    model: TinyLLM, o_groups: int, o_lora_rank: int, seed: int = 0,
+) -> tuple[TinyLLM, float]:
+    """把稠密输出投影 w_o 迁移为**分组低秩**（DeepSeek-V4.1 o_groups/o_lora_rank）.
+
+    近似（有损耗）：对每个全注意力层，把 `w_o`（d_model × n_heads*head_dim）按头分成
+    `o_groups` 个列块，逐块做秩 `o_lora_rank` 的截断 SVD，写入 `w_o_d`（降维）/`w_o_u`
+    （升维）。返回 (新模型, 平均相对重构误差)；误差 = 各块被截断的奇异值能量占比。
+
+    只处理全注意力层（线性注意力层无输出分组，原样保留）；已在分组的模型直接跳过。
+    新模型 config 的 `o_groups`/`o_lora_rank` 已同步，可直接续训。
+    """
+    if o_groups <= 1 or o_lora_rank <= 0:
+        raise ValueError("group_output_projection 需 o_groups>1 且 o_lora_rank>0")
+    cfg = copy.copy(model.config)
+    cfg.o_groups = int(o_groups)
+    cfg.o_lora_rank = int(o_lora_rank)
+    new = TinyLLM(cfg)  # 分组输出开启（TinyLLM 内部会校验 n_heads 可整除、r ≤ 每组输入维）
+    errs: list[float] = []
+    with torch.no_grad():
+        old_sd = model.state_dict()
+        # 先用旧权重覆盖所有同名同形参数（w_o 在新模型里不存在，w_o_d/w_o_u 为新增）
+        merged = {
+            k: (old_sd[k] if (k in old_sd and old_sd[k].shape == v.shape) else v)
+            for k, v in new.state_dict().items()
+        }
+        new.load_state_dict(merged)
+        for lo, ln in zip(model.layers, new.layers):
+            attn = ln.attn
+            if not getattr(attn, "grouped_o", False):
+                continue  # 线性注意力层无分组输出
+            if getattr(lo.attn, "grouped_o", False):
+                continue  # 源已是分组输出，键已按同形复制，不再分解
+            w_o = lo.attn.w_o.weight.detach()
+            in_g = attn.heads_per_group * attn.head_dim
+            r = attn.o_lora_rank
+            for g in range(attn.o_groups):
+                block = w_o[:, g * in_g:(g + 1) * in_g]
+                down, up, err = svd_split(block, r)
+                attn.w_o_u.weight[:, g * r:(g + 1) * r].copy_(down)
+                attn.w_o_d[g].weight.copy_(up)
+                errs.append(err)
+    new.eval()
+    return new, round(sum(errs) / max(len(errs), 1), 4)

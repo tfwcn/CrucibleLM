@@ -150,6 +150,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "不传时新训练取架构默认=开，续训/迁移沿用 checkpoint")
     p.add_argument("--routed-scaling-factor", type=float, default=None,
                    help="路由权重缩放（V4.1=1.5；仅免辅助损失路由生效）")
+    p.add_argument("--o-groups", type=int, default=None,
+                   help="MLA 输出投影分组数（V4.1=8；>1 时启用分组低秩输出，**改变 "
+                        "state_dict 键**，旧 checkpoint 需迁移或重训；不传时沿用 checkpoint/"
+                        "新训练默认关=1）")
+    p.add_argument("--o-lora-rank", type=int, default=None,
+                   help="每组中间维 o_lora_rank（V4.1=1024；仅 o_groups>1 生效）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -813,6 +819,13 @@ def main(argv=None) -> int:
               flush=True)
     else:
         print(f"路由：旧口径（softmax + greedy + aux loss {config.aux_loss_coef}）",
+              flush=True)
+    if arch_src.get("o_groups") == "checkpoint":
+        print(f"MLA 输出：沿用 checkpoint 架构 o_groups={config.o_groups}"
+              f"（o_lora_rank={config.o_lora_rank}）", flush=True)
+    if config.o_groups > 1 and config.o_lora_rank > 0:
+        print(f"MLA 输出分组低秩已开：{config.o_groups} 组，每组中间维 "
+              f"{config.o_lora_rank}（输出投影参数下降；键已变，旧 ckpt 需迁移）",
               flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0

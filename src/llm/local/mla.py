@@ -45,6 +45,8 @@ class MLAModule(nn.Module):
         rope_theta: float = 10000.0,
         yarn_scale: float = 1.0,
         dropout: float = 0.0,
+        o_groups: int = 1,
+        o_lora_rank: int = 0,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -65,7 +67,31 @@ class MLAModule(nn.Module):
         # 输出投影 + QK-Norm（Qwen3 系做法，稳定训练）
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
-        self.w_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
+        # 输出投影：默认单个稠密 w_o（键名 w_o.weight，与旧 checkpoint 兼容）。
+        # o_groups>1 且 o_lora_rank>0 时改为**分组低秩**（DeepSeek-V4.1：o_groups=8 +
+        # 每组中间维 o_lora_rank）：把 n_heads 分成 o_groups 组，每组头输出先降维到
+        # o_lora_rank，拼接后再升维回 d_model。省参数、多一组非线性前没有（纯线性重组），
+        # 但改变了 state_dict 键（旧 checkpoint 需迁移或重训，见 group_output_projection）。
+        self.o_groups = int(o_groups)
+        self.o_lora_rank = int(o_lora_rank)
+        self.grouped_o = self.o_groups > 1 and self.o_lora_rank > 0
+        if self.grouped_o:
+            assert n_heads % self.o_groups == 0, \
+                f"n_heads({n_heads}) 须能被 o_groups({self.o_groups}) 整除"
+            self.heads_per_group = n_heads // self.o_groups
+            in_per_group = self.heads_per_group * self.head_dim
+            assert 0 < self.o_lora_rank <= in_per_group, (
+                f"o_lora_rank({self.o_lora_rank}) 须在 (0, 每组输入维 {in_per_group}] 内")
+            self.w_o_d = nn.ModuleList([
+                nn.Linear(in_per_group, self.o_lora_rank, bias=False)
+                for _ in range(self.o_groups)
+            ])
+            self.w_o_u = nn.Linear(self.o_groups * self.o_lora_rank, d_model,
+                                   bias=False)
+            # 占位：分组时不注册 w_o（键集不同，旧 checkpoint 严格载入会报缺键）
+            self.w_o = None
+        else:
+            self.w_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
         self.dropout = dropout
         # CSA2 跨层复用：True 时本层为 "Reuse" 层——推理/解码复用最近 Full 层的
         # latent 缓存，不重复写自己的 KV（由 build_block 按 csa_reuse_every 设）；
@@ -75,6 +101,32 @@ class MLAModule(nn.Module):
         cos, sin = build_rope_cache(max_seq_len, qk_rope_dim, rope_theta, yarn_scale)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
+
+    def out_proj_weight(self) -> torch.Tensor:
+        """残差输出投影的权重（按深度缩放初始化 / 迁移置零用）.
+
+        分组低秩时返回升维投影 `w_o_u`（降维 `w_o_d` 是内部瓶颈，置零它没意义）；
+        否则返回稠密 `w_o`。
+        """
+        return self.w_o_u.weight if self.grouped_o else self.w_o.weight
+
+    def _out_proj(self, out: torch.Tensor) -> torch.Tensor:
+        """输出投影：(b, t, n_heads*head_dim) → (b, t, d_model).
+
+        分组低秩：按头分组各自降维到 o_lora_rank，拼接后一次升维（等价于每组各有一个
+        o_lora_rank→d_model 升维再求和，只是把求和并进了矩阵乘法）。关闭时退化为稠密
+        `w_o`，与旧实现逐位一致。
+        """
+        if not self.grouped_o:
+            return self.w_o(out)
+        b, t, _ = out.shape
+        in_per_group = self.heads_per_group * self.head_dim
+        grouped = out.view(b, t, self.o_groups, in_per_group)
+        latents = torch.stack(
+            [self.w_o_d[i](grouped[:, :, i]) for i in range(self.o_groups)],
+            dim=2,
+        )  # (b, t, o_groups, o_lora_rank)
+        return self.w_o_u(latents.reshape(b, t, self.o_groups * self.o_lora_rank))
 
     def _pack_cache(
         self, c_kv: torch.Tensor, k_rope_raw: torch.Tensor, reserve: int,
@@ -186,7 +238,7 @@ class MLAModule(nn.Module):
             dropout_p=self.dropout,
         )
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
-        return self.w_o(out), (reuse if return_state else None)
+        return self._out_proj(out), (reuse if return_state else None)
 
     def _decode_attend(
         self,
@@ -237,7 +289,7 @@ class MLAModule(nn.Module):
             dropout_p=0.0,
         )
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
-        return self.w_o(out), (buf_c, buf_kr, pos_next)
+        return self._out_proj(out), (buf_c, buf_kr, pos_next)
 
     def forward(
         self,
@@ -275,9 +327,9 @@ class MLAModule(nn.Module):
         )
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
         if not return_state:
-            return self.w_o(out), None
+            return self._out_proj(out), None
         # 静态缓存装箱（reserve=0 即恰好当前长度，解码前由调用方扩到够用）
-        return self.w_o(out), self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
+        return self._out_proj(out), self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
 
     def cache_bytes_per_token(self, dtype_bytes: int = 2) -> int:
         """每 token KV 缓存字节数（对比 MHA 说明压缩收益）."""

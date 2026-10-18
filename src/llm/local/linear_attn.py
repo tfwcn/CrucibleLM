@@ -43,6 +43,10 @@ class GatedDeltaLite(nn.Module):
         # 多 token 增量解码时记录的每步缓存（投机部分接受回退用；其余时候 None）
         self.multi_steps: list | None = None
 
+    def out_proj_weight(self) -> torch.Tensor:
+        """残差输出投影权重（统一接口；线性层无分组低秩，直接返回 w_o）."""
+        return self.w_o.weight
+
     def _step_conv(
         self,
         conv: nn.Conv1d,

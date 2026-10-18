@@ -29,7 +29,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 6 | CED 编码器-解码器（上半层全局 KV 由 L/2 层投影，省近半预填充） | ❌ | `model.py`/`block.py` |
 | 7 | 每层 SWA + SWA Bounded Replay | 🔶 hybrid 骨架 | `sparse_attn.py` |
 | 8 | FP4 主 KV（MXFP4 + QAT）+ FP8 SWA KV | ❌ | `mla.py`/`optim.py` |
-| 9 | MLA 分组输出投影 `o_lora_rank` + `o_groups` | ❌ | `mla.py` |
+| 9 | MLA 分组输出投影 `o_lora_rank` + `o_groups` | ✅ | `mla.py` |
 | 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | 🔶 mHC-lite | `hyperconn.py` |
 | 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | 🔶 小表 + 短卷积 | `engram.py` |
 | 12 | MTP 深度 3 | 🔶 深度 1 | `model.py` |

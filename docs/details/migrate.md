@@ -23,6 +23,8 @@
   - `--expert-hidden M`：专家加宽（Net2WiderNet，复制单元 + 下投影列平分，
     ulp 级误差内一致）；
 - **有损操作**（需短训恢复）：`--keep-layers` 层裁剪；
+  `--o-groups G --o-lora-rank r` MLA 分组低秩输出投影（对稠密 `w_o` 按头分组逐块 SVD，
+  近似、附平均重构误差；详见[MLA 分组输出投影](./mla-grouped-output.md)）；
   `--svd-report` 各投影低秩能量占比（跨架构映射如 GQA→MLA 选 rank 用，
   配 `svd_split` 手册配方，不做假精确的自动映射）；
 - `build_block` 是模型/迁移/训练共用的**唯一构造入口**，防参数漂移；

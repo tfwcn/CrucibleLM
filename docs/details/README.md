@@ -6,6 +6,7 @@
 ## 注意力与位置
 
 - [MLA：低秩压缩的 KV 缓存](./mla.md)
+- [MLA 分组输出投影：压最后一哆嗦](./mla-grouped-output.md)
 - [线性注意力：O(1) 状态的金鱼记忆](./linear-attention.md)
 - [Hybrid 交替：排班表](./hybrid.md)
 - [稀疏注意力：200K 跳读](./sparse-attention.md)

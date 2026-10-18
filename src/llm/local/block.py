@@ -39,6 +39,8 @@ class HybridBlock(nn.Module):
         router_bias_lr: float = 1e-3,
         routed_scaling_factor: float = 1.5,
         norm_topk_prob: bool = True,
+        o_groups: int = 1,
+        o_lora_rank: int = 0,
         dropout: float = 0.0,
         sparse_threshold: int = 4096,
         sparse_window: int = 4096,
@@ -71,6 +73,7 @@ class HybridBlock(nn.Module):
                 max_seq_len, rope_theta, yarn_scale, dropout,
                 sparse_threshold, sparse_window, sparse_sink,
                 sparse_stride, sparse_chunk,
+                o_groups=o_groups, o_lora_rank=o_lora_rank,
             )
             # CSA2 跨层复用：Reuse 层解码复用最近 Full 层的 latent 缓存（纯超参）
             self.attn.csa_reuse = bool(csa_reuse)

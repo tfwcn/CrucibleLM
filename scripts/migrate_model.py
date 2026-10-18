@@ -32,6 +32,7 @@ import torch
 from src.llm.local.config import SmallLLMConfig
 from src.llm.local.migrate import (
     add_identity_layers,
+    group_output_projection,
     subselect_layers,
     svd_split,
     widen_experts,
@@ -52,6 +53,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out", required=True, help="输出目录")
     p.add_argument("--add-layers", type=int, default=0, help="追加恒等层数")
     p.add_argument("--expert-hidden", type=int, default=0, help="专家 hidden 目标值")
+    p.add_argument("--o-groups", type=int, default=0,
+                   help="MLA 输出投影分组数（>1 时把稠密 w_o 迁移为分组低秩，"
+                        "配合 --o-lora-rank；近似有损耗，附重构误差）")
+    p.add_argument("--o-lora-rank", type=int, default=0, help="每组中间维 o_lora_rank")
     p.add_argument("--keep-layers", default="",
                    help="只保留指定层，如 0,1,2（逗号分隔，空=全保留）")
     p.add_argument("--svd-report", action="store_true", help="打印低秩能量占比")
@@ -81,6 +86,12 @@ def main(argv=None) -> int:
     if args.expert_hidden > 0:
         widen_experts(model, args.expert_hidden, seed=args.seed)
         ops.append(f"expert-hidden={args.expert_hidden}")
+    if args.o_groups > 1:
+        model, err = group_output_projection(
+            model, args.o_groups, args.o_lora_rank, seed=args.seed)
+        config = model.config  # 新模型 config（分组开关已同步）
+        ops.append(f"o-groups={args.o_groups},o-lora-rank={args.o_lora_rank}"
+                   f"(err={err:.4f})")
     if args.svd_report:
         from collections import defaultdict
 

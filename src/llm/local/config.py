@@ -25,6 +25,15 @@ class SmallLLMConfig:
     kv_lora_rank: int = 128
     # MLA：解耦 RoPE 维度（Q/K 共享同一份旋转）
     qk_rope_dim: int = 32
+    # MLA 分组输出投影（DeepSeek-V4.1：o_groups=8 + 每组中间维 o_lora_rank=1024）：
+    # 把 n_heads 分成 o_groups 组，每组头输出先降维到 o_lora_rank，拼接后一次升维回
+    # d_model，省输出投影参数（本机 12 头/head 64 为例，o_groups=4+o_lora_rank=192）。
+    # o_groups<=1 或 o_lora_rank<=0 = 关（稠密 w_o，键/数值与旧实现逐位一致）。
+    # **默认关**（区别于 1/2）：本项**改变 state_dict 键**（w_o → w_o_d/w_o_u），旧
+    # checkpoint 严格载入会报缺键，故按约定 5 归为需迁移/重训的 opt-in——开启需重训，
+    # 或走 `migrate.group_output_projection`（对 w_o 分组 SVD，近似无损，附重构误差）。
+    o_groups: int = 1
+    o_lora_rank: int = 0
     # MoE 专家总数（细粒度小专家）
     n_experts: int = 16
     # 每 token 激活专家数
@@ -288,13 +297,22 @@ def load_saved_config(path) -> "SmallLLMConfig | None":
         return None
 
 
-# "改前向语义但不改 state_dict 键"的架构开关：改默认值只影响"新建模型"，续训/迁移/
-# 装载必须从 checkpoint 的 hparams.json 沿用来源；找到配置但缺某字段 → 回退到"早于该
-# 特性"的值（旧 checkpoint 语义），避免默认值升级把旧 run 静默换架构。
+# 架构开关（登记表）：改默认值只影响"新建模型"；续训/迁移/装载必须从 checkpoint 的
+# hparams.json 沿用来源。找到配置但缺某字段 → 回退到"早于该特性"的值（旧 checkpoint
+# 语义），避免默认值升级把旧 run 静默换架构/改前向数学。
+# 分两类：①只改前向语义/共享关系、不改 state_dict 键（csa_reuse_every / swiglu_limit /
+# 路由三件套）——装错不报错，必须靠来源对齐；②改结构、改键（o_groups/o_lora_rank）——
+# 装错会严格载入报错，但同样登记在此以便续训自动沿用（旧 ckpt 回退关）。
 # 值 = (缺失时的回退值, 归一化函数)。
-def _norm_csa(v) -> int:
-    """CSA2 档位归一化：至少 1（1=全 Full/关）."""
+def _norm_at_least_one_int(v) -> int:
+    """至少 1 的整数归一化（如 CSA2 档位、o_groups）."""
     return max(int(v), 1)
+
+
+def _norm_nonneg_int(v) -> int:
+    """非负整数归一化：<=0 视为关闭（0）."""
+    i = int(v)
+    return i if i > 0 else 0
 
 
 def _norm_nonneg_float(v) -> float:
@@ -311,12 +329,15 @@ def _norm_bool(v) -> bool:
 
 
 _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
-    "csa_reuse_every": (1, _norm_csa),
+    "csa_reuse_every": (1, _norm_at_least_one_int),
     "swiglu_limit": (0.0, _norm_nonneg_float),
     # 路由开关（V4.1）；旧 checkpoint 缺字段 → 回退旧口径（aux loss + 无缩放 + 归一化）
     "router_aux_free": (False, _norm_bool),
     "routed_scaling_factor": (1.0, _norm_nonneg_float),
     "norm_topk_prob": (True, _norm_bool),
+    # MLA 分组输出投影（V4.1）；改 state_dict 键（w_o → w_o_d/w_o_u），旧 ckpt 回退 1/0=关
+    "o_groups": (1, _norm_at_least_one_int),
+    "o_lora_rank": (0, _norm_nonneg_int),
 }
 
 

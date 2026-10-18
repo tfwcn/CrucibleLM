@@ -80,10 +80,13 @@ class SparseMLAModule(MLAModule):
         sparse_sink: int = 128,
         sparse_stride: int = 512,
         sparse_chunk: int = 2048,
+        o_groups: int = 1,
+        o_lora_rank: int = 0,
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
             max_seq_len, rope_theta, yarn_scale, dropout,
+            o_groups=o_groups, o_lora_rank=o_lora_rank,
         )
         # 纯超参，不注册为 Parameter/Buffer（state_dict 与 MLA 一致，checkpoint 通用）
         self.sparse_threshold = sparse_threshold
@@ -164,7 +167,7 @@ class SparseMLAModule(MLAModule):
                 outs.append(self._sparse_scores(
                     q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t))
             out = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, t, -1)
-            return self.w_o(out), (reuse if return_state else None)
+            return self._out_proj(out), (reuse if return_state else None)
         if t <= self.sparse_threshold:
             # 短序列：与 MLAModule 逐位一致（reserve 透传装箱）
             return super().forward(h, None, return_state, reserve)
@@ -177,10 +180,10 @@ class SparseMLAModule(MLAModule):
                 q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t))
         out = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, t, -1)
         if not return_state:
-            return self.w_o(out), None
+            return self._out_proj(out), None
         # 缓存仍存 latent（与 MLA 一致，200K 上下文每 token 仅 ~320B/层），
         # 静态装箱（reserve 由 _prefill 按 prompt+max_new 精确给出）
-        return self.w_o(out), self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
+        return self._out_proj(out), self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
 
     @torch._dynamo.disable
     def _decode(
@@ -228,7 +231,7 @@ class SparseMLAModule(MLAModule):
         # t>1 为投机解码并行验证服务（块内因果由 chunk_causal_mask 保证）
         out = self._sparse_scores(q_full, k_full, v_full, total - t, total, total)
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
-        return self.w_o(out), (buf_c, buf_kr, pos_next)
+        return self._out_proj(out), (buf_c, buf_kr, pos_next)
 
 
 def apply_rope_wrap(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:

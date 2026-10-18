@@ -47,6 +47,8 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         router_bias_lr=config.router_bias_lr,
         routed_scaling_factor=config.routed_scaling_factor,
         norm_topk_prob=config.norm_topk_prob,
+        o_groups=config.o_groups,
+        o_lora_rank=config.o_lora_rank,
         dropout=config.dropout,
         sparse_threshold=config.sparse_threshold,
         sparse_window=config.sparse_window,
@@ -158,7 +160,7 @@ class TinyLLM(nn.Module):
         torch.nn.init.normal_(self.embed.weight, std=0.02)
         residual_std = 0.02 / math.sqrt(2 * n)
         for layer in self.layers:
-            torch.nn.init.normal_(layer.attn.w_o.weight, std=residual_std)
+            torch.nn.init.normal_(layer.attn.out_proj_weight(), std=residual_std)
             for expert in list(layer.moe.experts) + list(layer.moe.shared):
                 torch.nn.init.normal_(expert.w_down.weight, std=residual_std)
 
