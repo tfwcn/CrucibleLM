@@ -114,3 +114,43 @@ def test_scan_shapes_and_report():
         assert mk.dtype == torch.bool
         assert mk.shape == scores[key].shape
     assert all("dormant_frac" in v for v in report.values())
+
+
+def test_collect_returns_mean_and_peak():
+    """采集同时给出逐神经元均值与峰值，且峰值≥均值."""
+    m = _tiny_eval()
+    batches = [torch.randint(0, 256, (1, 16)) for _ in range(2)]
+    acts = collect_mid_activations(m, batches)
+    for key, v in acts.items():
+        assert set(v) == {"mean", "peak"}
+        assert v["mean"].shape == v["peak"].shape
+        assert bool((v["peak"] >= v["mean"] - 1e-6).all())
+
+
+def test_dormancy_peak_guard_rescues_rare_strong_units():
+    """峰值保护：平均激活极低但峰值最高的单元不被误判休眠."""
+    key = (0, "routed", 0)
+    mean = torch.ones(8)
+    mean[0] = 1e-6            # 平均极低 → 原判据必休眠
+    peak = torch.ones(8)
+    peak[0] = 100.0           # 但峰值最高 → 罕见强特征
+    acts = {key: {"mean": mean, "peak": peak}}
+
+    masks, _, rep = dormancy_masks(acts, rel_threshold=1e-3, peak_frac=0.0)
+    assert bool(masks[key][0]) is True
+    assert rep[0]["rescued"] == 0
+
+    # peak_frac=0.1 → 保护阈值 = 0.1×100 = 10，单元0 峰值 100 ≥ 10 → 救回
+    masks, _, rep = dormancy_masks(acts, rel_threshold=1e-3, peak_frac=0.1)
+    assert bool(masks[key][0]) is False
+    assert rep[0]["rescued"] == 1
+
+
+def test_dormancy_masks_accepts_raw_tensor():
+    """向后兼容：直接传逐神经元均值张量（无峰值）也能判."""
+    key = (0, "routed", 0)
+    acts = {key: torch.tensor([0.0, 1.0, 1.0, 1.0])}
+    masks, scores, report = dormancy_masks(acts, rel_threshold=1e-3)
+    assert bool(masks[key][0]) is True
+    assert set(report) == {0}
+    assert report[0]["rescued"] == 0

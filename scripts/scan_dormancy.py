@@ -31,6 +31,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--batch", type=int, default=4, help="校准 batch")
     p.add_argument("--rel-threshold", type=float, default=1e-3,
                    help="休眠阈值（层均值的相对倍数）")
+    p.add_argument("--peak-frac", type=float, default=0.0,
+                   help="峰值保护：峰值≥该专家最大峰值×该比例者不判休眠（0=关，默认）")
     p.add_argument("--memory-every", type=int, default=0, help="记忆层间隔（与权重一致）")
     p.add_argument("--retro-every", type=int, default=0, help="RETRO 交错间隔（与权重一致）")
     p.add_argument("--retro-len", type=int, default=64, help="chunk 长度（与权重一致）")
@@ -89,7 +91,8 @@ def main(argv=None) -> int:
             dtype=torch.long, device=device))
 
     acts = collect_mid_activations(model, batches)
-    masks, scores, report = dormancy_masks(acts, args.rel_threshold)
+    masks, scores, report = dormancy_masks(acts, args.rel_threshold,
+                                           args.peak_frac)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "report.json").write_text(
@@ -97,13 +100,19 @@ def main(argv=None) -> int:
                    ensure_ascii=False, indent=2), encoding="utf-8")
     torch.save({"masks": {k: v.cpu() for k, v in masks.items()},
                 "scores": {k: v.cpu() for k, v in scores.items()},
-                "rel_threshold": args.rel_threshold}, out / "masks.pt")
+                "rel_threshold": args.rel_threshold,
+                "peak_frac": args.peak_frac}, out / "masks.pt")
     total_dorm = sum(m.float().mean().item() for m in masks.values()) / len(masks)
+    total_rescued = sum(v.get("rescued", 0) for v in report.values())
     print(f"全局休眠占比：{total_dorm:.4f}（>0.10 值得手术，<0.05 建议结案）",
           flush=True)
+    if args.peak_frac > 0:
+        print(f"峰值保护（peak_frac={args.peak_frac}）救回 {total_rescued} 个神经元",
+              flush=True)
     for li in sorted(report):
         print(f"  层 {li}：dormant={report[li]['dormant_frac']:.4f} "
-              f"({report[li]['n_experts']} 个专家)", flush=True)
+              f"({report[li]['n_experts']} 个专家，救回 {report[li]['rescued']})",
+              flush=True)
     return 0
 
 

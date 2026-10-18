@@ -15,6 +15,7 @@
 ## 前馈与目标
 
 - [细粒度 MoE](./moe.md)
+- [MoE 可解释性：双负区间、休眠与生长](./moe-interpretability.md)
 - [MTP：多看一步](./mtp.md)
 - [归一与激活](./norms.md)
 

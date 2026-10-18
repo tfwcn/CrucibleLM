@@ -64,27 +64,53 @@ def test_tiny_preset_stays_baseline():
 
 
 def test_sync_csa_reuse_from_checkpoint(tmp_path):
-    """加载既有权重时按来源对齐 CSA2；无来源则不动（返回 False）."""
+    """加载既有权重时按来源对齐 CSA2；旧格式按基线 1；无来源不动（False）."""
     import json
 
-    cfg = SmallLLMConfig()  # 默认 2
-    (tmp_path / "hparams.json").write_text(
+    # 1) hparams 记录 csa=1 → 对齐到 1
+    d1 = tmp_path / "run1"
+    d1.mkdir()
+    (d1 / "hparams.json").write_text(
         json.dumps({"config": {"csa_reuse_every": 1}}), encoding="utf-8")
-    ckpt = tmp_path / "model.pt"
-    ckpt.write_bytes(b"")
-    assert sync_csa_reuse_from_checkpoint(cfg, str(ckpt)) is True
+    (d1 / "model.pt").write_bytes(b"")
+    cfg = SmallLLMConfig()
+    assert sync_csa_reuse_from_checkpoint(cfg, str(d1 / "model.pt")) is True
     assert cfg.csa_reuse_every == 1
-    # config.json（migrate 输出的扁平 dict）优先于 hparams
-    (tmp_path / "config.json").write_text(
+
+    # 2) config.json（migrate 输出，扁平 dict）优先于 hparams
+    (d1 / "config.json").write_text(
         json.dumps({"csa_reuse_every": 3}), encoding="utf-8")
-    assert sync_csa_reuse_from_checkpoint(cfg, str(ckpt)) is True
+    assert sync_csa_reuse_from_checkpoint(cfg, str(d1 / "model.pt")) is True
     assert cfg.csa_reuse_every == 3
-    # 无来源 → False，配置保持不变
-    empty = tmp_path / "nope"
-    empty.mkdir()
+
+    # 3) 快照布局：hparams 在上一级目录（ckpt-XXXXX/model.pt）
+    d2 = tmp_path / "run2"
+    snap = d2 / "ckpt-0100"
+    snap.mkdir(parents=True)
+    (d2 / "hparams.json").write_text(
+        json.dumps({"config": {"csa_reuse_every": 2}}), encoding="utf-8")
+    (snap / "model.pt").write_bytes(b"")
     cfg2 = SmallLLMConfig()
-    assert sync_csa_reuse_from_checkpoint(cfg2, str(empty)) is False
+    assert sync_csa_reuse_from_checkpoint(cfg2, str(snap / "model.pt")) is True
     assert cfg2.csa_reuse_every == 2
+
+    # 4) 配置存在但无该字段（早于 CSA2 的旧 checkpoint）→ 基线 1
+    d3 = tmp_path / "run3"
+    d3.mkdir()
+    (d3 / "hparams.json").write_text(
+        json.dumps({"config": {"d_model": 768}}), encoding="utf-8")
+    (d3 / "model.pt").write_bytes(b"")
+    cfg3 = SmallLLMConfig()
+    assert sync_csa_reuse_from_checkpoint(cfg3, str(d3 / "model.pt")) is True
+    assert cfg3.csa_reuse_every == 1
+
+    # 5) 无任何配置来源 → False，配置保持默认
+    d4 = tmp_path / "run4"
+    d4.mkdir()
+    (d4 / "model.pt").write_bytes(b"")
+    cfg4 = SmallLLMConfig()
+    assert sync_csa_reuse_from_checkpoint(cfg4, str(d4 / "model.pt")) is False
+    assert cfg4.csa_reuse_every == 2
 
 
 def test_restore_arch_switch_reads_hparams(tmp_path):

@@ -224,28 +224,45 @@ def longctx_config() -> "SmallLLMConfig":
 
 
 def _read_saved_config(path) -> dict | None:
-    """读 checkpoint 同目录保存的配置字典（`config.json` 优先，其次 `hparams.json` 的 `config`）.
+    """读 checkpoint 附近保存的配置字典（`config.json` 优先，其次 `hparams.json` 的 `config`）.
 
-    `path` 可以是权重文件、权重前缀或所在目录。读不到返回 None。
+    `path` 可为权重文件、权重前缀或所在目录；会从该目录**向上找最多 2 层**，以兼容
+    `ckpt-XXXXX/model.pt` 这类快照布局（hparams 常放在上一级目录）。读不到返回 None。
     """
     import json
     from pathlib import Path
 
     p = Path(path)
-    d = p if p.is_dir() else p.parent
-    for name, wrap in (("config.json", None), ("hparams.json", "config")):
-        f = d / name
-        if not f.exists():
-            continue
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if wrap:
-            data = data.get(wrap) if isinstance(data, dict) else None
-        if isinstance(data, dict):
-            return data
+    start = p if p.is_dir() else p.parent
+    for d in (start, start.parent, start.parent.parent):
+        for name, wrap in (("config.json", None), ("hparams.json", "config")):
+            f = d / name
+            if not f.exists():
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if wrap:
+                data = data.get(wrap) if isinstance(data, dict) else None
+            if isinstance(data, dict) and data:
+                return data
     return None
+
+
+def load_saved_config(path) -> "SmallLLMConfig | None":
+    """从 checkpoint 附近读回完整模型配置（`config.json` 优先，其次 `hparams.json` 的 `config`）.
+
+    只取 `SmallLLMConfig` 认得的字段（多余键忽略），旧格式缺的字段用当前默认。读不到返回 None。
+    """
+    data = _read_saved_config(path)
+    if not data:
+        return None
+    fields = set(SmallLLMConfig.__dataclass_fields__)
+    try:
+        return SmallLLMConfig(**{k: v for k, v in data.items() if k in fields})
+    except (TypeError, ValueError):
+        return None
 
 
 def sync_csa_reuse_from_checkpoint(config: "SmallLLMConfig", path) -> bool:
@@ -253,11 +270,16 @@ def sync_csa_reuse_from_checkpoint(config: "SmallLLMConfig", path) -> bool:
 
     `csa_reuse_every` 只改变 Full/Reuse 层的权重共享，不改变键名与形状——装错架构
     **不会报错**，只会静默改变语义（如把 Reuse 层的 KV 投影换成相邻 Full 层的）。
-    故加载既有权重的脚本应先调用本函数对齐来源；读不到来源返回 False，调用方用默认值。
+    故加载既有权重的脚本应先调用本函数对齐来源；读不到任何配置返回 False，调用方用默认值。
+
+    找到配置但**没有该字段**时，说明是早于 CSA2 的旧 checkpoint，按基线（1）处理。
     """
     data = _read_saved_config(path)
-    if not data or "csa_reuse_every" not in data:
+    if data is None:
         return False
+    if "csa_reuse_every" not in data:
+        config.csa_reuse_every = 1
+        return True
     try:
         config.csa_reuse_every = max(int(data["csa_reuse_every"]), 1)
     except (TypeError, ValueError):
