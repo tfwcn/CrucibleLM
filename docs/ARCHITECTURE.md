@@ -16,6 +16,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek V3 / V4.1 | MTP 多 token 预测（深度 3） | `model.py:MTPHead`：第 1 级押 t+2（键兼容旧实现），更深级（`mtp.extra.*`）链式喂"下一 token 嵌入"押到 t+1+depth（V4.1 `num_nextn_predict_layers=3`）；推理只用第 1 级（`mtp_depth`，**默认 1**=旧口径，>1 改键需重训） |
 | DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
 | DeepSeek-V4.1 | CSA2 跨层 KV 复用 | `mla.py`/`sparse_attn.py`：Full/Reuse 交替，Reuse 借最近 Full 层 latent（`csa_reuse_every`，**默认 2=开**，1=关） |
+| DeepSeek-V4.1 | 分层稀疏 indexer | `sparse_attn.py`：学习式打分器选 Top-K 主 KV，先块级粗选候选池再池内 token 级 Top-K（`sparse_indexer`，**默认关**：新增 `w_iq`/`w_ik` 改键） |
 | DeepSeek-V4.1 | 3×3 pixel-unshuffle 视觉压缩 | `vision_compress.py`：`vision_unshuffle=3` 先按 3×3 重排降采样，视觉 token /9（默认 1=关） |
 | DeepSeek DSpark | 置信调度验证（spec decoding） | `spec_decode.py`：按草稿存活置信度动态定验证长度，截断必被拒后缀（`dspark_enabled`，默认关） |
 | Qwen3-Next | Hybrid 注意力（全/线性交替） | `block.py`：每 4 层 1 层 MLA，其余 `GatedDeltaLite` 线性层 |
@@ -179,6 +180,12 @@ GPU 利用率低时先看 CPU 是否被 parquet 解码/分词占满。
 - 稀疏 MLA（`sparse_attn.py`，DSA 思想简化版）：sink 128 + 窗口 4096 + 跨步 512，
   超 `sparse_threshold`（默认 4096）自动切分块聚集，短序列数学上退化为 dense；
   解码从 latent 缓存展开后同样聚集。无新增参数，checkpoint 与 dense 通用。
+- 分层稀疏 indexer（可选，`sparse_indexer`，默认关）：把"定死的 sink+窗口+跨步"换成
+  学习式打分器——indexer Q 来自 hidden、indexer K 由主 KV latent 投影，先按块粗选
+  候选池（块分=块内最大分），再在池内取 token 级 Top-K；当前块（含自身）的本地
+  SWA 列不受影响。**注意口径**：我们的候选集本就是常数规模，indexer 改的是"读哪些
+  主 KV"（学习式选择）而非张量形状，真实加速需 block-sparse kernel（未实现）。
+  详见 `docs/details/sparse-indexer.md`。
 - 线性层超 `linear_chunk`（默认 2048）切块递推：前向精确，反向块间截断
   （Transformer-XL 式）；另修了两处训推不一致：跨块项补 `×scale`、
   解码补卷积状态缓存（否则每步 k/v 与全前向对不上，Mamba 系同理）。
@@ -338,6 +345,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `csa_reuse_every`(2) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，实测 8192 ctx KV −30%、32768 −32%）。**默认 2=开**（实测有代价的净收益），1=关 | `mla.py`/`sparse_attn.py`/`model.py` |
 | `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 | `o_groups`(1) / `o_lora_rank`(0) | MLA 分组低秩输出投影（V4.1：8/1024）：按头分组、每组压到 `o_lora_rank` 再拼接升维。**默认关**（改 `state_dict` 键，旧 ckpt 无法直接载入）；开启需重训或 `scripts/migrate_model.py --o-groups G --o-lora-rank r`（SVD 迁移，近似）。详见 `docs/details/mla-grouped-output.md` | `mla.py`/`migrate.py` |
+| `sparse_indexer`(False) / `indexer_heads`(4) / `indexer_head_dim`(64) / `indexer_topk`(64) / `indexer_block`(8) / `indexer_pool_blocks`(32) | 分层稀疏 indexer（V4.1：32 头/128 维/top-k 512/2048 块×8）：学习式 top-K 主 KV + 块级候选池。**默认关**（新增 `w_iq`/`w_ik` 改 `state_dict` 键，旧 ckpt 无法直接载入，需重训）；只影响长序列（`t > sparse_threshold`），短序列 dense 逐位不变。详见 `docs/details/sparse-indexer.md` | `sparse_attn.py` |
 | `mtp_depth`(1) | MTP 预测深度（V4.1 `num_nextn_predict_layers=3`）：第 1 级押 t+2（键兼容），更深级链式喂"下一 token 嵌入"押到 t+1+depth，多级 loss 取均值。**默认 1**（>1 新增 `mtp.extra.*`、改键，旧 ckpt 需重训）；`--mtp-depth` 三态，续训从 hparams 沿用。详见 `docs/details/mtp.md` | `model.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；

@@ -55,6 +55,12 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         sparse_sink=config.sparse_sink,
         sparse_stride=config.sparse_stride,
         sparse_chunk=config.sparse_chunk,
+        sparse_indexer=config.sparse_indexer,
+        indexer_heads=config.indexer_heads,
+        indexer_head_dim=config.indexer_head_dim,
+        indexer_topk=config.indexer_topk,
+        indexer_block=config.indexer_block,
+        indexer_pool_blocks=config.indexer_pool_blocks,
         linear_chunk=config.linear_chunk,
         use_memory=use_memory,
         memory_slots=config.memory_slots,
@@ -200,6 +206,10 @@ class TinyLLM(nn.Module):
         residual_std = 0.02 / math.sqrt(2 * n)
         for layer in self.layers:
             torch.nn.init.normal_(layer.attn.out_proj_weight(), std=residual_std)
+            # 分层稀疏 indexer（若开）：小方差初始化，避免初始选择偏置过强
+            if getattr(layer.attn, "sparse_indexer", False):
+                torch.nn.init.normal_(layer.attn.w_iq.weight, std=0.02)
+                torch.nn.init.normal_(layer.attn.w_ik.weight, std=0.02)
             for expert in list(layer.moe.experts) + list(layer.moe.shared):
                 torch.nn.init.normal_(expert.w_down.weight, std=residual_std)
 

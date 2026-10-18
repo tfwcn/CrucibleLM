@@ -25,7 +25,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 2 | 免辅助损失路由（sqrtsoftplus + noaux_tc + routed_scaling） | ✅ | `moe.py` |
 | 3 | CSA2 三模式 Full/Reindex/Reuse | 🔶 仅 Full/Reuse | `mla.py` |
 | 4 | 逐层压缩比 `compress_ratios` + KV 源层（非均匀） | 🔶 每 N 层统一 | `config.py`/`model.py` |
-| 5 | 分层稀疏 indexer（学习式 top-K + 块级候选池） | 🔶 固定 sink/window/stride | `sparse_attn.py` |
+| 5 | 分层稀疏 indexer（学习式 top-K + 块级候选池） | ✅ 开关 `sparse_indexer`（默认关，改键） | `sparse_attn.py` |
 | 6 | CED 编码器-解码器（上半层全局 KV 由 L/2 层投影，省近半预填充） | ❌ | `model.py`/`block.py` |
 | 7 | 每层 SWA + SWA Bounded Replay | 🔶 hybrid 骨架 | `sparse_attn.py` |
 | 8 | FP4 主 KV（MXFP4 + QAT）+ FP8 SWA KV | ❌ | `mla.py`/`optim.py` |
@@ -40,9 +40,17 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 17 | 1M 上下文（64K 稀疏起训 + YaRN 外推） | 🔶 默认 8K / 长上下文 200K | `config.py` + 训练 |
 | 18 | 可控推理努力（1–100 整数档） | ❌ | 推理 / 后训练 |
 
-**每项交付模板**：`docs/details/<技术>.md`（含"从想法到代码"）+ 单测（数学/因果/Finite）+ `docs/ARCHITECTURE.md` 开关行；踩坑进 `docs/pitfalls/`。默认开按约定 5；**前向数学变更**（1/3/4/6/7/8/9/10/11）必须重跑冒烟，并给出"旧 checkpoint 来源对齐或显式关闭"路径（沿用 `hparams.json`）。
+**每项交付模板**：`docs/details/<技术>.md`（含"从想法到代码"）+ 单测（数学/因果/Finite）+ `docs/ARCHITECTURE.md` 开关行；踩坑进 `docs/pitfalls/`。默认开按约定 5；**前向数学变更**（1/3/4/5/6/7/8/9/10/11）必须重跑冒烟，并给出"旧 checkpoint 来源对齐或显式关闭"路径（沿用 `hparams.json`）。
 
-**建议顺序**：先隔离性强、可回退的（1/2/9/12），再骨架级（6/7/3/4/5），最后记忆与量化（11/13/8/14/15/16/17/18）。
+**依赖修正（原顺序不合理）**：3/4/5 是同一个 **CSA2 家族**，咬合在一起——
+**5（indexer）→ 3（三模式）→ 4（逐层压缩比 + KV 源层）**，必须当一个块做。
+原因：3 的 **Reindex** 语义是"复用前层 main KV + indexer K，但用自己的 indexer Q 重新选 Top-K"——
+没有 5 的 indexer（选择与 query 内容无关、逐层相同）时，Reindex 会**退化成与 Reuse 完全一样**，
+无法单独验证；4 的"非均匀 KV 源层 / 逐层压缩比"又直接建立在这套 Full/Reindex/Reuse 分配之上。
+所以原"骨架级（6/7/3/4/5）"里把 6/7 排在 3/4/5 之前是错的。
+
+**建议顺序**：先隔离性强、可回退的（1/2/9/12，已完成），再接 **CSA2 家族（5 → 3 → 4）**，
+然后骨架级（6/7），最后记忆与量化（11/13/8/14/15/16/17/18）。
 
 ## 操作约束
 

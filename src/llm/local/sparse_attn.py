@@ -13,10 +13,25 @@ DeepSeek V4 的 DSA/CSA 全套需要论文细节与定制 kernel 才能复刻；
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from src.llm.local.mla import MLAModule
+
+
+class IndexerSelect(NamedTuple):
+    """学习式 indexer 的一次选择结果（供 CSA2 层间复用）.
+
+    topk_mask: (b, n_q, n_static) bool —— token 级最终选择（True=该候选参与注意力）；
+    pool_mask: (b, n_q, n_static) bool —— 块级候选池（True=该候选属于入选块），
+        供后续 Reindex 层缩小打分范围（复用池、但重选 Top-K）。
+    """
+
+    topk_mask: torch.Tensor
+    pool_mask: torch.Tensor
 
 
 def select_keys(
@@ -82,6 +97,12 @@ class SparseMLAModule(MLAModule):
         sparse_chunk: int = 2048,
         o_groups: int = 1,
         o_lora_rank: int = 0,
+        sparse_indexer: bool = False,
+        indexer_heads: int = 4,
+        indexer_head_dim: int = 64,
+        indexer_topk: int = 64,
+        indexer_block: int = 8,
+        indexer_pool_blocks: int = 32,
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
@@ -94,6 +115,70 @@ class SparseMLAModule(MLAModule):
         self.sparse_sink = sparse_sink
         self.sparse_stride = sparse_stride
         self.sparse_chunk = sparse_chunk
+        # 分层稀疏 indexer（学习式 top-K；默认关，开启新增 w_iq/w_ik）
+        self.sparse_indexer = bool(sparse_indexer)
+        self.indexer_heads = int(indexer_heads)
+        self.indexer_head_dim = int(indexer_head_dim)
+        self.indexer_topk = int(indexer_topk)
+        self.indexer_block = int(indexer_block)
+        self.indexer_pool_blocks = int(indexer_pool_blocks)
+        if self.sparse_indexer:
+            # indexer Q 来自 hidden，indexer K 由主 KV latent 投影（V4.1：不另开压缩路径）
+            self.w_iq = nn.Linear(
+                d_model, self.indexer_heads * self.indexer_head_dim, bias=False)
+            self.w_ik = nn.Linear(
+                kv_lora_rank, self.indexer_heads * self.indexer_head_dim, bias=False)
+
+    def _indexer_select(
+        self,
+        h_q: torch.Tensor,
+        c_kv: torch.Tensor,
+        static_pos: torch.Tensor,
+        n_q: int,
+        shared: IndexerSelect | None = None,
+    ) -> IndexerSelect:
+        """学习式 indexer：对静态候选打分 → 块级候选池 → 池内 token 级 top-K.
+
+        h_q: 当块 hidden (b, n_q, d)；c_kv: 全历史 latent (b, L, r)；
+        static_pos: (n_static,) 候选全局位置（升序，均 < 块起点，故对块内所有查询可见）；
+        shared: 前一层（Full）的选择；给定时只在其候选池内打分（CSA2 Reindex 语义）。
+
+        返回 IndexerSelect（topk_mask/pool_mask 均 (b, n_q, n_static)）。
+        打分提 fp32（候选数不大，保数值稳定）。
+        """
+        b = h_q.shape[0]
+        heads, hdim = self.indexer_heads, self.indexer_head_dim
+        qi = self.w_iq(h_q).view(b, n_q, heads, hdim).float()
+        ki = self.w_ik(c_kv[:, static_pos]).view(b, -1, heads, hdim).float()
+        scores = torch.einsum("bqhd,bkhd->bqk", qi, ki) * (hdim ** -0.5)
+        n_static = scores.shape[-1]
+        flat = scores.reshape(b * n_q, n_static)
+        # 块级候选池：候选按其全局位置分块，块分 = 块内最大分
+        blk = (static_pos // self.indexer_block).to(scores.device)
+        n_blk = int(blk[-1].item()) + 1
+        block_scores = flat.new_full((b * n_q, n_blk), float("-inf"))
+        block_scores.scatter_reduce_(
+            1, blk.view(1, -1).expand(b * n_q, -1), flat,
+            reduce="amax", include_self=True)
+        top_blk = block_scores.topk(
+            min(self.indexer_pool_blocks, n_blk), dim=-1).indices
+        sel_blk = block_scores.new_zeros((b * n_q, n_blk), dtype=torch.bool)
+        sel_blk.scatter_(1, top_blk, True)
+        pool_mask = sel_blk.gather(
+            1, blk.view(1, -1).expand(b * n_q, -1)).view(b, n_q, n_static)
+        if shared is not None:
+            # Reindex：只在前层的候选池内打分；交集为空时退回自己的池（防空掩码→NaN）
+            inter = pool_mask & shared.pool_mask
+            empty = ~inter.any(-1, keepdim=True)
+            pool_mask = torch.where(empty, pool_mask, inter)
+        masked = scores.masked_fill(~pool_mask, float("-inf"))
+        # 池内全被 mask 的极端情况（不应发生）：退回未 mask 的分数，保证 softmax 有非 -inf
+        bad = torch.isinf(masked).all(-1, keepdim=True)
+        masked = torch.where(bad, scores, masked)
+        topk = masked.topk(min(self.indexer_topk, n_static), dim=-1).indices
+        topk_mask = torch.zeros_like(masked, dtype=torch.bool)
+        topk_mask.scatter_(2, topk, True)
+        return IndexerSelect(topk_mask=topk_mask, pool_mask=pool_mask)
 
     def _sparse_scores(
         self,
@@ -103,11 +188,16 @@ class SparseMLAModule(MLAModule):
         start: int,
         end: int,
         total: int,
+        c_kv: torch.Tensor | None = None,
+        h_c: torch.Tensor | None = None,
+        shared: "IndexerSelect | None" = None,
     ) -> torch.Tensor:
         """对查询 [start, end) 做聚集 + 掩码 + 注意力（softmax 提 fp32 保精度）.
 
         q_c 为已切好的查询块 (b, h, C=end-start, d)；k/v 为全历史。
         解码时 q_c 只有当步 1 个位置（下标与全历史不对齐，由 start/end 表达绝对位置）。
+        indexer 开启且给了 c_kv/h_c 时：静态候选先经学习式 top-K（块级池 → 池内 top-K），
+        未入选的静态列掩 -inf（当前块的本地 SWA 列不受影响）。
         """
         b, h, _, d = k_full.shape
         idx, n_static = select_keys(
@@ -120,6 +210,15 @@ class SparseMLAModule(MLAModule):
         scores = torch.matmul(q_c, k_sel.transpose(-1, -2)) * scale
         mask = chunk_causal_mask(
             end - start, n_static, end - start, q_c.device, scores.dtype)
+        if (self.sparse_indexer and n_static > 0
+                and c_kv is not None and h_c is not None):
+            sel = self._indexer_select(h_c, c_kv, idx[:n_static], end - start, shared)
+            # (b, 1, n_q, n_static)：静态列按 top-K 掩码，块列（本地 SWA）保持因果掩码
+            static = mask[:, :n_static].unsqueeze(0).unsqueeze(0).masked_fill(
+                ~sel.topk_mask[:, None], float("-inf"))
+            chunk = mask[:, n_static:].unsqueeze(0).unsqueeze(0)
+            mask = torch.cat(
+                [static.expand(b, 1, -1, -1), chunk.expand(b, 1, -1, -1)], dim=-1)
         # softmax 提 fp32（bf16 下长序列 exp 易欠精），再转回
         probs = F.softmax(scores.float() + mask.float(), dim=-1).to(scores.dtype)
         if self.training and self.dropout > 0:
@@ -165,7 +264,8 @@ class SparseMLAModule(MLAModule):
             for s in range(0, t, self.sparse_chunk):
                 e = min(s + self.sparse_chunk, t)
                 outs.append(self._sparse_scores(
-                    q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t))
+                    q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t,
+                    c_kv=reuse[0], h_c=h[:, s:e]))
             out = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, t, -1)
             return self._out_proj(out), (reuse if return_state else None)
         if t <= self.sparse_threshold:
@@ -177,7 +277,8 @@ class SparseMLAModule(MLAModule):
         for s in range(0, t, self.sparse_chunk):
             e = min(s + self.sparse_chunk, t)
             outs.append(self._sparse_scores(
-                q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t))
+                q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t,
+                c_kv=c_kv, h_c=h[:, s:e]))
         out = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, t, -1)
         if not return_state:
             return self._out_proj(out), None
@@ -229,7 +330,8 @@ class SparseMLAModule(MLAModule):
         v_full = v.transpose(1, 2)
         # 查询即最后 t 个位置：select_keys(total, total-t, total)，t==1 时与旧式一致；
         # t>1 为投机解码并行验证服务（块内因果由 chunk_causal_mask 保证）
-        out = self._sparse_scores(q_full, k_full, v_full, total - t, total, total)
+        out = self._sparse_scores(q_full, k_full, v_full, total - t, total, total,
+                                  c_kv=buf_c, h_c=h)
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
         return self._out_proj(out), (buf_c, buf_kr, pos_next)
 

@@ -88,6 +88,22 @@ class SmallLLMConfig:
     sparse_sink: int = 128  # 注意力汇点（打头保留）
     sparse_stride: int = 512  # 膨胀跨步（窗口外每隔这么多保留一个）
     sparse_chunk: int = 2048  # 预填充分块（显存/速度折中）
+    # ===== 分层稀疏 indexer（DeepSeek-V4.1 CSA2：学习式 top-K + 块级候选池）=====
+    # False=沿用固定图案（sink+跨步+窗口全聚集，见 sparse_attn.select_keys）；
+    # True=用轻量学习式 indexer 从候选集中选 Top-K 主 KV（块级候选池 → 池内 token 级
+    # top-K，即"分层"），并在后续层间复用候选池/选择（见 csa_modes）。
+    # **新增参数 w_iq/w_ik → 改 state_dict 键**，故默认关（opt-in，需重训）。
+    # 口径说明：我们的候选集本就是常数规模，indexer 改的是"读哪些主 KV"（学习式选择），
+    # 而非张量形状；真实加速需 block-sparse kernel（未实现）。
+    sparse_indexer: bool = False
+    # indexer 头数与每头维度（V4.1：32 头 / 128 维）
+    indexer_heads: int = 4
+    indexer_head_dim: int = 64
+    # 每个查询最终读的 token 级主 KV 条数（V4.1：attention top-k = 512）
+    indexer_topk: int = 64
+    # 块级候选池：块大小（按候选的全局位置分块）与选中的块数（V4.1：2048 块 × 8 位置）
+    indexer_block: int = 8
+    indexer_pool_blocks: int = 32
     # CSA2 跨层 KV 复用（DeepSeek-V4.1）：每 N 个全注意力层里 1 个 Full（自算 latent），
     # 其余 Reuse（复用最近 Full 层的 latent，自算 Q/上投影，不重复存 KV 缓存）。
     # 实测（本机 128M 续训 2500 步）：8192 上下文 KV −30%，val_loss +0.012（相对 +0.27%），
@@ -343,6 +359,13 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "o_lora_rank": (0, _norm_nonneg_int),
     # MTP 深度（V4.1=3）；改 state_dict 键（depth>1 增 mtp.extra.*），旧 ckpt 回退 1
     "mtp_depth": (1, _norm_nonneg_int),
+    # 分层稀疏 indexer（V4.1）；改 state_dict 键（新增 w_iq/w_ik），旧 ckpt 回退关
+    "sparse_indexer": (False, _norm_bool),
+    "indexer_heads": (4, _norm_at_least_one_int),
+    "indexer_head_dim": (64, _norm_at_least_one_int),
+    "indexer_topk": (64, _norm_at_least_one_int),
+    "indexer_block": (8, _norm_at_least_one_int),
+    "indexer_pool_blocks": (32, _norm_at_least_one_int),
 }
 
 

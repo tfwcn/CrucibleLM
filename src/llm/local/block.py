@@ -41,6 +41,12 @@ class HybridBlock(nn.Module):
         norm_topk_prob: bool = True,
         o_groups: int = 1,
         o_lora_rank: int = 0,
+        sparse_indexer: bool = False,
+        indexer_heads: int = 4,
+        indexer_head_dim: int = 64,
+        indexer_topk: int = 64,
+        indexer_block: int = 8,
+        indexer_pool_blocks: int = 32,
         dropout: float = 0.0,
         sparse_threshold: int = 4096,
         sparse_window: int = 4096,
@@ -74,6 +80,10 @@ class HybridBlock(nn.Module):
                 sparse_threshold, sparse_window, sparse_sink,
                 sparse_stride, sparse_chunk,
                 o_groups=o_groups, o_lora_rank=o_lora_rank,
+                sparse_indexer=sparse_indexer, indexer_heads=indexer_heads,
+                indexer_head_dim=indexer_head_dim, indexer_topk=indexer_topk,
+                indexer_block=indexer_block,
+                indexer_pool_blocks=indexer_pool_blocks,
             )
             # CSA2 跨层复用：Reuse 层解码复用最近 Full 层的 latent 缓存（纯超参）
             self.attn.csa_reuse = bool(csa_reuse)

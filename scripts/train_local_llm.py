@@ -159,6 +159,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--mtp-depth", type=int, default=None,
                    help="MTP 预测深度（V4.1 num_nextn_predict_layers=3；>1 每级新增浅层头，"
                         "**改变 state_dict 键**，旧 checkpoint 需重训；不传时沿用/默认 1）")
+    p.add_argument("--sparse-indexer", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="分层稀疏 indexer（V4.1 CSA2：学习式 top-K + 块级候选池）；"
+                        "**新增 w_iq/w_ik 改 state_dict 键**，旧 checkpoint 需重训；"
+                        "不传时沿用/默认关")
+    p.add_argument("--indexer-heads", type=int, default=None, help="indexer 头数（V4.1=32）")
+    p.add_argument("--indexer-head-dim", type=int, default=None,
+                   help="indexer 每头维度（V4.1=128）")
+    p.add_argument("--indexer-topk", type=int, default=None,
+                   help="每查询选中的主 KV 条数（V4.1 attention top-k=512）")
+    p.add_argument("--indexer-block", type=int, default=None, help="候选池块大小（V4.1=8）")
+    p.add_argument("--indexer-pool-blocks", type=int, default=None,
+                   help="候选池选中的块数（V4.1=2048）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -835,6 +848,15 @@ def main(argv=None) -> int:
     if config.mtp_depth > 1:
         print(f"MTP 深度已开：级联预测 t+2…t+{config.mtp_depth + 1}"
               f"（每级一个浅层头；键已变，旧 ckpt 需重训）", flush=True)
+    if arch_src.get("sparse_indexer") == "checkpoint":
+        print(f"稀疏 indexer：沿用 checkpoint 开关 sparse_indexer="
+              f"{config.sparse_indexer}", flush=True)
+    if config.sparse_indexer:
+        print(f"分层稀疏 indexer 已开：{config.indexer_heads} 头 × "
+              f"{config.indexer_head_dim} 维，top-k={config.indexer_topk}，"
+              f"块 {config.indexer_block} 位置 × {config.indexer_pool_blocks} 块"
+              f"（仅影响长序列 > sparse_threshold={config.sparse_threshold}；"
+              f"键已变，旧 ckpt 需重训）", flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0
     if args.resume:
