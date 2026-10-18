@@ -34,6 +34,7 @@ class HybridBlock(nn.Module):
         expert_hidden: int = 192,
         n_shared: int = 1,
         aux_coef: float = 0.01,
+        swiglu_limit: float = 10.0,
         dropout: float = 0.0,
         sparse_threshold: int = 4096,
         sparse_window: int = 4096,
@@ -75,6 +76,7 @@ class HybridBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.moe = FineGrainedMoE(
             d_model, n_experts, top_k, expert_hidden, n_shared, aux_coef,
+            swiglu_limit,
         )
         # 记忆层（默认 None：无参数，state_dict 兼容；开后残差并联在 MoE 之后）
         self.memory: ProductKeyMemory | None = (

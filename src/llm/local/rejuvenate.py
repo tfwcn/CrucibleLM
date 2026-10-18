@@ -39,7 +39,8 @@ def collect_mid_activations(model, batches: list[torch.Tensor],
                           ("shared", _layer.moe.shared))
                 for kind, experts in groups:
                     for ei, e in enumerate(experts):
-                        mid = (F.silu(e.w_gate(x)) * e.w_up(x)).detach().float().abs()
+                        g, u = e.gate_up(x)  # 与模型前向同口径（含 SwiGLU 限幅）
+                        mid = (F.silu(g) * u).detach().float().abs()
                         red = tuple(range(mid.dim() - 1))  # 除最后一维（神经元）外全归约
                         part = mid.sum(dim=red)
                         pk = mid.amax(dim=red)

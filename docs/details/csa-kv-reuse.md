@@ -120,7 +120,7 @@ if reuse is not None:                       # prefill/训练：K/V 借共享 lat
 - **与旧 checkpoint 的兼容**：**默认已开**（`csa_reuse_every=2`）。关（显式传 1）时无任何共享、
   `_csa_active=False`，与旧 checkpoint 逐位兼容。开启后参数量**变小**（去掉了重复的下投影）
   且**不改 state_dict 键**，因此 Full↔Reuse 的权重不能直接互载却也不报错——模式属于结构开关
-  （同记忆层）。加载既有权重的脚本必须先 `sync_csa_reuse_from_checkpoint` 对齐来源
+  （同记忆层）。加载既有权重的脚本必须先 `sync_arch_from_checkpoint` 对齐来源
   （见 pitfalls 第 23 条）。
 - **Reuse 层不再向后传播"自己的 KV 投影"**：共享的 `w_dkv` 只从 Full 层拿梯度，
   但 Reuse 层的 K/V 用共享 latent，梯度会经由共享 latent 回流，训练仍是联合的。

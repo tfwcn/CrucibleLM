@@ -21,7 +21,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 
 | # | 技术点 | 现状 | 落点 |
 |---|---|---|---|
-| 1 | SwiGLU 限幅 `swiglu_limit` | ❌ | `moe.py` |
+| 1 | SwiGLU 限幅 `swiglu_limit` | ✅ | `moe.py` |
 | 2 | 免辅助损失路由（sqrtsoftplus + noaux_tc + routed_scaling） | ❌ | `moe.py` |
 | 3 | CSA2 三模式 Full/Reindex/Reuse | 🔶 仅 Full/Reuse | `mla.py` |
 | 4 | 逐层压缩比 `compress_ratios` + KV 源层（非均匀） | 🔶 每 N 层统一 | `config.py`/`model.py` |

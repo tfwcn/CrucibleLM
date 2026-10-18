@@ -94,8 +94,7 @@ def expert_sign_regimes(model, batches, layers=None, top_frac: float = 0.01) -> 
     for li, x in collect_moe_inputs(model, batches, layers).items():
         moe = model.layers[li].moe
         for kind, ei, e in iter_experts(moe):
-            gate = e.w_gate(x)
-            up = e.w_up(x)
+            gate, up = e.gate_up(x)  # 与模型前向同口径（含 SwiGLU 限幅）
             s = regime_summary(F.silu(gate) * up, (gate < 0) & (up < 0),
                                top_frac)
             s.update(li=li, kind=kind, ei=ei)
@@ -114,7 +113,8 @@ def expert_activation_profile(model, batches, layers=None) -> dict:
     for li, x in collect_moe_inputs(model, batches, layers).items():
         moe = model.layers[li].moe
         for kind, ei, e in iter_experts(moe):
-            mid = (F.silu(e.w_gate(x)) * e.w_up(x)).abs().float()  # (N, h)
+            gate, up = e.gate_up(x)  # 与模型前向同口径（含 SwiGLU 限幅）
+            mid = (F.silu(gate) * up).abs().float()  # (N, h)
             n = mid.shape[0]
             k = max(1, min(n, int(round(0.99 * (n - 1))) + 1))
             out[(li, kind, ei)] = {

@@ -42,6 +42,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         expert_hidden=config.expert_hidden,
         n_shared=config.n_shared,
         aux_coef=config.aux_loss_coef,
+        swiglu_limit=config.swiglu_limit,
         dropout=config.dropout,
         sparse_threshold=config.sparse_threshold,
         sparse_window=config.sparse_window,

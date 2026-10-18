@@ -35,6 +35,12 @@ class SmallLLMConfig:
     n_shared: int = 1
     # 负载均衡 aux loss 系数
     aux_loss_coef: float = 0.01
+    # SwiGLU 限幅（DeepSeek-V4.1 `swiglu_limit=10.0`）：gate/up 预激活对称截断到
+    # [-limit, limit] 再进 silu/相乘，压住激活离群值（个别维度爆炸主导残差流）。
+    # 0=关闭（逐位等价旧实现）。只压极值尾部，正常量级下几乎不触发；但仍按"改前向语义"
+    # 处理：续训/装载从 checkpoint 的 hparams.json 沿用，读不到按 0（旧行为），见
+    # sync_arch_from_checkpoint。docs/details/swiglu-limit.md
+    swiglu_limit: float = 10.0
     # MTP 额外预测步数（1 表示除 t+1 外再预测 t+2）
     mtp_depth: int = 1
     # MTP loss 权重
@@ -205,6 +211,8 @@ def tiny_test_config() -> "SmallLLMConfig":
         yarn_scale=1.0,
         # CPU 极小配置保持"全 Full"基线：单测断言的是结构契约，不该随生产默认值漂移
         csa_reuse_every=1,
+        # 同理：极小配置不做 SwiGLU 限幅，避免随机权重下前向数值随生产默认漂移
+        swiglu_limit=0.0,
     )
 
 
@@ -265,24 +273,47 @@ def load_saved_config(path) -> "SmallLLMConfig | None":
         return None
 
 
-def sync_csa_reuse_from_checkpoint(config: "SmallLLMConfig", path) -> bool:
-    """按 checkpoint 对齐 CSA2 开关（唯一"改共享关系但不改 state_dict 键"的结构开关）.
+# "改前向语义但不改 state_dict 键"的架构开关：改默认值只影响"新建模型"，续训/迁移/
+# 装载必须从 checkpoint 的 hparams.json 沿用来源；找到配置但缺某字段 → 回退到"早于该
+# 特性"的值（旧 checkpoint 语义），避免默认值升级把旧 run 静默换架构。
+# 值 = (缺失时的回退值, 归一化函数)。
+def _norm_csa(v) -> int:
+    """CSA2 档位归一化：至少 1（1=全 Full/关）."""
+    return max(int(v), 1)
 
-    `csa_reuse_every` 只改变 Full/Reuse 层的权重共享，不改变键名与形状——装错架构
-    **不会报错**，只会静默改变语义（如把 Reuse 层的 KV 投影换成相邻 Full 层的）。
-    故加载既有权重的脚本应先调用本函数对齐来源；读不到任何配置返回 False，调用方用默认值。
 
-    找到配置但**没有该字段**时，说明是早于 CSA2 的旧 checkpoint，按基线（1）处理。
+def _norm_nonneg_float(v) -> float:
+    """非负浮点归一化：<=0 视为关闭（0）."""
+    f = float(v)
+    return f if f > 0 else 0.0
+
+
+_ARCH_SWITCHES: dict[str, tuple[object, object]] = {
+    "csa_reuse_every": (1, _norm_csa),
+    "swiglu_limit": (0.0, _norm_nonneg_float),
+}
+
+
+def sync_arch_from_checkpoint(config: "SmallLLMConfig", path) -> list[str]:
+    """按 checkpoint 对齐所有"改语义不改键"的架构开关，返回被对齐的字段名（无来源=空）.
+
+    这些开关只改变权重共享/前向数学，不改变 state_dict 键名与形状——装错架构
+    **不会报错**，只会静默改变语义（如把 Reuse 层的 KV 投影换成相邻 Full 层的，
+    或对旧 run 强加 SwiGLU 限幅）。故加载既有权重的脚本应先调用本函数对齐来源。
+
+    读不到任何配置返回 []，调用方用当前默认值；**找到配置但缺某字段**时，说明该
+    checkpoint 早于该特性，回退到"特性前"的值（CSA2→1、SwiGLU 限幅→0），保证旧
+    run 语义逐位不变。
     """
     data = _read_saved_config(path)
     if data is None:
-        return False
-    if "csa_reuse_every" not in data:
-        config.csa_reuse_every = 1
-        return True
-    try:
-        config.csa_reuse_every = max(int(data["csa_reuse_every"]), 1)
-    except (TypeError, ValueError):
-        return False
-    return True
+        return []
+    synced: list[str] = []
+    for field, (fallback, norm) in _ARCH_SWITCHES.items():
+        try:
+            setattr(config, field, norm(data.get(field, fallback)))
+        except (TypeError, ValueError):
+            continue
+        synced.append(field)
+    return synced
 

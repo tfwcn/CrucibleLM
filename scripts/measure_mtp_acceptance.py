@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.llm.local.config import (
     SmallLLMConfig,
-    sync_csa_reuse_from_checkpoint,
+    sync_arch_from_checkpoint,
     tiny_test_config,
 )
 from src.llm.local.infer import LocalChatBackend
@@ -109,7 +109,7 @@ def main() -> None:
     if args.model:
         cfg = SmallLLMConfig()
         # 按权重目录对齐 CSA2（该开关不改 state_dict 键，装错不报错只会静默变语义）
-        sync_csa_reuse_from_checkpoint(cfg, args.model)
+        sync_arch_from_checkpoint(cfg, args.model)
         if args.run_yaml:
             apply_run_yaml(cfg, args.run_yaml)
         backend = LocalChatBackend.load(

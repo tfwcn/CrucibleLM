@@ -334,8 +334,11 @@ n-gram 共享：同一个桶每步收到方向相反的梯度，AdamW 的 `m/√
   必须一并纳入保护（见 `resolve_csa_reuse_every`）。
 - 加载既有权重的一切脚本（`serve_openai`、`scan_dormancy`、`rejuvenate`、`init_memory`、
   `rft_sample`、`measure_mtp_acceptance`、`bench_offload_les`）都要先
-  `sync_csa_reuse_from_checkpoint(cfg, <checkpoint 路径>)` 对齐，再套 CLI 覆盖。
+  `sync_arch_from_checkpoint(cfg, <checkpoint 路径>)` 对齐，再套 CLI 覆盖。
 - 判据：**"strict=True 通过" ≠ "架构一致"**。只改共享的开关，strict 永远通过。
+- 同类的还有**改前向数学但不改键**的开关（如 `swiglu_limit`：只在专家内部 clamp 预激活，
+  键名形状全不变）——同样必须靠 `sync_arch_from_checkpoint` 来源对齐，旧 run 回退到
+  特性前的值（SwiGLU 限幅→0），否则新默认 10.0 会静默改掉旧 run 的前向数字。
 
 ## 24. 续训对比时"重新加热"会掩盖真实差距——别把暂态读成"再训就补上了"
 

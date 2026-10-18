@@ -1,4 +1,4 @@
-"""细粒度 MoE — DeepSeek 系多小专家 + 共享专家 + 负载均衡 aux loss."""
+"""细粒度 MoE — DeepSeek 系多小专家 + 共享专家 + 负载均衡 aux loss（含 SwiGLU 限幅）."""
 
 from __future__ import annotations
 
@@ -8,17 +8,34 @@ import torch.nn.functional as F
 
 
 class SwiGLUExpert(nn.Module):
-    """单个 SwiGLU 前馈专家（小中间维度）."""
+    """单个 SwiGLU 前馈专家（小中间维度），可选预激活限幅.
 
-    def __init__(self, d_model: int, hidden: int):
+    `limit > 0` 时对 gate/up 预激活做**对称限幅**（DeepSeek-V4.1 `swiglu_limit`）：
+    `clamp(z, -limit, limit)` 后再进 silu/相乘，压住离群值（个别维度爆炸主导残差流）。
+    `limit <= 0` 时逐位等价旧实现（无限幅）。
+    """
+
+    def __init__(self, d_model: int, hidden: int, limit: float = 0.0):
         super().__init__()
+        # 限幅阈值（纯超参，不入 state_dict，键名与形状不变）
+        self.limit = float(limit)
         self.w_gate = nn.Linear(d_model, hidden, bias=False)
         self.w_up = nn.Linear(d_model, hidden, bias=False)
         self.w_down = nn.Linear(hidden, d_model, bias=False)
 
+    def gate_up(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """返回（已限幅的）gate/up 预激活，供前向与离线分析共用，保证口径一致."""
+        gate = self.w_gate(x)
+        up = self.w_up(x)
+        if self.limit > 0:
+            gate = gate.clamp(-self.limit, self.limit)
+            up = up.clamp(-self.limit, self.limit)
+        return gate, up
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """SwiGLU 前向."""
-        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+        """SwiGLU 前向；开启限幅时先截断 gate/up 预激活."""
+        gate, up = self.gate_up(x)
+        return self.w_down(F.silu(gate) * up)
 
 
 class FineGrainedMoE(nn.Module):
@@ -32,17 +49,22 @@ class FineGrainedMoE(nn.Module):
         expert_hidden: int = 192,
         n_shared: int = 1,
         aux_coef: float = 0.01,
+        swiglu_limit: float = 10.0,
     ):
         super().__init__()
         self.n_experts = n_experts
         self.top_k = top_k
         self.aux_coef = aux_coef
+        # SwiGLU 预激活限幅（DeepSeek-V4.1；0=关）。默认 10.0，与 config 一致
+        self.swiglu_limit = float(swiglu_limit)
         self.router = nn.Linear(d_model, n_experts, bias=False)
         self.experts = nn.ModuleList(
-            [SwiGLUExpert(d_model, expert_hidden) for _ in range(n_experts)]
+            [SwiGLUExpert(d_model, expert_hidden, self.swiglu_limit)
+             for _ in range(n_experts)]
         )
         self.shared = nn.ModuleList(
-            [SwiGLUExpert(d_model, expert_hidden) for _ in range(n_shared)]
+            [SwiGLUExpert(d_model, expert_hidden, self.swiglu_limit)
+             for _ in range(n_shared)]
         )
         # 可选：专家跨设备搬运（默认 None = 走分组 bmm 快路径，逐位不变）
         self.store = None
@@ -181,7 +203,14 @@ class FineGrainedMoE(nn.Module):
         w_g = torch.stack([e.w_gate.weight for e in self.experts])  # (E, h, d)
         w_u = torch.stack([e.w_up.weight for e in self.experts])
         w_d = torch.stack([e.w_down.weight for e in self.experts])  # (E, d, h)
-        gate = F.silu(canvas @ w_g.transpose(1, 2)) * (canvas @ w_u.transpose(1, 2))
+        gate_raw = canvas @ w_g.transpose(1, 2)
+        up_raw = canvas @ w_u.transpose(1, 2)
+        if self.swiglu_limit > 0:
+            # 与 SwiGLUExpert.forward 同一限幅口径（分组/逐专家数值须一致，单测锁定）
+            lim = self.swiglu_limit
+            gate_raw = gate_raw.clamp(-lim, lim)
+            up_raw = up_raw.clamp(-lim, lim)
+        gate = F.silu(gate_raw) * up_raw
         out_e = (gate @ w_d.transpose(1, 2)) * (
             w_canvas * row_mask.to(flat.dtype)).unsqueeze(-1)
         out = torch.zeros_like(flat)

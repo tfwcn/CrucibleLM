@@ -76,12 +76,12 @@ def load_model(src: str, grad_ckpt: bool = False):
     import torch
 
     from src.llm.local.config import (SmallLLMConfig, load_saved_config,
-                                      sync_csa_reuse_from_checkpoint)
+                                      sync_arch_from_checkpoint)
     from src.llm.local.model import TinyLLM
 
     config = load_saved_config(src) or SmallLLMConfig()
     # 旧 checkpoint 的 hparams 可能没有 csa 字段：按来源对齐，避免静默换架构
-    sync_csa_reuse_from_checkpoint(config, src)
+    sync_arch_from_checkpoint(config, src)
     config.grad_ckpt = grad_ckpt
     model = TinyLLM(config)
     model.load_state_dict(torch.load(src, map_location="cpu"))

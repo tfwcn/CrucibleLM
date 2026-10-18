@@ -10,6 +10,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 |---|---|---|
 | DeepSeek V3/V4 | MLA 低秩 KV 压缩 + 解耦 RoPE | `mla.py`：KV 压缩到 `kv_lora_rank=128` + 共享 rope 键，缓存省约 9x |
 | DeepSeek V3/V4 | 细粒度 MoE + 共享专家 | `moe.py`：16 小专家 top-4 + 1 共享专家 + aux 负载均衡 |
+| DeepSeek-V4.1 | SwiGLU 预激活限幅 | `moe.py`：gate/up 对称 `clamp(±swiglu_limit)` 压激活离群值（`swiglu_limit`，**默认 10=开**，0=关） |
 | DeepSeek V3 | MTP 多 token 预测 | `model.py:MTPHead`：训练时额外预测 t+2，推理关闭 |
 | DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
 | DeepSeek-V4.1 | CSA2 跨层 KV 复用 | `mla.py`/`sparse_attn.py`：Full/Reuse 交替，Reuse 借最近 Full 层 latent（`csa_reuse_every`，**默认 2=开**，1=关） |
@@ -23,7 +24,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 
 - 词表 8192（小词表是 100M 可行的关键），`d_model=768`，12 层，12 头
 - MLA：`q_lora_rank=192`，`kv_lora_rank=128`，`qk_rope_dim=32`
-- MoE：16 专家 / top-4 / 专家 hidden 192 / 1 共享专家
+- MoE：16 专家 / top-4 / 专家 hidden 192 / 1 共享专家；SwiGLU 预激活限幅 `swiglu_limit=10.0`（V4.1，默认开，0=关）
 - 上下文 8192（YaRN scale=2），embedding 与输出头绑定省约 6M
 
 ## 用法

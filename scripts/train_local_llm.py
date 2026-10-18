@@ -139,6 +139,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
                         "读不到 checkpoint 架构则保守按 1）")
+    p.add_argument("--swiglu-limit", type=float, default=None,
+                   help="SwiGLU gate/up 预激活对称限幅（DeepSeek-V4.1=10.0；0=关；"
+                        "不传时新训练取架构默认=10.0，续训/迁移沿用 checkpoint，"
+                        "读不到则保守按 0=不限幅）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -205,12 +209,12 @@ def build_config(args: argparse.Namespace) -> SmallLLMConfig:
     return config
 
 
-def _restore_arch_switch(args: argparse.Namespace, key: str) -> int | None:
-    """续训/迁移时从 checkpoint 的 hparams.json 取回架构开关.
+def _restore_arch_switch(args: argparse.Namespace, key: str) -> object | None:
+    """续训/迁移时从 checkpoint 的 hparams.json 取回架构开关（原样返回，调用方转型）.
 
-    架构开关（如 `csa_reuse_every`）会改变权重共享关系，一旦随"默认值升级"变化，
-    旧 run 的 `--resume` 就会被静默换架构。故命令行未显式指定时，优先沿用
-    checkpoint 记录的值；读不到返回 None，由调用方决定保守策略。
+    架构开关（如 `csa_reuse_every`、`swiglu_limit`）会改变权重共享/前向数学，一旦随
+    "默认值升级"变化，旧 run 的 `--resume` 就会被静默换架构。故命令行未显式指定时，
+    优先沿用 checkpoint 记录的值；读不到返回 None，由调用方决定保守策略。
     """
     dirs: list[Path] = []
     if args.resume:
@@ -228,7 +232,7 @@ def _restore_arch_switch(args: argparse.Namespace, key: str) -> int | None:
         except (OSError, ValueError):
             continue
         if key in cfg:
-            return int(cfg[key])
+            return cfg[key]
     return None
 
 
@@ -246,10 +250,30 @@ def resolve_csa_reuse_every(args: argparse.Namespace,
         return max(config.csa_reuse_every, 1), "config_json"
     restored = _restore_arch_switch(args, "csa_reuse_every")
     if restored is not None:
-        return max(restored, 1), "checkpoint"
+        return max(int(restored), 1), "checkpoint"
     if args.resume or args.init_checkpoint or getattr(args, "sft_init", ""):
         return 1, "conservative"
     return max(config.csa_reuse_every, 1), "default"
+
+
+def resolve_swiglu_limit(args: argparse.Namespace,
+                         config: SmallLLMConfig) -> tuple[float, str]:
+    """定本次训练实际使用的 `swiglu_limit` 与来源（无副作用，便于单测）.
+
+    优先级同 CSA2：命令行显式 > `--config-json` > checkpoint 的 hparams.json >（续训/
+    迁移/SFT 载入则保守按 0=不限幅，新训练则用架构默认 10.0）。来源取值与
+    `resolve_csa_reuse_every` 一致，供日志区分"用户指定"与"自动沿用"。
+    """
+    if getattr(args, "swiglu_limit", None) is not None:
+        return max(float(args.swiglu_limit), 0.0), "explicit"
+    if getattr(args, "config_json", ""):
+        return max(config.swiglu_limit, 0.0), "config_json"
+    restored = _restore_arch_switch(args, "swiglu_limit")
+    if restored is not None:
+        return max(float(restored), 0.0), "checkpoint"
+    if args.resume or args.init_checkpoint or getattr(args, "sft_init", ""):
+        return 0.0, "conservative"
+    return max(config.swiglu_limit, 0.0), "default"
 
 
 def load_tokenizer(args: argparse.Namespace, config: SmallLLMConfig,
@@ -755,6 +779,18 @@ def main(argv=None) -> int:
     if every > 1:
         print(f"CSA2 跨层 KV 复用已开：每 {every} 个全注意力层留 1 个 Full，"
               f"其余 Reuse 借共享 latent（KV 缓存下降）", flush=True)
+    # SwiGLU 限幅：同 CSA2 策略（显式优先；新训练默认 10.0；续训/迁移沿用 checkpoint，
+    # 读不到则保守按 0=不限幅，避免静默改旧 run 的前向数学）。
+    limit, lsrc = resolve_swiglu_limit(args, config)
+    args.swiglu_limit = limit
+    config.swiglu_limit = limit
+    if lsrc == "checkpoint":
+        print(f"SwiGLU 限幅：沿用 checkpoint 架构 swiglu_limit={limit}", flush=True)
+    elif lsrc == "conservative":
+        print("SwiGLU 限幅：checkpoint 无架构记录，按关闭（0）处理，避免静默改前向",
+              flush=True)
+    if limit > 0:
+        print(f"SwiGLU 限幅已开：gate/up 预激活对称截断到 ±{limit}", flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
     resume_cursor = 0
     if args.resume:
