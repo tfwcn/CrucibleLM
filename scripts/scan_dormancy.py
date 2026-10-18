@@ -31,8 +31,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--batch", type=int, default=4, help="校准 batch")
     p.add_argument("--rel-threshold", type=float, default=1e-3,
                    help="休眠阈值（层均值的相对倍数）")
-    p.add_argument("--peak-frac", type=float, default=0.0,
-                   help="峰值保护：峰值≥该专家最大峰值×该比例者不判休眠（0=关，默认）")
+    p.add_argument("--peak-frac", type=float, default=0.1,
+                   help="峰值保护：峰值≥该专家最大峰值×该比例者不判休眠（默认 0.1=开；传 0 关闭）")
     p.add_argument("--memory-every", type=int, default=0, help="记忆层间隔（与权重一致）")
     p.add_argument("--retro-every", type=int, default=0, help="RETRO 交错间隔（与权重一致）")
     p.add_argument("--retro-len", type=int, default=64, help="chunk 长度（与权重一致）")

@@ -295,7 +295,7 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
 `scripts/rejuvenate.py` 封存（自检阈值 1e-3 会正确 abort）。"效果一般"
 不是容量闲置——aux 0.12（路由均衡）+ 零休眠双交叉验证模型已被榨干，
 杠杆只剩数据量级与参数量级。
-配套：`dormancy_masks` 新增**峰值保护**（`--peak-frac`，默认关），高阈值下可救回约 84%
+配套：`dormancy_masks` 新增**峰值保护**（`--peak-frac`，默认 `0.1`=开），高阈值下可救回约 84%
 被均值误杀的"少见但强烈"单元；真实阈值下空转（无对象）。跨 6 个周期 checkpoint
 （每 100 步）追踪：末段 500 步激活幅度持平、职责稳定（首末相关 r≈0.9）、两端零休眠。
 可解释性工具（SwiGLU 双负区间 / 激活画像）见 `docs/details/moe-interpretability.md`。

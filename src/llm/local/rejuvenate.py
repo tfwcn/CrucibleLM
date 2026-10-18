@@ -2,8 +2,8 @@
 
 原理：旧权重已拟合 easy token（loss≈0 → 梯度≈0），RHO 只反向 hard token
 梯度——重开的新权重第一口梯度天然来自难数据，躺不回去。
-安全三件套：①休眠按**激活**判定（magnitude 小可能是被抑制的重要特征），并可选
-**峰值保护**（`peak_frac>0`：平均激活低但峰值高者不判休眠，防误杀稀有强特征）；
+安全三件套：①休眠按**激活**判定（magnitude 小可能是被抑制的重要特征），并**默认开启
+峰值保护**（`peak_frac=0.1`：平均激活低但峰值高者不判休眠，防误杀稀有强特征）；
 ②手术对休眠单元恒等（输入侧随机重开 + 输出侧置零；激活恒零则逐位不变，无 loss 尖峰）；
 ③单次 cap 占比 + 术前归档 + A/B 验收。
 新训练直接新开优化器（无 stale 动量问题）；继续旧优化器需另清对应动量。
@@ -68,7 +68,7 @@ def collect_mid_activations(model, batches: list[torch.Tensor],
 
 def dormancy_masks(acts: dict,
                    rel_threshold: float = 1e-3,
-                   peak_frac: float = 0.0,
+                   peak_frac: float = 0.1,
                    ) -> tuple[dict[tuple, torch.Tensor],
                               dict[tuple, torch.Tensor], dict]:
     """激活休眠判定：score=神经元平均|激活|，阈值=**该专家**神经元均值×rel_threshold.
@@ -78,9 +78,9 @@ def dormancy_masks(acts: dict,
     `acts` 取值可为 `collect_mid_activations` 的 `{"mean","peak"}` 字典，也可直接是
     逐神经元均值张量（向后兼容；此时无峰值保护）。
 
-    `peak_frac>0` 开启**峰值保护**：平均激活低于阈值、但峰值达到**该专家**最大峰值
-    `peak_frac` 倍的神经元不判休眠（少见但强烈 → 误杀代价高，是"被抑制的重要特征"）。
-    与休眠阈值同用逐专家口径，避免"整层尺度大就永不保护"。
+    `peak_frac>0` 开启**峰值保护**（**默认 0.1**）：平均激活低于阈值、但峰值达到**该专家**
+    最大峰值 `peak_frac` 倍的神经元不判休眠（少见但强烈 → 误杀代价高，是"被抑制的重要特征"）。
+    与休眠阈值同用逐专家口径，避免"整层尺度大就永不保护"。传 `0` 关闭。
 
     返回 ({key: bool mask（True=休眠）}, {key: score}, 报告 {layer: {...}})。
     报告逐层给出 `dormant_frac`/`n_experts`/`rescued`（被峰值保护救回的神经元数）。

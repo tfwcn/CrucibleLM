@@ -146,6 +146,19 @@ def test_dormancy_peak_guard_rescues_rare_strong_units():
     assert rep[0]["rescued"] == 1
 
 
+def test_dormancy_peak_guard_on_by_default():
+    """默认即开启峰值保护（peak_frac=0.1），无需显式传参."""
+    key = (0, "routed", 0)
+    mean = torch.ones(8)
+    mean[0] = 1e-6
+    peak = torch.ones(8)
+    peak[0] = 100.0
+    acts = {key: {"mean": mean, "peak": peak}}
+    masks, _, rep = dormancy_masks(acts, rel_threshold=1e-3)  # 不传 peak_frac
+    assert bool(masks[key][0]) is False
+    assert rep[0]["rescued"] == 1
+
+
 def test_dormancy_masks_accepts_raw_tensor():
     """向后兼容：直接传逐神经元均值张量（无峰值）也能判."""
     key = (0, "routed", 0)
