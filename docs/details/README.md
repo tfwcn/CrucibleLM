@@ -13,6 +13,7 @@
 - [分层稀疏 indexer：让"跳读"学会自己找重点](./sparse-indexer.md)
 - [CSA2 跨层 KV 复用：相邻层共享 latent](./csa-kv-reuse.md)
 - [CSA2 三模式：复用 KV，但不必交出选择权](./csa-modes.md)
+- [主 KV 压缩比：一个条目代表 m 个 token](./kv-compression-ratio.md)
 - [RoPE 与 YaRN：位置和外推](./rope-yarn.md)
 
 ## 前馈与目标

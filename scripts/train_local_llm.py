@@ -139,6 +139,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
                         "读不到 checkpoint 架构则保守按 1）")
+    p.add_argument("--compress-ratios", type=str, default=None,
+                   help="CSA2 逐层主 KV 压缩比（V4.1，如 '2' 或 '1,2'，按全注意力层序号"
+                        "循环）：m=每条目聚合的连续 token 数（不重叠），远端按 m 块池化、"
+                        "本地窗口不压缩；1=不压缩（默认）。改键：m>1 的层新增 z_cmp")
     p.add_argument("--kv-source-layer-ids", type=str, default=None,
                    help="CSA2 非均匀 KV 源层（V4.1，如 '2,8,14,20'）：列出的全注意力层"
                         "为生产者（Full），其余复用最近生产者的 main KV；空=按 "
@@ -865,6 +869,15 @@ def main(argv=None) -> int:
         _srcs = sorted(config.kv_source_set())
         print(f"CSA2 非均匀 KV 源层已开：生产者层 {_srcs}（其余全注意力层复用最近"
               f"生产者的 main KV；间距可任意非均匀）", flush=True)
+    if arch_src.get("compress_ratios") == "checkpoint":
+        print("CSA2：沿用 checkpoint 的压缩比表 "
+              f"compress_ratios={config.compress_ratios!r}", flush=True)
+    if any(r > 1 for r in config.compress_ratio_list()):
+        _rs = {i: config.compress_ratio_of(i) for i in range(config.n_layers)
+               if config.is_full_attn_layer(i) and config.compress_ratio_of(i) > 1}
+        print(f"主 KV 逐层压缩已开（V4.1 CSA2(ratio,mode)）：层→m {_rs}"
+              f"（m=每条目聚合的连续 token 数；远端按 m 块池化，本地窗口保持未压缩；"
+              f"键已变，旧 ckpt 需重训）", flush=True)
     if config.csa_modes:
         modes = ",".join(config.csa_mode_list())
         print(f"CSA2 三模式静态分配已开：{modes}（按全注意力层序号循环；"

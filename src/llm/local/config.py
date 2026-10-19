@@ -136,6 +136,16 @@ class SmallLLMConfig:
     # （消费层若被指定为 reindex 则仍是 reindex）；未指定则生产者 Full、消费者 Reuse。
     # 同族语义开关：不改 state_dict 键，续训/迁移自动沿用 checkpoint。
     kv_source_layer_ids: str = ""
+    # 逐层主 KV 压缩比（V4.1 `CSA2(ratio, mode)`）：按**全注意力层**序号循环的整数表
+    # （如 "2" 或 "1,2"）。m = 每个 main KV 条目聚合的连续 token 数（**不重叠**，
+    # CSA2 去掉 CSA 的相邻块重叠）：m=1 = 不压缩（默认，逐位等价旧行为）。
+    # m>1 时远端 main KV 按 m 块池化（块内逐位置逐通道可学习权重 `z_cmp`，初值 1
+    # =算术平均），本地窗口与当前块保持**未压缩**（V4.1：SWA KV 不压缩、逐层本地）；
+    # 块的代表位置取块尾。效果：同样的远端列数预算下，覆盖的历史跨度 ×m。
+    # 改键（m>1 的层新增 `z_cmp`）→ **默认关**（空串），续训/迁移从 hparams 沿用。
+    # 注意：压缩开启后该层恒走分块路径（短序列也不再走 dense），否则同一模型在
+    # 短/长序列会看到两种 KV 表示；且借用层（reuse/reindex）沿用生产者的压缩比。
+    compress_ratios: str = ""
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
@@ -291,6 +301,19 @@ class SmallLLMConfig:
                     f"（full_attn_every={self.full_attn_every}，"
                     f"全注意力层序号需能被其整除）")
         return frozenset(ids)
+
+    def compress_ratio_list(self) -> tuple[int, ...]:
+        """主 KV 压缩比表（按全注意力层序号循环）；空串 = `(1,)`（不压缩）."""
+        vals = _parse_layer_ids(_norm_compress_ratios(self.compress_ratios))
+        return tuple(vals) if vals else (1,)
+
+    def compress_ratio_of(self, layer_idx: int) -> int:
+        """某层的主 KV 压缩比 m（非全注意力层恒为 1，不受影响）."""
+        if not self.is_full_attn_layer(layer_idx):
+            return 1
+        vals = self.compress_ratio_list()
+        k = layer_idx // max(1, self.full_attn_every)
+        return int(vals[k % len(vals)])
 
 
 # 16G 训练配方建议（bf16 + AdamW + 梯度检查点）
@@ -484,6 +507,30 @@ def _parse_layer_ids(s: str) -> tuple[int, ...]:
     return tuple(int(x) for x in str(s).split(",") if x.strip())
 
 
+def _norm_compress_ratios(v) -> str:
+    """主 KV 压缩比表归一化：\"2,1\" / [2, 1] → \"2,1\"（**保序/保重复**，循环语义）.
+
+    每个值必须 ≥ 1（1=不压缩）；非法值早失败（配置错误用户可见）。
+    """
+    if v is None or v == "":
+        return ""
+    items = v if isinstance(v, (list, tuple)) else str(v).replace(";", ",").split(",")
+    out: list[int] = []
+    for raw in items:
+        tok = str(raw).strip()
+        if not tok:
+            continue
+        try:
+            x = int(tok)
+        except ValueError:
+            raise ValueError(
+                f"compress_ratios 含非整数 {raw!r}（形如 \"2\" 或 \"1,2\"）") from None
+        if x < 1:
+            raise ValueError(f"compress_ratios 含非法压缩比 {x}（须 ≥ 1，1=不压缩）")
+        out.append(x)
+    return ",".join(str(x) for x in out)
+
+
 _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "csa_reuse_every": (1, _norm_at_least_one_int),
     "swiglu_limit": (0.0, _norm_nonneg_float),
@@ -507,6 +554,8 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "csa_modes": ("", _norm_csa_modes),
     # 显式非均匀 KV 源层（V4.1）；（语义变更但不改键，空=均匀分配）
     "kv_source_layer_ids": ("", _norm_layer_ids),
+    # 逐层主 KV 压缩比（V4.1）；改 state_dict 键（m>1 的层新增 z_cmp），旧 ckpt 回退空=全 1
+    "compress_ratios": ("", _norm_compress_ratios),
 }
 
 

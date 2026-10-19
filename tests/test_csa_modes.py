@@ -212,7 +212,7 @@ def test_channel_reuse_takes_shared_topk_reindex_picks_its_own():
     m = _mod(sparse_indexer=True, indexer_topk=2, indexer_block=8,
              indexer_pool_blocks=1)
     m.csa_mode = "reindex"
-    sel = m._indexer_select(h_q, c_kv, pos, 3, shared)
+    sel = m._indexer_select(h_q, c_kv[:, pos], pos, 3, shared)
     assert sel is not shared, "Reindex 必须重算，不能照抄"
     # 打分域被收窄到共享池 → 池与 Top-K 都落在前 2 个候选内
     assert sel.pool_mask.sum(-1).tolist() == [[2, 2, 2]]

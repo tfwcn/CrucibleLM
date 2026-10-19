@@ -350,6 +350,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
 | `csa_reuse_every`(2) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，实测 8192 ctx KV −30%、32768 −32%）。**默认 2=开**（实测有代价的净收益），1=关 | `mla.py`/`sparse_attn.py`/`model.py` |
 | `kv_source_layer_ids`("") | CSA2 **非均匀** KV 源层（V4.1，如 `"2,8,14,20"`）：只决定"谁生产"（表内全注意力层为 Full 生产者，其余复用最近生产者），间距任意；**不改 `state_dict` 键**，续训/迁移沿用 checkpoint。详见 `docs/details/csa-modes.md` | `config.py`/`model.py` |
+| `compress_ratios`("") | CSA2 **逐层主 KV 压缩比**（V4.1 `CSA2(ratio, mode)` 的 ratio）：整数表按全注意力层序号循环（`"2"` / `"2,1"`），m = 每个 main KV 条目聚合的**连续 token 数**（不重叠）。m>1 时远端按 m 块池化（块内逐位置可学习权重 `z_cmp`，初值 1=算术平均），本地窗口/当前块保持未压缩，块尾作 rope 代表位置；同样列数预算下远端表示的 token 数 ×m。**默认关**（m>1 新增 `z_cmp`、改键，旧 ckpt 需重训；续训从 hparams 沿用）；压缩开启后该层恒走分块路径（`sparse_threshold` 失效）；借用层沿用生产者的 m 与 `z_cmp`。KV **显存**尚未下降（池化在读取时做，缓存仍逐 token 存 latent，布局重构随 #7）。详见 `docs/details/kv-compression-ratio.md` | `config.py`/`sparse_attn.py`/`model.py` |
 | `csa_modes`("") | CSA2 三模式静态分配（V4.1）：`full,reindex,reuse` 逗号分隔、按全注意力层序号循环（别名 `f`/`ri`/`re`）；非空时**覆盖** `csa_reuse_every`。**改语义但不改 `state_dict` 键**（旧 Full/Reuse 权重可直接互载，装载需 `sync_arch_from_checkpoint` 对齐来源）；Reindex 只在 `sparse_indexer` 开启时才与 Reuse 有区别。详见 `docs/details/csa-modes.md` | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 | `o_groups`(1) / `o_lora_rank`(0) | MLA 分组低秩输出投影（V4.1：8/1024）：按头分组、每组压到 `o_lora_rank` 再拼接升维。**默认关**（改 `state_dict` 键，旧 ckpt 无法直接载入）；开启需重训或 `scripts/migrate_model.py --o-groups G --o-lora-rank r`（SVD 迁移，近似）。详见 `docs/details/mla-grouped-output.md` | `mla.py`/`migrate.py` |
@@ -406,6 +407,16 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   **无 `sparse_indexer` 时 Reindex 数学上等于 Reuse**（选择与 query 无关）。三模式**不改
   `state_dict` 键**，但"默认值升级"风险仍在：装载脚本必须 `sync_arch_from_checkpoint`。
   收益尚未 A/B（依赖 indexer 训得动）。细节见 `docs/details/csa-modes.md`。
+- **CSA2 逐层主 KV 压缩比（`compress_ratios`，默认空=不压缩）**：每个远端 main KV 条目聚合
+  **m 个连续 token**（不重叠、块内逐位置逐通道可学习权重 `z_cmp`，初值 1=算术平均），
+  本地窗口与当前块保持未压缩（V4.1：SWA KV 不压缩），块尾作代表位置。pattern 的 sink/stride
+  语义搬到**块轴**（`sink→ceil(sink/m)` 块、`stride→max(1, stride//m)` 块），故列数预算不变、
+  远端表示的 token 数 ×m；远端块必须"完整且块尾 < 查询块起点"（因果 + 不越出真实数据区）。
+  借用层（Reindex/Reuse）沿用生产者的 m 与 `z_cmp`（同一对象），生产者 m=1 时借用层删掉自己
+  多余的 `z_cmp`（无死参数）。压缩比 >1 的层**恒走分块路径**（`sparse_threshold` 失效），
+  否则短序列 dense 与长序列压缩表示不一致。**KV 显存尚未下降**——池化在读取时做、
+  缓存仍逐 token 存原始 latent；真正的显存收益要等"压缩条目落盘 + 未压缩窗口定长环"的
+  缓存布局重构（与 #7 每层 SWA 环形缓存同工）。见 `docs/details/kv-compression-ratio.md`、pitfalls 32。
 
 ## 直觉头/RAG（`heads.py` + `retrieval.py`，SFT 后启用）
 

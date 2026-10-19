@@ -99,6 +99,26 @@ def select_keys(
     return torch.tensor(idx, dtype=torch.long), len(static_sorted)
 
 
+def select_block_keys(
+    n_blk: int,
+    sink: int,
+    stride: int,
+    m: int,
+) -> torch.Tensor:
+    """压缩路径的**远端块 id**（升序）：开头 ceil(sink/m) 块 ∪ 每 max(1, stride//m) 块取一块.
+
+    `n_blk` 为可用的"完整且因果安全"块数（见 `SparseMLAModule._far_block_ids`）。
+    语义与 `select_keys` 的 sink/stride 一致，只是**单位从 token 换成 m 块**——
+    同样的远端列数预算下，覆盖的历史跨度 ×m。
+    """
+    if n_blk <= 0:
+        return torch.zeros(0, dtype=torch.long)
+    sink_blk = min(n_blk, (sink + m - 1) // m)
+    stride_blk = max(1, stride // m)
+    ids = sorted(set(range(sink_blk)) | set(range(0, n_blk, stride_blk)))
+    return torch.tensor(ids, dtype=torch.long)
+
+
 def chunk_causal_mask(
     n_queries: int, n_static: int, n_chunk: int,
     device: torch.device, dtype: torch.dtype,
@@ -145,6 +165,7 @@ class SparseMLAModule(MLAModule):
         indexer_block: int = 8,
         indexer_pool_blocks: int = 32,
         indexer_loss_coef: float = 0.01,
+        compress_ratio: int = 1,
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
@@ -166,6 +187,13 @@ class SparseMLAModule(MLAModule):
         self.indexer_pool_blocks = int(indexer_pool_blocks)
         # indexer 蒸馏损失系数（DSA：学习式打分拟合主注意力分布；0=不训 indexer）
         self.indexer_loss_coef = float(indexer_loss_coef)
+        # 主 KV 压缩比 m（V4.1 CSA2(ratio, mode)）：远端 main KV 按 m 个连续 token
+        # 不重叠地池化成一个条目；m=1 = 不压缩（逐位等价旧行为，无新增键）。
+        self.compress_ratio = int(compress_ratio)
+        if self.compress_ratio > 1:
+            # 压缩权重：(m, kv_lora_rank) 的逐位置逐通道权重，初值 1 → 块内算术平均。
+            # 只对 m>1 的层建参数（改键）→ 默认关（`compress_ratios` 为空）。
+            self.z_cmp = nn.Parameter(torch.ones(self.compress_ratio, kv_lora_rank))
         # 最近一次前向的 indexer 辅助损失（已缩放/未缩放；赋值语义，重算幂等）
         self._last_indexer_aux: torch.Tensor | None = None
         self._last_indexer_kl: torch.Tensor | None = None
@@ -183,15 +211,16 @@ class SparseMLAModule(MLAModule):
     def _indexer_select(
         self,
         h_q: torch.Tensor,
-        c_kv: torch.Tensor,
-        static_pos: torch.Tensor,
+        c_cols: torch.Tensor,
+        col_pos: torch.Tensor,
         n_q: int,
         shared: IndexerSelect | None = None,
     ) -> IndexerSelect:
         """学习式 indexer：对静态候选打分 → 块级候选池 → 池内 token 级 top-K.
 
-        h_q: 当块 hidden (b, n_q, d)；c_kv: 全历史 latent (b, L, r)；
-        static_pos: (n_static,) 候选全局位置（升序，均 < 块起点，故对块内所有查询可见）；
+        h_q: 当块 hidden (b, n_q, d)；c_cols: **候选列自己的 latent** (b, n_static, r)
+        （压缩路径下是池化后的块 latent）；col_pos: 候选列的全局位置 (n_static,)
+        （压缩路径下取块尾位置，用于块级候选池分块）；
         shared: 前一层（Full）的选择；给定时只在其候选池内打分（CSA2 Reindex 语义）。
 
         返回 IndexerSelect（topk_mask/pool_mask 均 (b, n_q, n_static)）。
@@ -200,13 +229,13 @@ class SparseMLAModule(MLAModule):
         b = h_q.shape[0]
         heads, hdim = self.indexer_heads, self.indexer_head_dim
         qi = self.w_iq(h_q).view(b, n_q, heads, hdim).float()
-        ki = self.w_ik(c_kv[:, static_pos]).view(b, -1, heads, hdim).float()
+        ki = self.w_ik(c_cols).view(b, -1, heads, hdim).float()
         scores = torch.einsum("bqhd,bkhd->bqk", qi, ki) * (hdim ** -0.5)
         n_static = scores.shape[-1]
         flat = scores.reshape(b * n_q, n_static)
         # 块级候选池：候选按其全局位置分块，块分 = 块内最大分
-        blk = (static_pos // self.indexer_block).to(scores.device)
-        n_blk = int(blk[-1].item()) + 1
+        blk = (col_pos // self.indexer_block).to(scores.device)
+        n_blk = int(blk.max().item()) + 1  # 压缩路径下列位置非严格升序，取 max 更稳
         block_scores = flat.new_full((b * n_q, n_blk), float("-inf"))
         block_scores.scatter_reduce_(
             1, blk.view(1, -1).expand(b * n_q, -1), flat,
@@ -232,6 +261,43 @@ class SparseMLAModule(MLAModule):
         return IndexerSelect(topk_mask=topk_mask, pool_mask=pool_mask,
                              logits=scores)
 
+    def _far_block_ids(self, total: int, start: int) -> torch.Tensor:
+        """远端（压缩）块 id：只取"完整且在查询块之前"的块（因果安全）.
+
+        - 完整：块尾 `(b+1)*m-1 < total`（缓存/当前段里真有这些行）；
+        - 因果：块尾 `< start`（在查询块之前，绝不看未来 token）；
+        - 只在 `start - sparse_window` 之前：更近的位置由**未压缩**的窗口/本块列覆盖。
+        建议 `m ≤ sparse_window`（否则窗口与压缩列之间会漏掉不足一个块的近端 token）。
+        """
+        m = self.compress_ratio
+        n_valid = min(total // m, start // m)
+        n_far = min(n_valid, max(0, (start - self.sparse_window + m - 1) // m))
+        return select_block_keys(n_far, self.sparse_sink, self.sparse_stride, m)
+
+    def _compressed_columns(
+        self, c_src: torch.Tensor, kr_src: torch.Tensor, blk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """远端压缩块列：latent 按 m 块池化（可学习权重）→ (c_blk, k_blk, v_blk, blk_end).
+
+        块内不重叠、覆盖 `[b*m, (b+1)*m)`；rope 用**块尾位置**（该条目覆盖到块尾为止）。
+        池化 = `sum_i z_i ⊙ c_i / m`（z 初值 1 → 算术平均），`index_select` 可微。
+        """
+        m = self.compress_ratio
+        pos = (blk_ids[:, None] * m
+               + torch.arange(m, device=c_src.device)[None, :])   # (B, m)
+        members = c_src[:, pos]                                    # (b, B, m, r)
+        c_blk = (members * self.z_cmp).sum(dim=2) / m
+        blk_end = (blk_ids + 1) * m - 1
+        kr_blk = apply_rope_wrap(
+            kr_src[:, pos[:, -1]], self.rope_cos[blk_end], self.rope_sin[blk_end])
+        b = c_src.shape[0]
+        k = self.k_norm(self.w_uk(c_blk).view(b, -1, self.n_heads, self.head_dim))
+        v = self.w_uv(c_blk).view(b, -1, self.n_heads, self.head_dim)
+        k = torch.cat(
+            [k, kr_blk.unsqueeze(2).expand(-1, -1, self.n_heads, -1)],
+            dim=-1).transpose(1, 2)
+        return c_blk, k, v.transpose(1, 2), blk_end
+
     def _sparse_scores(
         self,
         q_c: torch.Tensor,
@@ -243,6 +309,7 @@ class SparseMLAModule(MLAModule):
         c_kv: torch.Tensor | None = None,
         h_c: torch.Tensor | None = None,
         shared: "IndexerSelect | None" = None,
+        kr_raw: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, "IndexerSelect | None", torch.Tensor | None]:
         """对查询 [start, end) 做聚集 + 掩码 + 注意力（softmax 提 fp32 保精度）.
 
@@ -254,32 +321,57 @@ class SparseMLAModule(MLAModule):
         - `reindex`：只在 `shared`（前层）的候选池内打分，用**自己的** indexer Q 重选；
         - `reuse`：直接复用 `shared` 的 Top-K（不算 indexer）；`shared` 缺失时退化为
           `full` 自选（安全兜底）。
+        `compress_ratio > 1` 时远端列改由 `kr_raw`/`c_kv` 按 m 块池化而来（见
+        `_compressed_columns`），本地窗口与当前块保持未压缩。
         返回 (注意力输出, 本层选择, indexer 蒸馏 KL)。
         训练且为生产者（full/reindex）时额外算**蒸馏损失**（DSA 做法：让学习式打分
         去拟合主注意力在候选上的分布）——否则 indexer 只进掩码、拿不到任何梯度。
         """
         b, h, _, d = k_full.shape
-        idx, n_static = select_keys(
-            total, start, end, self.sparse_sink, self.sparse_window, self.sparse_stride)
-        idx = idx.to(k_full.device)
-        # 聚集 key（index_select 可微，反向走 index_add）
-        k_sel = k_full[:, :, idx, :].contiguous()  # (b, h, K, d)
-        v_sel = v_full[:, :, idx, :].contiguous()
+        n_q = end - start
+        cols_c: torch.Tensor | None = None
+        cols_pos: torch.Tensor | None = None
+        if self.compress_ratio > 1 and c_kv is not None and kr_raw is not None:
+            # 压缩路径（V4.1 CSA2(ratio, mode)）：远端 main KV 压成 m 块列，
+            # 本地窗口 + 当前块保持未压缩（SWA KV 不压缩，逐层本地）。
+            blk_ids = self._far_block_ids(total, start).to(k_full.device)
+            local = torch.arange(
+                max(0, start - self.sparse_window), end, device=k_full.device)
+            c_blk, k_blk, v_blk, blk_end = self._compressed_columns(
+                c_kv, kr_raw, blk_ids)
+            k_cols = torch.cat([k_blk, k_full[:, :, local, :]], dim=2).contiguous()
+            v_cols = torch.cat([v_blk, v_full[:, :, local, :]], dim=2).contiguous()
+            # 静态列 = 压缩块列 + 窗口列（窗口全 < start，对块内所有查询可见）
+            n_near = local.numel() - n_q
+            cols_c = torch.cat([c_blk, c_kv[:, local[:n_near]]], dim=1)
+            cols_pos = torch.cat([blk_end, local[:n_near]])
+            n_static = blk_ids.numel() + n_near
+        else:
+            idx, n_static = select_keys(
+                total, start, end, self.sparse_sink, self.sparse_window, self.sparse_stride)
+            idx = idx.to(k_full.device)
+            # 聚集 key（index_select 可微，反向走 index_add）
+            k_cols = k_full[:, :, idx, :].contiguous()  # (b, h, K, d)
+            v_cols = v_full[:, :, idx, :].contiguous()
+            if c_kv is not None:
+                # indexer 的候选 latent 与位置（m=1 时逐位等价旧实现）
+                cols_c = c_kv[:, idx[:n_static]]
+                cols_pos = idx[:n_static]
         scale = q_c.shape[-1] ** -0.5
-        scores = torch.matmul(q_c, k_sel.transpose(-1, -2)) * scale
+        scores = torch.matmul(q_c, k_cols.transpose(-1, -2)) * scale
         mask = chunk_causal_mask(
             end - start, n_static, end - start, q_c.device, scores.dtype)
         sel: IndexerSelect | None = None
         kl: torch.Tensor | None = None
         if (self.sparse_indexer and n_static > 0
-                and c_kv is not None and h_c is not None):
+                and cols_c is not None and h_c is not None):
             if self.csa_mode == "reuse" and shared is not None:
                 # Reuse：复用最新的 Top-K，不算 indexer（V4.1：Reuse 只借 KV + 索引）
                 sel = shared
             else:
                 # Full：全候选造池自选；Reindex：借前层池、自选（V4.1 三模式核心差异）
                 sel = self._indexer_select(
-                    h_c, c_kv, idx[:n_static], end - start,
+                    h_c, cols_c, cols_pos, end - start,
                     shared if self.csa_mode == "reindex" else None)
                 if (self.training and sel.logits is not None
                         and self.csa_mode in ("full", "reindex")):
@@ -300,7 +392,7 @@ class SparseMLAModule(MLAModule):
         probs = F.softmax(scores.float() + mask.float(), dim=-1).to(scores.dtype)
         if self.training and self.dropout > 0:
             probs = F.dropout(probs, p=self.dropout)
-        return torch.matmul(probs, v_sel), sel, kl
+        return torch.matmul(probs, v_cols), sel, kl
 
     def _full_qkv_for_gather(
         self, h: torch.Tensor,
@@ -338,20 +430,23 @@ class SparseMLAModule(MLAModule):
         self._last_indexer_kl = None
         if reuse is not None:
             # 跨层复用：Q 自算、K/V 借共享 latent（短序列走 dense，超长走分块聚集）
-            if t <= self.sparse_threshold:
+            # 压缩开启时恒走分块路径：dense 用未压缩 latent，与压缩表示不一致。
+            if self.compress_ratio == 1 and t <= self.sparse_threshold:
                 return super().forward(h, None, return_state, reserve, reuse)
             q_full = self._q_only(h)
             k_full, v_full = self._kv_from_latent(reuse[0], reuse[1], total=t)
             out = self._run_blocks(
-                q_full, k_full, v_full, h, t, c_kv=reuse[0], csa_sel=csa_sel)
+                q_full, k_full, v_full, h, t, c_kv=reuse[0], csa_sel=csa_sel,
+                kr_raw=reuse[1])
             return self._out_proj(out), (reuse if return_state else None)
-        if t <= self.sparse_threshold:
+        if self.compress_ratio == 1 and t <= self.sparse_threshold:
             # 短序列：与 MLAModule 逐位一致（reserve 透传装箱）
             return super().forward(h, None, return_state, reserve)
-        # 长序列分块预填充
+        # 长序列分块预填充（压缩开启时短序列也走这里）
         q_full, k_full, v_full, c_kv, k_rope_raw = self._full_qkv_for_gather(h)
         out = self._run_blocks(
-            q_full, k_full, v_full, h, t, c_kv=c_kv, csa_sel=csa_sel)
+            q_full, k_full, v_full, h, t, c_kv=c_kv, csa_sel=csa_sel,
+            kr_raw=k_rope_raw)
         if not return_state:
             return self._out_proj(out), None
         # 缓存仍存 latent（与 MLA 一致，200K 上下文每 token 仅 ~320B/层），
@@ -367,6 +462,7 @@ class SparseMLAModule(MLAModule):
         t: int,
         c_kv: torch.Tensor,
         csa_sel: "CsaChannel | None" = None,
+        kr_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """分块聚集注意力并返回 `(b, t, n_heads*head_dim)`（头维已并回特征维）.
 
@@ -383,7 +479,7 @@ class SparseMLAModule(MLAModule):
             shared = (csa_sel.get(self.csa_src, i) if csa_sel is not None else None)
             o, sel, kl = self._sparse_scores(
                 q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t,
-                c_kv=c_kv, h_c=h[:, s:e], shared=shared)
+                c_kv=c_kv, h_c=h[:, s:e], shared=shared, kr_raw=kr_raw)
             if (sel is not None and csa_sel is not None
                     and self.csa_mode in ("full", "reindex")
                     and self.csa_index is not None):
@@ -449,7 +545,8 @@ class SparseMLAModule(MLAModule):
         # t>1 为投机解码并行验证服务（块内因果由 chunk_causal_mask 保证）
         out, sel, _kl = self._sparse_scores(
             q_full, k_full, v_full, total - t, total, total, c_kv=buf_c, h_c=h,
-            shared=(csa_sel.get(self.csa_src, 0) if csa_sel is not None else None))
+            shared=(csa_sel.get(self.csa_src, 0) if csa_sel is not None else None),
+            kr_raw=buf_kr)
         if (sel is not None and csa_sel is not None
                 and self.csa_mode in ("full", "reindex")
                 and self.csa_index is not None):

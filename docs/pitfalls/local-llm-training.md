@@ -494,4 +494,51 @@ kernel**，我们没实现——文档必须诚实写明"这里省的是选择�
   token）数恒为 0，indexer 根本不会被调用——测试里必须把 `sparse_chunk` 调小，
   否则会误判"indexer 没生效"。
 
+## 32. 压缩块 id 与 token 位置是**两套坐标**：混淆会静默看错历史（且可能越因果边界）
+
+**现象**：主 KV 逐层压缩比 `compress_ratios` 里，"块 b 聚合 `[b*m, (b+1)*m)`"，代码里到处是
+`blk_ids * m`（块 → token）与 `pos // m`（token → 块）两个方向。第一版把"块号"当"位置"用过：
+`select_block_keys` 的 sink/stride 语义搬到块轴后，块 id 与 token 位置已经**不再相等**，
+但掩码/池化/代表位置那几处看上去都"像是位置"，错了也**不报错**——只是模型看到了错的东西。
+
+**机制**：块轴 pattern 下每个 id 覆盖 m 个 token，于是有三类混淆：
+
+1. **因果**：块尾 `(b+1)*m-1` 必须 `< start`（查询块起点）。只夹取 `total // m`（"数据存在"）
+   而忘了 `start // m`（"在查询之前"），当 `m > sparse_window` 时最后一块会**伸进查询块的未来**
+   → 因果泄漏（前部输出会随未来 token 变化，单测能抓，但训练时只是"loss 莫名更好"）。
+2. **代表位置**：条目的 rope 用**块尾**位置，不是块首。用块首会让条目"提前结束"，
+   与本地窗口 `[start-window, start)` 之间漏掉近端 token。
+3. **未入选块也要参与池化**：块是被池化成**一个**条目的，池化要读块内**全部** m 个成员；
+   只读块首（把块 id 当 token）会得到一个"假条目"，且改其他成员不影响输出（看起来"稳定"）。
+
+**教训**：
+- 明确区分 **块坐标**（`blk_id`，pattern/池化/代表位置用它）与 **token 坐标**（`pos`，窗口/当前块/
+  缓存行号用它），命名上带 `blk` 前缀；跨坐标的换算只允许两处：`blk*m`（块首）与 `(blk+1)*m-1`（块尾）。
+- 因果夹取要**两个都写**：`n_valid = min(total // m, start // m)`，再夹 `start - window`。
+- **回归锁**：`tests/test_compress_ratios.py` 里
+  `test_far_block_ids_are_complete_and_causal`（块尾 < start 且 < start-window）、
+  `test_far_columns_are_actually_read`（改**未入选**块的成员输出不变、改**入选**块必须变）
+  ——后者专门防"把块 id 当 token 用"这类静默错误。
+
+## 33. 借用层必须沿用**生产者**的压缩表示（m 与池化权重），否则"共用 main KV"是假的
+
+**现象**：`compress_ratios="1,4"`（生产层 m=1、借用层 m=4）时，生产者自己的 K/V 是逐 token 的，
+而借用层按 m=4 把**同一份** latent 池化成 4 块条目——两层"复用同一份 main KV"变成了
+"复用同一份原始 latent 后各自解释"，`Reuse` 的语义（连表示都照抄）被破坏；
+更隐蔽的是借用层的 `z_cmp` 建了却**永远拿不到梯度**（它的池化结果只影响自己的输出，
+但短测试里恰好没人看），成了死参数。
+
+**机制**：压缩是**表示层**的事，而 CSA2 的"复用"复用的是**表示**（生产者算好的 main KV 条目），
+不是"原始 latent 的读取权"。所以 `mode != full` 的层必须与生产者同 m、同池化权重对象。
+
+**教训**：
+- `_link_csa_reuse` 里除了共享 `w_dkv`/`w_kr`（以及 Reindex 的 `w_ik`），还要：
+  `compress_ratio = 生产者的 m`、`z_cmp = 生产者的 z_cmp`（**同一对象**）。
+- 生产者 m=1（无 `z_cmp`）而借用层配置了 m>1 时，**删掉**借用层自己的 `z_cmp`
+  （`del layer.attn.z_cmp`；注意 `param = None` 在 torch 里只是把值置空、`hasattr` 仍为真
+  → 死参数还在，必须 `del`）。
+- 回归锁：`test_borrow_layer_inherits_producer_ratio_and_weights` 断言
+  `layers[2].attn.z_cmp is layers[0].attn.z_cmp`，以及 `not hasattr(..., "z_cmp")`。
+
+
 

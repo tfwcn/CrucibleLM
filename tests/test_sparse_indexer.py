@@ -113,7 +113,7 @@ def test_indexer_select_topk_subset_of_pool():
     h_q = torch.randn(1, 4, 128)
     c_kv = torch.randn(1, 20, 32)
     static_pos = torch.arange(0, 16)  # 16 个候选，block=4 → 4 个块
-    sel = m._indexer_select(h_q, c_kv, static_pos, 4)
+    sel = m._indexer_select(h_q, c_kv[:, static_pos], static_pos, 4)
     assert sel.topk_mask.shape == (1, 4, 16)
     assert sel.topk_mask.sum(-1).tolist() == [[6, 6, 6, 6]]
     # top-K 必须落在池内

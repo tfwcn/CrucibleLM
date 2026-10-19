@@ -76,6 +76,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         engram_conv=config.engram_conv,
         vocab_size=config.vocab_size,
         csa_mode=csa_mode,
+        compress_ratio=config.compress_ratio_of(layer_idx),
     )
     if full:
         # 层序号：CSA2 选择通道按层号键控，生产者写、借用者读（见 CsaChannel）
@@ -207,6 +208,15 @@ class TinyLLM(nn.Module):
                         and getattr(last_full.attn, "sparse_indexer", False)):
                     layer.attn.w_ik = last_full.attn.w_ik
                 layer.attn.csa_src = last_full.attn.csa_index
+                # 主 KV 的**压缩表示**也必须名实相符：借用层沿用生产者的压缩比与池化
+                # 权重（同一对象），否则同一条 main KV 在两层被池化成不同条目。
+                layer.attn.compress_ratio = getattr(last_full.attn, "compress_ratio", 1)
+                _z = getattr(last_full.attn, "z_cmp", None)
+                if _z is None:
+                    if getattr(layer.attn, "z_cmp", None) is not None:
+                        del layer.attn.z_cmp  # 生产者不压缩 → 本层也不留死参数
+                else:
+                    layer.attn.z_cmp = _z
                 if mode == "reindex":
                     last_full = layer  # Reindex 也是生产者（更新"最新选择"）
             else:
