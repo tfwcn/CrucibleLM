@@ -177,6 +177,13 @@ class SmallLLMConfig:
     # 近似（重建出的解码器 SWA 与全量前向不严格相等）。关掉即"全量 prefill"，
     # 严格对齐训练口径，代价是失去 CED 的省算。
     ced_prefill_skip: bool = True
+    # KV 缓存量化（V4.1 §2.4.4）："" = 关（默认）；"fp4" = 主 KV 用 MXFP4
+    # （E2M1 + 每 16 通道 E4M3 scale，4.5 bit/通道）；"fp8" = 主 KV 用 E4M3（8.5 bit）。
+    # 训练期在 `_kv_latent`/`_rope_key` 出口做 fake-quant（STE）→ 即 QAT；推理期同一
+    # 数值，区别只在存储（`QuantBuffer` 打包，读时反量化再算注意力——不需要 FP4 矩阵乘）。
+    # **默认关**：改缓存数值（精度损失）且改缓存布局（扩容器走 QuantBuffer）。
+    # 真省存储：FP4 相对 bf16 约 3.4x（latent+rope 一起算），相对 FP8 约 1.9x。
+    kv_quant: str = ""
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
@@ -515,6 +522,18 @@ _CSA_MODE_ALIASES: dict[str, str] = {
 }
 
 
+def _norm_kv_quant(v) -> str:
+    """KV 量化格式："" / "fp4" / "fp8"（非法值早失败）."""
+    s = str(v or "").strip().lower()
+    if s in ("", "none", "off", "0", "false"):
+        return ""
+    if s in ("fp4", "mxfp4"):
+        return "fp4"
+    if s in ("fp8", "e4m3"):
+        return "fp8"
+    raise ValueError(f"未知 kv_quant 格式 {v!r}（支持 ''/'fp4'/'fp8'）")
+
+
 def _norm_csa_modes(v) -> str:
     """CSA2 模式串归一化："full,reindex,reuse" 式逗号列表（别名 f/ri/re）.
 
@@ -623,6 +642,8 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "ced_split": (0, _norm_nonneg_int),
     # CED 预填充跳算（推理近似性开关，不改键）；旧 ckpt 沿用默认开
     "ced_prefill_skip": (True, _norm_bool),
+    # KV 缓存量化格式（V4.1）；不改 state_dict 键（只改缓存数值/布局），旧 ckpt 回退空=不量化
+    "kv_quant": ("", _norm_kv_quant),
 }
 
 

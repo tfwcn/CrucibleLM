@@ -176,6 +176,7 @@ EMA 影子评测 + 冠军快照兜底——分阶段的手工课程已被这三�
 - 检索融合：`--enable-retro --retro-db <pickle>`（RETRO-lite，BM25 捞回片段拼成前缀
   mem 段；索引用 `scripts/build_retrieval.py` 构建）；V2 交错用
   `--retro-every N --retro-len L`（每 N 层融合 token 级 chunk，frozen 编码）；
+- KV 量化：`--kv-quant fp4`（V4.1 §2.4.4：主 KV 用 MXFP4、SWA 环用 FP8；QAT 训练期生效，读时反量化再算注意力。实测 32768 ctx 缓存降到 0.32x，代价是精度需 A/B）；
 - CED 编码器-解码器：`--ced-split N`（V4.1 §2.2：前 N 层当编码器，其后层全局 KV 由编码器
   输出逐层投影，预填充只跑尾段。要求解码器区间全是全注意力层——base 的 1:3 hybrid 不满足；
   解码器层恒 Full 不借缓存，KV 存储会升 ~38%，是"用存储换算力"。详见 `docs/details/ced.md`）；

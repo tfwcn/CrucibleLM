@@ -28,7 +28,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 5 | 分层稀疏 indexer（学习式 top-K + 块级候选池） | ✅ 开关 `sparse_indexer`（默认关，改键）+ 蒸馏损失 `indexer_loss_coef` | `sparse_attn.py` |
 | 6 | CED 编码器-解码器（上半层全局 KV 由 L/2 层投影，省近半预填充） | ✅ 开关 `ced_split`（解码器层全局 KV/rope 键由编码器输出逐层投影；预填充只跑编码器全序列 + 解码器尾段 2×窗口，8K 实测总算力 −43.75%；约束：解码器区间须全为全注意力层，base 的 1:3 hybrid 不满足；解码器恒 Full → KV 存储 +38%） | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | 7 | 每层 SWA + SWA Bounded Replay | ✅ 开关 `swa_window`（每层自带独立投影分支，与全局条目同一次 softmax；定长环缓存与序列长度无关；落盘只存全局 KV，读回有界重放重建；SWA 下禁用投机解码） | `config.py`/`sparse_attn.py`/`model.py`/`session_cache.py` |
-| 8 | FP4 主 KV（MXFP4 + QAT）+ FP8 SWA KV | ❌ | `mla.py`/`optim.py` |
+| 8 | FP4 主 KV（MXFP4 + QAT）+ FP8 SWA KV | ✅ 开关 `kv_quant`（MXFP4：E2M1 + 每 16 通道 E4M3 scale，4.5 bit/通道；SWA 环联动 FP8。QAT 走 fake-quant/STE，读时反量化再算注意力；缓存打包成 `QuantBuffer`，实测 8192 ctx 0.41x、32768 ctx 0.32x） | `config.py`/`kv_quant.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | 9 | MLA 分组输出投影 `o_lora_rank` + `o_groups` | ✅ | `mla.py` |
 | 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | 🔶 mHC-lite | `hyperconn.py` |
 | 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | 🔶 小表 + 短卷积 | `engram.py` |

@@ -48,6 +48,7 @@ class MLAModule(nn.Module):
         o_groups: int = 1,
         o_lora_rank: int = 0,
         ced: bool = False,
+        kv_fmt: str = "",
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -64,6 +65,20 @@ class MLAModule(nn.Module):
         # 投影权重），不再看自己的 hidden；因此这层的 `w_dkv`/`w_kr` 换成
         # `w_ced_kv`/`w_ced_kr`（键集不同 → 改键、opt-in）。Q 与 SWA 仍来自自己。
         self.ced = bool(ced)
+        # KV 缓存量化格式（V4.1 §2.4.4）：""=关；"fp4"=MXFP4（E2M1 + 每 16 通道
+        # E4M3 scale）；"fp8"=E4M3。训练期 fake-quant（STE）做 QAT、推理期同一数值，
+        # 差别只在**存储**（QuantBuffer 打包，反量化后再算注意力）。
+        from src.llm.local.config import _norm_kv_quant
+
+        self.kv_fmt = _norm_kv_quant(kv_fmt)
+        if self.kv_fmt:
+            from src.llm.local.kv_quant import KV_QUANT_BLOCK
+
+            for _name, _dim in (("kv_lora_rank", kv_lora_rank),
+                                ("qk_rope_dim", qk_rope_dim)):
+                if _dim % KV_QUANT_BLOCK:
+                    raise ValueError(
+                        f"KV 量化要求 {_name}={_dim} 能被块 {KV_QUANT_BLOCK} 整除")
         if not self.ced:
             self.w_dkv = nn.Linear(d_model, kv_lora_rank, bias=False)
         self.w_uk = nn.Linear(kv_lora_rank, n_heads * self.head_dim, bias=False)
@@ -149,6 +164,30 @@ class MLAModule(nn.Module):
 
     def _pack_cache(
         self, c_kv: torch.Tensor, k_rope_raw: torch.Tensor, reserve: int,
+    ) -> tuple:
+        """装箱解码缓存：`self.kv_fmt` 非空时返回 QuantBuffer（真省存储），
+        否则返回 fp 张量（逐位兼容旧行为）。"""
+        if self.kv_fmt:
+            assert reserve >= c_kv.shape[1], "缓存预留不足序列"
+            return (self._quant_cache(c_kv, reserve),
+                    self._quant_cache(k_rope_raw, reserve),
+                    torch.tensor(c_kv.shape[1], dtype=torch.long,
+                                 device=c_kv.device))
+        return self._pack_cache_fp(c_kv, k_rope_raw, reserve)
+
+    def _quant_cache(self, x: torch.Tensor, reserve: int):
+        """把 (b, t, r) 的缓存写成量化缓冲（尾部补零到 reserve，逻辑长仍是 reserve）."""
+        from src.llm.local.kv_quant import QuantBuffer
+
+        b, t, r = x.shape
+        tail = max(0, reserve - t)
+        if tail:
+            x = torch.cat([x, torch.zeros(b, tail, r, device=x.device,
+                                          dtype=x.dtype)], dim=1)
+        return QuantBuffer.from_tensor(x, self.kv_fmt)
+
+    def _pack_cache_fp(
+        self, c_kv: torch.Tensor, k_rope_raw: torch.Tensor, reserve: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """静态缓存装箱：latent 尾部补零到 reserve 长，并附位置计数.
 
@@ -186,7 +225,12 @@ class MLAModule(nn.Module):
 
     def _kv_latent(self, h: torch.Tensor,
                    ced_src: torch.Tensor | None = None) -> torch.Tensor:
-        """主 KV 的下投影 latent：CED 解码器层来自编码器输出，其余来自本层 hidden."""
+        """主 KV 的下投影 latent：CED 解码器层来自编码器输出，其余来自本层 hidden.
+
+        `kv_fmt` 非空时在这里做 QAT（fake-quant + STE）：训练与推理都按"会被量化成
+        的值"计算，区别只在存储（`QuantBuffer` 打包）。放这里是因为它是**唯一**的
+        latent 出口（prefill / 解码 / CED 全走它），避免漏掉某条路径导致训推不一致。
+        """
         if not self.ced:
             return self.w_dkv(h)
         if ced_src is None:
@@ -237,6 +281,16 @@ class MLAModule(nn.Module):
         v = self.w_uv(c_kv).view(b, t_kv, self.n_heads, self.head_dim)
         # 共享旋转键（先旋转再补头维度，避免广播错位）
         k_rope_raw = self._rope_key(h, ced_src)
+        # QAT（V4.1 §2.4.4）：训练与"不走缓存的前向"都按**会被量化成的值**计算，
+        # 这样它和缓存里存的值一致（缓存写入处对同一个张量做同一量化）。
+        if self.kv_fmt:
+            from src.llm.local.kv_quant import fake_quant
+
+            c_kv = fake_quant(c_kv, self.kv_fmt)
+            k = self.w_uk(c_kv).view(b, t_kv, self.n_heads, self.head_dim)
+            k = self.k_norm(k)
+            v = self.w_uv(c_kv).view(b, t_kv, self.n_heads, self.head_dim)
+            k_rope_raw = fake_quant(k_rope_raw, self.kv_fmt)
         k_rope = apply_rope(
             k_rope_raw, self.rope_cos, self.rope_sin
         ).unsqueeze(2)
@@ -262,6 +316,12 @@ class MLAModule(nn.Module):
 
         `total` 非空时只取前 `total` 个位置（prefill 缓冲可能补零到 reserve）。
         """
+        from src.llm.local.kv_quant import QuantBuffer, fake_quant
+
+        if isinstance(c_kv, QuantBuffer):
+            c_kv = c_kv.dequant()
+        if isinstance(k_rope_raw, QuantBuffer):
+            k_rope_raw = k_rope_raw.dequant()
         if total is not None:
             c_kv = c_kv[:, :total]
             k_rope_raw = k_rope_raw[:, :total]
@@ -313,17 +373,31 @@ class MLAModule(nn.Module):
 
         `ced_src`：CED 解码器层的编码器输出（当步），KV/rope 键由它投影后写入缓存。
         """
+        from src.llm.local.kv_quant import QuantBuffer, fake_quant
+
         b, t, _ = h.shape
         buf_c, buf_kr, pos = past
         total = buf_c.shape[1]
         if write:
-            # 范围写（t==1 即单槽；dynamo 安全，形状恒定）
-            w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
-            # 对齐缓冲 dtype（prefill 可能建于 autocast 下；同 dtype 时是 no-op）
-            buf_c.index_copy_(1, w_idx,
-                              self._kv_latent(h, ced_src).to(buf_c.dtype))
-            buf_kr.index_copy_(1, w_idx,
-                               self._rope_key(h, ced_src).to(buf_kr.dtype))
+            p0 = int(pos.item())
+            if isinstance(buf_c, QuantBuffer):
+                # 量化缓存：写到哪就把哪一段按格式量化（QAT 数值与训练一致）
+                buf_c.write_(p0, self._kv_latent(h, ced_src))
+                buf_kr.write_(p0, self._rope_key(h, ced_src))
+            else:
+                # 范围写（t==1 即单槽；dynamo 安全，形状恒定）
+                w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
+                # 对齐缓冲 dtype（prefill 可能建于 autocast 下；同 dtype 时是 no-op）
+                buf_c.index_copy_(1, w_idx,
+                                  self._kv_latent(h, ced_src).to(buf_c.dtype))
+                buf_kr.index_copy_(1, w_idx,
+                                   self._rope_key(h, ced_src).to(buf_kr.dtype))
+        # 读之前先反量化（V4.1：反量化后再算注意力，不需要 FP4 矩阵乘）；
+        # 注意别覆盖 `buf_c/buf_kr`——返回的 past 必须是**原始（量化）缓冲**
+        if isinstance(buf_c, QuantBuffer):
+            c_use, kr_use = buf_c.dequant(), buf_kr.dequant()
+        else:
+            c_use, kr_use = buf_c, buf_kr
         pos_next = pos + t
         q_c = self.w_dq(h)
         q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
@@ -338,12 +412,13 @@ class MLAModule(nn.Module):
             self.rope_cos[q_idx],
             self.rope_sin[q_idx],
         )
-        k = self.k_norm(self.w_uk(buf_c).view(b, total, self.n_heads, self.head_dim))
-        v = self.w_uv(buf_c).view(b, total, self.n_heads, self.head_dim)
+        k = self.k_norm(self.w_uk(c_use).view(b, total, self.n_heads,
+                                              self.head_dim))
+        v = self.w_uv(c_use).view(b, total, self.n_heads, self.head_dim)
         rlen = self.rope_cos.shape[0]
         ridx = torch.arange(total, device=h.device).clamp(max=rlen - 1)
         k_rope_hist = apply_rope(
-            buf_kr,
+            kr_use,
             self.rope_cos[ridx],
             self.rope_sin[ridx],
         ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)

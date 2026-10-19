@@ -82,6 +82,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         compress_ratio=config.compress_ratio_of(layer_idx),
         swa_window=config.swa_window,
         ced=is_ced_dec,
+        kv_quant=config.kv_quant,
     )
     if full:
         # 层序号：CSA2 选择通道按层号键控，生产者写、借用者读（见 CsaChannel）
@@ -1165,8 +1166,17 @@ class TinyLLM(nn.Module):
         CSA2 跨层复用时，Reuse 层不新增 KV 缓存（借最近 Full 层），故只计 Full 层。
         """
         c = self.config
-        # 主 KV：逐 token 增长（CSA2 压缩比 m 只改"条目表示"，缓存布局仍逐 token）
-        mla_per_layer = (c.kv_lora_rank + c.qk_rope_dim) * seq_len * dtype_bytes
+        # 主 KV：逐 token 增长（CSA2 压缩比 m 只改"条目表示"，缓存布局仍逐 token）；
+        # `kv_quant` 非空时按量化格式计（fp4 4.5 bit/通道、fp8 8.5 bit/通道）
+        if c.kv_quant:
+            from src.llm.local.kv_quant import kv_bytes_per_token
+
+            mla_per_layer = (
+                kv_bytes_per_token(c.kv_lora_rank, c.kv_quant)
+                + kv_bytes_per_token(c.qk_rope_dim, c.kv_quant, block=16)
+            ) * seq_len
+        else:
+            mla_per_layer = (c.kv_lora_rank + c.qk_rope_dim) * seq_len * dtype_bytes
         lin_per_layer = c.n_heads * (c.d_model // c.n_heads) ** 2 * dtype_bytes
         # 层内 SWA：定长环（k/v 各 n_heads*head_dim + 共享 rope 键 n_win*qk_rope_dim）
         # ——**与序列长度无关**，故这里是加法项而不是乘 seq_len 项
@@ -1174,8 +1184,16 @@ class TinyLLM(nn.Module):
         swa_per_layer = 0
         if c.swa_window > 0:
             head_dim = c.d_model // c.n_heads
-            swa_per_layer = (2 * c.n_heads * head_dim + c.qk_rope_dim) \
-                * c.swa_window * dtype_bytes
+            if c.kv_quant:
+                # SWA 环按 FP8 存（V4.1：SWA 对量化更敏感，保留 FP8）
+                from src.llm.local.kv_quant import kv_bytes_per_token
+
+                swa_per_layer = int(round(kv_bytes_per_token(
+                    2 * c.n_heads * head_dim + c.qk_rope_dim, "fp8")
+                    * c.swa_window))
+            else:
+                swa_per_layer = (2 * c.n_heads * head_dim + c.qk_rope_dim) \
+                    * c.swa_window * dtype_bytes
         n_full = c.n_full_layers
         n_lin = c.n_layers - n_full
         # 统计真正存 KV 的全注意力层（非 Reuse）

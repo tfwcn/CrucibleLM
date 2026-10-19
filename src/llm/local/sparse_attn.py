@@ -224,11 +224,13 @@ class SparseMLAModule(MLAModule):
         compress_ratio: int = 1,
         swa_window: int = 0,
         ced: bool = False,
+        kv_fmt: str = "",
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
             max_seq_len, rope_theta, yarn_scale, dropout,
             o_groups=o_groups, o_lora_rank=o_lora_rank, ced=ced,
+            kv_fmt=kv_fmt,
         )
         # 纯超参，不注册为 Parameter/Buffer（state_dict 与 MLA 一致，checkpoint 通用）
         self.sparse_threshold = sparse_threshold
@@ -254,6 +256,9 @@ class SparseMLAModule(MLAModule):
             self.z_cmp = nn.Parameter(torch.ones(self.compress_ratio, kv_lora_rank))
         # 层内 SWA（V4.1：每层自带、窗口定长）：0=关（无新增参数/键，逐位兼容旧 ckpt）
         self.swa_window = int(swa_window)
+        # 层内 SWA 环的量化格式（V4.1）：主 KV 开量化时环用 **FP8**（论文：SWA 对
+        # 量化更敏感，保留 FP8；主 KV 才用 FP4）
+        self.swa_fmt = "fp8" if self.kv_fmt else ""
         self.swa: SwaBranch | None = (
             SwaBranch(d_model, n_heads, qk_rope_dim, self.swa_window, dropout)
             if self.swa_window > 0 else None
@@ -561,10 +566,17 @@ class SparseMLAModule(MLAModule):
                 return super().forward(h, None, return_state, reserve, reuse)
             q_full = self._q_only(h)
             k_full, v_full = self._kv_from_latent(reuse[0], reuse[1], total=t)
-            swa_kv = self.swa.project(h) if self.swa is not None else None
+            # indexer 的候选 latent 需要 float（量化缓存先反量化）
+            from src.llm.local.kv_quant import QuantBuffer
+
+            c_cols = (reuse[0].dequant() if isinstance(reuse[0], QuantBuffer)
+                      else reuse[0])
+            kr_cols = (reuse[1].dequant() if isinstance(reuse[1], QuantBuffer)
+                       else reuse[1])
+            swa_kv = self._swa_project(h) if self.swa is not None else None
             out = self._run_blocks(
-                q_full, k_full, v_full, h, t, c_kv=reuse[0], csa_sel=csa_sel,
-                kr_raw=reuse[1], swa_kv=swa_kv)
+                q_full, k_full, v_full, h, t, c_kv=c_cols, csa_sel=csa_sel,
+                kr_raw=kr_cols, swa_kv=swa_kv)
             if not return_state:
                 return self._out_proj(out), None
             # 只借生产者的全局主 KV（buf/pos），**SWA 环必须各建各的**：层内
@@ -588,7 +600,9 @@ class SparseMLAModule(MLAModule):
         total = q_off + t
         # SWA 投影：查询段里的**每个**位置都要有自己的 SWA 列（否则前段输出与
         # 全前向分叉）；环另由 `_pack_swa` 按绝对位置装（定长）。
-        swa_kv = self.swa.project(h) if self.swa is not None else None
+        # 开 KV 量化时 SWA 环按 FP8 存 → 这里也要 fake-quant，否则"预填充用的是
+        # 未量化的 SWA 列、解码用的是环里的 FP8 值"，两条路径必然分叉。
+        swa_kv = self._swa_project(h) if self.swa is not None else None
         out = self._run_blocks(
             q_full, k_full, v_full, h, total, c_kv=c_kv, csa_sel=csa_sel,
             kr_raw=k_rope_raw, swa_kv=swa_kv, q_off=q_off)
@@ -618,11 +632,33 @@ class SparseMLAModule(MLAModule):
         """
         assert self.swa is not None, "本层未开 SWA（swa_window=0）"
         cap = self._swa_capacity(t)
-        k = torch.zeros(batch, cap, self.n_heads, self.swa.head_dim,
-                        device=device, dtype=dtype)
-        kr = torch.zeros(batch, cap, self.swa.qk_rope_dim,
-                         device=device, dtype=dtype)
+        k_shape = (batch, cap, self.n_heads, self.swa.head_dim)
+        kr_shape = (batch, cap, self.swa.qk_rope_dim)
+        if self.swa_fmt:
+            from src.llm.local.kv_quant import QuantBuffer
+
+            return (QuantBuffer.zeros(k_shape, self.swa_fmt, device=device),
+                    QuantBuffer.zeros(kr_shape, self.swa_fmt, device=device),
+                    QuantBuffer.zeros(k_shape, self.swa_fmt, device=device))
+        k = torch.zeros(*k_shape, device=device, dtype=dtype)
+        kr = torch.zeros(*kr_shape, device=device, dtype=dtype)
         return k, kr, torch.zeros_like(k)
+
+    def _swa_project(self, h: torch.Tensor
+                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """层内 SWA 的 K/V 投影 + QAT（`swa_fmt` 非空时按 FP8 fake-quant）.
+
+        SWA 环按 FP8 存（V4.1：SWA 对量化更敏感，保留 FP8），所以**预填充的 SWA 列**
+        与**环里的值**必须是同一套量化数值，否则增量解码与全前向分叉（实测 0.3 量级）。
+        """
+        k, kr, v = self.swa.project(h)
+        if self.swa_fmt:
+            from src.llm.local.kv_quant import fake_quant
+
+            k = fake_quant(k, self.swa_fmt)
+            kr = fake_quant(kr, self.swa_fmt)
+            v = fake_quant(v, self.swa_fmt)
+        return k, kr, v
 
     def _swa_capacity(self, t: int = 1) -> int:
         """SWA 环容量：`window + max(0, t-1)`.
@@ -649,18 +685,34 @@ class SparseMLAModule(MLAModule):
         （pitfall 34）。
         """
         b = k.shape[0]
+        # k/kr/v 可能只覆盖尾部（Bounded Replay）：按**绝对位置**右对齐写入
+        t_proj = k.shape[1]
+        n = min(t_proj, cap)
+        rows = torch.arange(pos_end - n, pos_end, device=k.device) % cap
+        k_tail = k[:, t_proj - n:t_proj]
+        kr_tail = kr[:, t_proj - n:t_proj]
+        v_tail = v[:, t_proj - n:t_proj]
+        if self.swa_fmt:
+            from src.llm.local.kv_quant import QuantBuffer
+
+            k_ring = QuantBuffer.zeros(
+                (b, cap, self.n_heads, self.swa.head_dim), self.swa_fmt,
+                device=k.device).write_rows_(rows, k_tail)
+            kr_ring = QuantBuffer.zeros(
+                (b, cap, self.swa.qk_rope_dim), self.swa_fmt,
+                device=k.device).write_rows_(rows, kr_tail)
+            v_ring = QuantBuffer.zeros(
+                (b, cap, self.n_heads, self.swa.head_dim), self.swa_fmt,
+                device=k.device).write_rows_(rows, v_tail)
+            return k_ring, kr_ring, v_ring
         k_ring = torch.zeros(b, cap, self.n_heads, self.swa.head_dim,
                              device=k.device, dtype=k.dtype)
         kr_ring = torch.zeros(b, cap, self.swa.qk_rope_dim,
                               device=k.device, dtype=k.dtype)
         v_ring = torch.zeros_like(k_ring)
-        # k/kr/v 可能只覆盖尾部（Bounded Replay）：按**绝对位置**右对齐写入
-        t_proj = k.shape[1]
-        n = min(t_proj, cap)
-        rows = torch.arange(pos_end - n, pos_end, device=k.device) % cap
-        k_ring[:, rows] = k[:, t_proj - n:t_proj]
-        kr_ring[:, rows] = kr[:, t_proj - n:t_proj]
-        v_ring[:, rows] = v[:, t_proj - n:t_proj]
+        k_ring[:, rows] = k_tail
+        kr_ring[:, rows] = kr_tail
+        v_ring[:, rows] = v_tail
         return k_ring, kr_ring, v_ring
 
     def _grow_swa_rings(
@@ -681,8 +733,17 @@ class SparseMLAModule(MLAModule):
         old_pos = torch.arange(pos - n_old, pos, device=rings[0].device)
         src = old_pos % cap_old
         dst = old_pos % cap_new
+        from src.llm.local.kv_quant import QuantBuffer
+
         out = []
         for ring, width in zip(rings, (None, self.swa.qk_rope_dim, None)):
+            if isinstance(ring, QuantBuffer):
+                # 量化环：先反量化取有效行，再按新模写入新环
+                new = QuantBuffer.zeros((b, cap_new, *ring.shape[2:]),
+                                        ring.fmt, device=ring.device)
+                new.write_rows_(dst, ring.dequant().index_select(1, src))
+                out.append(new)
+                continue
             if ring.dim() == 4:  # (b, cap, n_heads, head_dim)
                 new = torch.zeros(b, cap_new, ring.shape[2], ring.shape[3],
                                   device=ring.device, dtype=ring.dtype)
@@ -705,12 +766,19 @@ class SparseMLAModule(MLAModule):
         `[max(s, i-W+1), i]`"——重放段之前的位置**根本没进环**，必须靠 floor
         显式裁掉，否则会读到环里未初始化的零行（软注意力照付权重）。
         """
+        from src.llm.local.kv_quant import QuantBuffer
+
         n_win = self.swa.window
         k_ring, kr_ring, v_ring = rings
         cap = k_ring.shape[1]
         lo = max(0, int(floor), start - n_win + 1)
         pos = torch.arange(lo, end, device=k_ring.device)
         rows = pos % cap
+        if isinstance(k_ring, QuantBuffer):
+            # 环按 FP8 存（V4.1）：读时反量化整环再取列（环很小，代价可忽略）
+            k_ring = k_ring.dequant()
+            kr_ring = kr_ring.dequant()
+            v_ring = v_ring.dequant()
         return k_ring[:, rows], kr_ring[:, rows], v_ring[:, rows], pos
 
     def _run_blocks(
@@ -801,13 +869,20 @@ class SparseMLAModule(MLAModule):
         if not self.csa_reuse and write_cache:
             # 生产者（Full 层）：按位写自己的 latent；Reindex/Reuse 跳过
             # （共享缓冲已由生产者写好，两者都借 main KV）
-            w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
-            # 对齐缓冲 dtype：prefill 可能建在 autocast 下（bf16 缓冲），解码若
-            # 不带 autocast 会得到 fp32；同 dtype 时 `.to` 是 no-op
-            buf_c.index_copy_(1, w_idx,
-                              self._kv_latent(h, ced_src).to(buf_c.dtype))
-            buf_kr.index_copy_(1, w_idx,
-                               self._rope_key(h, ced_src).to(buf_kr.dtype))
+            from src.llm.local.kv_quant import QuantBuffer
+
+            if isinstance(buf_c, QuantBuffer):
+                # 量化缓存：按格式就地量化写（QAT 数值与训练一致）
+                buf_c.write_(int(pos.item()), self._kv_latent(h, ced_src))
+                buf_kr.write_(int(pos.item()), self._rope_key(h, ced_src))
+            else:
+                w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
+                # 对齐缓冲 dtype：prefill 可能建在 autocast 下（bf16 缓冲），解码若
+                # 不带 autocast 会得到 fp32；同 dtype 时 `.to` 是 no-op
+                buf_c.index_copy_(1, w_idx,
+                                  self._kv_latent(h, ced_src).to(buf_c.dtype))
+                buf_kr.index_copy_(1, w_idx,
+                                   self._rope_key(h, ced_src).to(buf_kr.dtype))
         pos_next = pos + t
         # 实际长度（pattern 按实际算；一次同步，eager 可忽略；
         # compile 下此处 graph-break 但不重编）
@@ -824,13 +899,20 @@ class SparseMLAModule(MLAModule):
         q_rope = apply_rope_wrap(
             q_rope, self.rope_cos[_qidx], self.rope_sin[_qidx])
         # 全缓冲展开（latent 省的是缓存不是计算，单步展开可接受；
-        # pattern 只 gather 有效下标，空位不参与；rope 下标钳制防 L 超缓存）
-        k = self.k_norm(self.w_uk(buf_c).view(b, -1, self.n_heads, self.head_dim))
-        v = self.w_uv(buf_c).view(b, -1, self.n_heads, self.head_dim)
+        # pattern 只 gather 有效下标，空位不参与；rope 下标钳制防 L 超缓存）。
+        # 量化缓存先反量化（V4.1：反量化后再算注意力，不需要 FP4 矩阵乘）
+        from src.llm.local.kv_quant import QuantBuffer
+
+        c_use = buf_c.dequant() if isinstance(buf_c, QuantBuffer) else buf_c
+        kr_use = buf_kr.dequant() if isinstance(buf_kr, QuantBuffer) else buf_kr
+        k = self.k_norm(self.w_uk(c_use).view(b, -1, self.n_heads,
+                                             self.head_dim))
+        v = self.w_uv(c_use).view(b, -1, self.n_heads, self.head_dim)
         _rlen = self.rope_cos.shape[0]
-        _ridx = torch.arange(buf_kr.shape[1], device=h.device).clamp(max=_rlen - 1)
+        _ridx = torch.arange(kr_use.shape[1], device=h.device).clamp(
+            max=_rlen - 1)
         k_rope_hist = apply_rope_wrap(
-            buf_kr,
+            kr_use,
             self.rope_cos[_ridx],
             self.rope_sin[_ridx],
         ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)
@@ -841,7 +923,7 @@ class SparseMLAModule(MLAModule):
         # t>1 为投机解码并行验证服务（块内因果由 chunk_causal_mask 保证）
         swa_cols = None
         if self.swa is not None:
-            k_swa, kr_swa, v_swa = self.swa.project(h)
+            k_swa, kr_swa, v_swa = self._swa_project(h)
             if rings is None:
                 # 兼容旧缓存（无 SWA 环）：本步现场补一个（后续步即走环）
                 rings = self._pack_swa(k_swa, kr_swa, v_swa, total,
@@ -852,14 +934,23 @@ class SparseMLAModule(MLAModule):
                 cap = rings[0].shape[1]
                 rows = ((pos.reshape(1) + torch.arange(t, device=h.device))
                         % cap)
-                rings = tuple(
-                    ring.index_copy(1, rows, new.to(ring.dtype)).clone()
-                    for ring, new in zip(rings, (k_swa, kr_swa, v_swa)))
+                from src.llm.local.kv_quant import QuantBuffer
+
+                if isinstance(rings[0], QuantBuffer):
+                    # 量化环：原地按行写（环内位置 = 位置 % cap）
+                    for ring, new in zip(rings, (k_swa, kr_swa, v_swa)):
+                        ring.write_rows_(rows, new)
+                    rings = tuple(r.clone() for r in rings)
+                else:
+                    rings = tuple(
+                        ring.index_copy(1, rows, new.to(ring.dtype)).clone()
+                        for ring, new in zip(rings, (k_swa, kr_swa, v_swa)))
             swa_cols = self._swa_read(rings, total - t, total, floor=swa_floor)
         out, sel, _kl = self._sparse_scores(
-            q_full, k_full, v_full, total - t, total, total, c_kv=buf_c, h_c=h,
+            q_full, k_full, v_full, total - t, total, total, c_kv=c_use,
+            h_c=h,
             shared=(csa_sel.get(self.csa_src, 0) if csa_sel is not None else None),
-            kr_raw=buf_kr, swa=swa_cols)
+            kr_raw=kr_use, swa=swa_cols)
         if (sel is not None and csa_sel is not None
                 and self.csa_mode in ("full", "reindex")
                 and self.csa_index is not None):

@@ -185,6 +185,8 @@ replace manual staged curriculum. Starting fully loaded from step 0 works too
   prefix memory segment; build the index with `scripts/build_retrieval.py`);
   V2 interleave with `--retro-every N --retro-len L` (per-layer fusion over
   token-level chunks, frozen-embedding encoded);
+- KV quantization: `--kv-quant fp4` (V4.1 §2.4.4: MXFP4 main KV + FP8 SWA rings; QAT during
+  training, dequantize before attention. Measured 0.32x cache at 32768 ctx; accuracy needs A/B);
 - Causal Encoder-Decoder: `--ced-split N` (V4.1 §2.2: the first N layers encode, later layers
   project their global KV from the encoder output, so prefill only runs the tail. Requires the
   decoder range to be all full-attention layers - the 1:3 hybrid base preset does not qualify.

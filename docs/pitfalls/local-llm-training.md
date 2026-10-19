@@ -760,3 +760,39 @@ hidden** 生成，"将来会被解码读到"的那 W 个环行自身也得自洽
 - 新增分组 = 新增 `kind` 变体，别只往字典里塞键而不更新标记。
 - 回归锁：`test_combined_optimizer_state_roundtrip_and_mismatch`（往返成功 +
   两个方向的开关不匹配都抛错 + 非 Muon 存盘抛错）。
+## 45. KV 量化的 scale 必须**向下**舍入，否则量化不幂等——prefill 与解码静默分叉
+
+**现象**：FP8 主 KV 写好后，`prefill + 增量解码 == 全前向` 的单测挂了（差 0.033）。
+查下去：`fake_quant(x)` 与"缓存里存的量化值"不一致——**同一张量量化两次会漂移**。
+再查：`fake_quant(fake_quant(x)) != fake_quant(x)`，而且只有个别 block 漂。
+
+**机制**：块量化的 scale 存成 E4M3（8 bit），scale 本身也要舍入。若 scale 向上舍入
+（> `amax/k`），反量化后块最大值 `< amax`；再做一次量化时 `amax` 变小、scale 跟着变小，
+码字重新分配 → 漂移。而我们的路径恰好会量化两次：`_qkv` 出口一次（QAT）+ 缓存写入
+一次。向下舍入时 `amax/scale ≥ k`，反量化最大恰为 `k×scale`，再量化得到同一个 scale
+——**幂等**。另有一个同源坑：**scale 必须"先舍入到 E4M3、再用它算码字"**，否则量化
+用精确 scale、反量化用存储 scale，误差直接超过半个码字间距（实测 1.145 vs 允许 0.875）。
+
+**教训**：
+- 量化格式里"scale 自己也占位宽"就意味着**两级舍入**：先舍 scale，再算码字；
+  且 scale 要 floor（不是 round）才能保住幂等。
+- 写单测直接锁幂等：`fake_quant(fake_quant(x)) == fake_quant(x)`（多组量级各测一遍）。
+- 回归锁：`test_kv_quant_prefill_plus_decode_matches_full_forward`（fp4/fp8 各一次）。
+
+## 46. SWA 分支也要 QAT：只量化主 KV 会让"预填充的窗口列"与"环里的值"分叉
+
+**现象**：主 KV 开 FP4 后，单 token 解码与全前向差 **1.23**（fp32！）。主 KV 的
+prefill/解码一致性明明已经是 0。逐层查：差异从第一个全注意力层就出现，且集中在
+SWA 窗口覆盖的位置。
+
+**机制**：SWA 环按 FP8 存，但**预填充时 SWA 的 K/V 是当场 float 投影**（没走缓存），
+而解码时读的是环里**已被量化**的值——同一层的同一条局部记忆，两条路径喂进去的数值
+不同。主 KV 因为 `_qkv` 出口有 `fake_quant` 所以一致，SWA 分支漏了这一步。
+
+**教训**：
+- "缓存量化"要覆盖**所有会被存进缓存的张量**，不只是主 KV；凡是"写缓存 / 直接前向"
+  两条路径，量化点必须放在**两条路径共同的上游**（这里是 `SwaBranch.project` 之后）。
+- 排查套路：把一致性测试的 diff 按位置画出来——如果差异集中在窗口附近而不是首位，
+  几乎一定是"局部记忆的两条来源不同"。
+- 回归锁：`test_kv_quant_prefill_plus_decode_matches_full_forward` 里同时断言
+  `swa_window=0` 与 `swa_window=8`（后者才覆盖 SWA 环路径）。

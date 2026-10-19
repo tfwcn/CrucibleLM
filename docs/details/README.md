@@ -16,6 +16,7 @@
 - [主 KV 压缩比：一个条目代表 m 个 token](./kv-compression-ratio.md)
 - [层内 SWA：每层自己的"近处记忆" + 有界重放](./per-layer-swa.md)
 - [CED 因果编码器-解码器：上半层不再自己造 KV](./ced.md)
+- [FP4 主 KV + FP8 SWA KV：缓存存 4 bit，算时抬回 float](./kv-cache-fp4.md)
 - [RoPE 与 YaRN：位置和外推](./rope-yarn.md)
 
 ## 前馈与目标

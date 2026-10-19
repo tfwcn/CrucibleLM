@@ -90,13 +90,18 @@ class SessionCache:
                     plans[id(t)] = (t, nlen)
         if not plans:
             return
-        # 第 2 遍：生成新张量（同一旧张量只生成一次）
-        fresh: dict[int, torch.Tensor] = {}
+        # 第 2 遍：生成新缓冲（同一旧张量只生成一次）。
+        # 量化缓存（QuantBuffer）走自己的 resize（打包存储 + 块 scale）；
+        # 注意 dtype 可能是 float8/int8，不能统一 torch.zeros 再拷贝。
+        fresh: dict[int, object] = {}
         for key, (t, nlen) in plans.items():
-            new = torch.zeros(t.shape[0], nlen, t.shape[2],
-                              device=t.device, dtype=t.dtype)
-            new[:, :t.shape[1]] = t
-            fresh[key] = new
+            if hasattr(t, "resize") and not isinstance(t, torch.Tensor):
+                fresh[key] = t.resize(nlen)
+            else:
+                new = torch.zeros(t.shape[0], nlen, t.shape[2],
+                                  device=t.device, dtype=t.dtype)
+                new[:, :t.shape[1]] = t
+                fresh[key] = new
         # 第 3 遍：就地替换（未扩容的 past 保持原对象，SWA 环元组原样续接）
         for li, p in enumerate(self.pasts):
             if not self._is_static_triple(p):
@@ -145,7 +150,9 @@ class SessionCache:
             dev = next(model.parameters()).device
         except StopIteration:
             dev = torch.device("cpu")
-        blob = torch.load(path, map_location=dev)
+        # weights_only=False：落盘里有 QuantBuffer/meta 等自定义对象（本文件由
+        # 自己 save 产生，可信）；torch>=2.6 默认 True 会拒载
+        blob = torch.load(path, map_location=dev, weights_only=False)
         sc.pasts = blob["pasts"]
         # ids 只是记账（`extend` 往 CPU 上拼），**别跟着 map 到设备**：否则 GPU 上
         # 读回后第一次 `extend` 会在 `torch.cat` 处设备不一致而炸（本仓踩过）。

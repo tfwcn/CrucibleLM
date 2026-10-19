@@ -151,6 +151,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
                         "读不到 checkpoint 架构则保守按 1）")
+    p.add_argument("--kv-quant", default=None,
+                   help="KV 缓存量化（V4.1 §2.4.4）：''=关（默认）、'fp4'（MXFP4：E2M1 + 每 16 "
+                        "通道 E4M3 scale，4.5 bit/通道）、'fp8'（E4M3，8.5 bit/通道）。训练期 fake-quant "
+                        "做 QAT，推理期同一数值、只在存储上省（不改 state_dict 键）")
     p.add_argument("--ced-split", type=int, default=None,
                    help="CED 编码器-解码器（V4.1）：前 N 层当因果编码器、其余当解码器，"
                         "解码器的全局 KV 由编码器输出逐层投影（预填充省近半）；"
@@ -893,6 +897,14 @@ def main(argv=None) -> int:
         _srcs = sorted(config.kv_source_set())
         print(f"CSA2 非均匀 KV 源层已开：生产者层 {_srcs}（其余全注意力层复用最近"
               f"生产者的 main KV；间距可任意非均匀）", flush=True)
+    if config.kv_quant:
+        from src.llm.local.kv_quant import kv_bytes_per_token
+
+        _per = (kv_bytes_per_token(config.kv_lora_rank, config.kv_quant)
+                + kv_bytes_per_token(config.qk_rope_dim, config.kv_quant))
+        print(f"KV 缓存量化已开（V4.1）：格式 {config.kv_quant}，主 KV 每 token "
+              f"{_per:.0f}B（bf16 对照 "
+              f"{(config.kv_lora_rank + config.qk_rope_dim) * 2}B）", flush=True)
     if config.ced_split > 0:
         print(f"CED 已开（V4.1）：前 {config.ced_split} 层为编码器、其余"
               f" {config.n_layers - config.ced_split} 层为解码器；解码器全局 KV 由"
