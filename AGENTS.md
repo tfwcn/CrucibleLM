@@ -24,7 +24,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 1 | SwiGLU 限幅 `swiglu_limit` | ✅ | `moe.py` |
 | 2 | 免辅助损失路由（sqrtsoftplus + noaux_tc + routed_scaling） | ✅ | `moe.py` |
 | 3 | CSA2 三模式 Full/Reindex/Reuse | ✅ `csa_modes`（空=旧 Full/Reuse 交替；Reindex 无 indexer 时数学上=Reuse） | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
-| 4 | 逐层压缩比 `compress_ratios` + KV 源层（非均匀） | 🔶 每 N 层统一（`csa_modes` 已支持任意非均匀分配） | `config.py`/`model.py` |
+| 4 | 逐层压缩比 `compress_ratios` + KV 源层（非均匀） | ✅ KV 源层非均匀（`kv_source_layer_ids`，任意间距）；🔶 逐层压缩比 `compress_ratios` 待做 | `config.py`/`model.py` |
 | 5 | 分层稀疏 indexer（学习式 top-K + 块级候选池） | ✅ 开关 `sparse_indexer`（默认关，改键）+ 蒸馏损失 `indexer_loss_coef` | `sparse_attn.py` |
 | 6 | CED 编码器-解码器（上半层全局 KV 由 L/2 层投影，省近半预填充） | ❌ | `model.py`/`block.py` |
 | 7 | 每层 SWA + SWA Bounded Replay | 🔶 hybrid 骨架 | `sparse_attn.py` |

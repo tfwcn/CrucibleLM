@@ -16,6 +16,7 @@ torch = pytest.importorskip("torch")
 from src.llm.local.config import (  # noqa: E402
     SmallLLMConfig,
     _norm_csa_modes,
+    _norm_layer_ids,
     sync_arch_from_checkpoint,
     tiny_test_config,
 )
@@ -120,6 +121,72 @@ def test_first_layer_degrades_to_full():
     assert m.layers[2].attn.csa_mode == "reuse"
     assert m._csa_active is True
     assert m.layers[2].attn.csa_src == 0
+
+
+# ---------------------- 非均匀 KV 源层（kv_source_layer_ids） ----------------------
+def test_kv_source_ids_non_uniform():
+    """显式 KV 源层：间距可任意非均匀（这是与"每 N 层统一"的区别）."""
+    cfg = _cfg(n_layers=12, kv_source_layer_ids="0,6")
+    assert [cfg.csa_mode_of(i) for i in range(12)] == [
+        "full", "full", "reuse", "full", "reuse", "full",
+        "full", "full", "reuse", "full", "reuse", "full"]
+    assert cfg.kv_source_set() == frozenset({0, 6})
+    m = TinyLLM(cfg)
+    modes = {i: L.attn.csa_mode for i, L in enumerate(m.layers)
+             if getattr(L, "full_attn", False)}
+    assert modes == {0: "full", 2: "reuse", 4: "reuse",
+                     6: "full", 8: "reuse", 10: "reuse"}
+    # 借用者指向**最近**生产者，且共享其下投影对象
+    assert m.layers[8].attn.csa_src == 6
+    assert m.layers[2].attn.csa_src == 0
+    assert m.layers[8].attn.w_dkv is m.layers[6].attn.w_dkv
+    assert m.layers[8].attn.w_dkv is not m.layers[0].attn.w_dkv
+    # KV 缓存只计生产者（2 个 Full）
+    c = m.config
+    n_lin = c.n_layers - c.n_full_layers
+    mla = (c.kv_lora_rank + c.qk_rope_dim) * 1024 * 2
+    lin = c.n_heads * (c.d_model // c.n_heads) ** 2 * 2
+    assert m.kv_cache_bytes(1024) == 2 * mla + n_lin * lin
+
+
+def test_kv_source_ids_first_layer_fallback_and_precedence():
+    """表内没有首层 → 首层退化为 Full；表只决定"谁生产"，模式仍听 `csa_modes`."""
+    m = TinyLLM(_cfg(n_layers=8, kv_source_layer_ids="4"))
+    assert m.layers[0].attn.csa_mode == "full"      # 兜底生产者
+    assert m.layers[4].attn.csa_mode == "full"
+    assert m.layers[2].attn.csa_mode == "reuse"     # 借最近生产者（层 0）
+    assert m.layers[6].attn.csa_mode == "reuse"
+    assert m.layers[6].attn.csa_src == 4
+    # 源层的模式取 `csa_modes` 在**该层序号**处的值：只有 reindex 才保留，否则升为 Full
+    m2 = TinyLLM(_cfg(n_layers=8, kv_source_layer_ids="4",
+                      csa_modes="reuse,reindex"))
+    # 层 0 表层外且 modes 说 reuse，但它前面没有生产者 → 仍在 `_link_csa_reuse` 退化为 Full
+    assert m2.layers[0].attn.csa_mode == "full"
+    assert m2.layers[2].attn.csa_mode == "reindex"  # 表层外 + modes 说 reindex
+    assert m2.layers[4].attn.csa_mode == "full"     # 表层内但该处 modes=reuse → 升 Full
+    assert m2.layers[6].attn.csa_mode == "reindex"
+    assert m2.layers[6].attn.csa_src == 4
+    m3 = TinyLLM(_cfg(n_layers=8, kv_source_layer_ids="4",
+                      csa_modes="reuse,reuse,reindex"))
+    assert m3.layers[4].attn.csa_mode == "reindex"  # 表层内 + 该处 modes=reindex → 保留
+    assert m3.layers[6].attn.csa_mode == "reuse"    # 消费层照 modes（借层 4 的索引）
+
+
+def test_kv_source_ids_validation_and_keys():
+    """非法层号早失败；源层表**不改 state_dict 键**."""
+    with pytest.raises(ValueError, match="非全注意力层"):
+        TinyLLM(_cfg(n_layers=8, kv_source_layer_ids="1"))   # 1 是线性层
+    with pytest.raises(ValueError, match="越界"):
+        _cfg(n_layers=8, kv_source_layer_ids="8").kv_source_set()
+    with pytest.raises(ValueError, match="非整数"):
+        _cfg(n_layers=8, kv_source_layer_ids="a").kv_source_set()
+    a = TinyLLM(_cfg(n_layers=8, kv_source_layer_ids="0,4"))
+    b = TinyLLM(_cfg(n_layers=8, kv_source_layer_ids=""))
+    assert set(a.state_dict()) == set(b.state_dict())
+    assert _norm_layer_ids("2, 8 ,14") == "2,8,14"
+    assert _norm_layer_ids("2,2,8") == "2,8"
+    assert _norm_layer_ids([2, 8]) == "2,8"
+    assert _norm_layer_ids("") == "" and _norm_layer_ids(None) == ""
 
 
 def test_modes_off_means_all_full():
@@ -353,6 +420,13 @@ def test_cli_csa_modes_and_resolver(tmp_path):
     cfg = tiny_test_config()
     src = T.resolve_arch_switches(T.parse_args(["--csa-modes", "full,reuse"]), cfg)
     assert cfg.csa_modes == "full,reuse" and src["csa_modes"] == "explicit"
+    # 非均匀 KV 源层：CLI 三态 + 来源对齐 + config 校验
+    assert T.parse_args([]).kv_source_layer_ids is None
+    cfg_src = tiny_test_config()
+    src_src = T.resolve_arch_switches(
+        T.parse_args(["--kv-source-layer-ids", "0,6"]), cfg_src)
+    assert cfg_src.kv_source_layer_ids == "0,6"
+    assert src_src["kv_source_layer_ids"] == "explicit"
     # indexer 超参 CLI 必须真的落进 config（曾经定义了却没接线）
     cfg2 = tiny_test_config()
     changed = T.apply_indexer_overrides(

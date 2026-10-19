@@ -126,6 +126,16 @@ class SmallLLMConfig:
     # `sparse_indexer` 开启时才与 Reuse 有区别（无 indexer 时退化为 Reuse，
     # 因为选择与 query 内容无关、逐层相同）——见 docs/details/csa-modes.md。
     csa_modes: str = ""
+    # 显式"KV 源层"表（V4.1 非均匀分配，如 "2,8,14,20"）：列出的**全注意力层**为
+    # 生产者（Full，自算自存 main KV + 自选 Top-K），其余全注意力层复用最近生产者的
+    # main KV（Reuse）——间距可以任意非均匀（这正是与"每 N 层统一"的区别）。
+    # 为空 = 按 `csa_modes`（空则 `csa_reuse_every`）均匀分配。
+    # 合法性：只能列全注意力层（`is_full_attn_layer`），否则报错（早失败）；
+    # 首个全注意力层若不在表内会退化为 Full 兜底（否则无共享源）。
+    # 与 `csa_modes` 的关系：本表只决定"谁生产"，模式仍取 `csa_modes` 该位置的值
+    # （消费层若被指定为 reindex 则仍是 reindex）；未指定则生产者 Full、消费者 Reuse。
+    # 同族语义开关：不改 state_dict 键，续训/迁移自动沿用 checkpoint。
+    kv_source_layer_ids: str = ""
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
@@ -244,12 +254,43 @@ class SmallLLMConfig:
             for k in range(self.csa_reuse_every))
 
     def csa_mode_of(self, layer_idx: int) -> str:
-        """某层的 CSA2 模式（非全注意力层恒为 "full"，不受影响）."""
+        """某层的 CSA2 模式（非全注意力层恒为 "full"，不受影响）.
+
+        显式 `kv_source_layer_ids` 非空时，它只决定"谁生产"：表内层是生产者
+        （Full，除非 `csa_modes` 该位置显式写成 reindex），表外全注意力层是消费者
+        （Reuse，除非该位置显式写成 reindex）。为空时按 `csa_modes`/`csa_reuse_every`
+        的循环均匀分配。
+        """
         if not self.is_full_attn_layer(layer_idx):
             return "full"
         modes = self.csa_mode_list()
         k = layer_idx // max(1, self.full_attn_every)
-        return modes[k % len(modes)]
+        base = modes[k % len(modes)]
+        srcs = self.kv_source_set()
+        if not srcs:
+            return base
+        if layer_idx in srcs:
+            return "reindex" if base == "reindex" else "full"
+        return "reuse" if base == "full" else base
+
+    def kv_source_set(self) -> frozenset[int]:
+        """KV 源层（生产者)集合；空串 → 空集（由 `csa_modes` 推导）.
+
+        合法性早失败：层号必须落在 `[0, n_layers)` 且必须是全注意力层。
+        """
+        if not self.kv_source_layer_ids:
+            return frozenset()
+        ids = _parse_layer_ids(_norm_layer_ids(self.kv_source_layer_ids))
+        for i in ids:
+            if not 0 <= i < self.n_layers:
+                raise ValueError(
+                    f"kv_source_layer_ids 含越界层号 {i}（共 {self.n_layers} 层）")
+            if not self.is_full_attn_layer(i):
+                raise ValueError(
+                    f"kv_source_layer_ids 含非全注意力层 {i}"
+                    f"（full_attn_every={self.full_attn_every}，"
+                    f"全注意力层序号需能被其整除）")
+        return frozenset(ids)
 
 
 # 16G 训练配方建议（bf16 + AdamW + 梯度检查点）
@@ -413,6 +454,36 @@ def _norm_csa_modes(v) -> str:
     return ",".join(out)
 
 
+def _norm_layer_ids(v) -> str:
+    """层号表归一化："2,8,14" / [2, 8, 14] → "2,8,14"（去重、保序；空 → ""）.
+
+    非整数或负数直接报错（配置错误用户可见，早失败）。
+    """
+    if v is None or v == "":
+        return ""
+    items = v if isinstance(v, (list, tuple)) else str(v).replace(";", ",").split(",")
+    out: list[int] = []
+    for raw in items:
+        tok = str(raw).strip()
+        if not tok:
+            continue
+        try:
+            x = int(tok)
+        except ValueError:
+            raise ValueError(
+                f"层号表含非整数 {raw!r}（形如 \"2,8,14\"）") from None
+        if x < 0:
+            raise ValueError(f"层号表含负层号 {x}")
+        if x not in out:
+            out.append(x)
+    return ",".join(str(x) for x in out)
+
+
+def _parse_layer_ids(s: str) -> tuple[int, ...]:
+    """规范化层号串 → 元组（空串 → ()）."""
+    return tuple(int(x) for x in str(s).split(",") if x.strip())
+
+
 _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "csa_reuse_every": (1, _norm_at_least_one_int),
     "swiglu_limit": (0.0, _norm_nonneg_float),
@@ -434,6 +505,8 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "indexer_pool_blocks": (32, _norm_at_least_one_int),
     # CSA2 三模式（V4.1）；语义变更但不改键，空=旧行为（由 csa_reuse_every 推导）
     "csa_modes": ("", _norm_csa_modes),
+    # 显式非均匀 KV 源层（V4.1）；（语义变更但不改键，空=均匀分配）
+    "kv_source_layer_ids": ("", _norm_layer_ids),
 }
 
 

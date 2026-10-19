@@ -139,6 +139,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
                         "读不到 checkpoint 架构则保守按 1）")
+    p.add_argument("--kv-source-layer-ids", type=str, default=None,
+                   help="CSA2 非均匀 KV 源层（V4.1，如 '2,8,14,20'）：列出的全注意力层"
+                        "为生产者（Full），其余复用最近生产者的 main KV；空=按 "
+                        "--csa-modes/--csa-reuse-every 均匀分配")
     p.add_argument("--csa-modes", type=str, default=None,
                    help="CSA2 三模式逐层分配（V4.1）：逗号分隔，按全注意力层序号循环，"
                         "如 'full,reindex,reuse'（别名 f/ri/re）；非空时覆盖 "
@@ -854,6 +858,13 @@ def main(argv=None) -> int:
     if arch_src.get("csa_modes") == "checkpoint":
         print(f"CSA2 三模式：沿用 checkpoint 分配 csa_modes={config.csa_modes!r}",
               flush=True)
+    if arch_src.get("kv_source_layer_ids") == "checkpoint":
+        print("CSA2：沿用 checkpoint 的 KV 源层表 "
+              f"kv_source_layer_ids={config.kv_source_layer_ids!r}", flush=True)
+    if config.kv_source_layer_ids:
+        _srcs = sorted(config.kv_source_set())
+        print(f"CSA2 非均匀 KV 源层已开：生产者层 {_srcs}（其余全注意力层复用最近"
+              f"生产者的 main KV；间距可任意非均匀）", flush=True)
     if config.csa_modes:
         modes = ",".join(config.csa_mode_list())
         print(f"CSA2 三模式静态分配已开：{modes}（按全注意力层序号循环；"

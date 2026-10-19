@@ -349,6 +349,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
 | `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
 | `csa_reuse_every`(2) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，实测 8192 ctx KV −30%、32768 −32%）。**默认 2=开**（实测有代价的净收益），1=关 | `mla.py`/`sparse_attn.py`/`model.py` |
+| `kv_source_layer_ids`("") | CSA2 **非均匀** KV 源层（V4.1，如 `"2,8,14,20"`）：只决定"谁生产"（表内全注意力层为 Full 生产者，其余复用最近生产者），间距任意；**不改 `state_dict` 键**，续训/迁移沿用 checkpoint。详见 `docs/details/csa-modes.md` | `config.py`/`model.py` |
 | `csa_modes`("") | CSA2 三模式静态分配（V4.1）：`full,reindex,reuse` 逗号分隔、按全注意力层序号循环（别名 `f`/`ri`/`re`）；非空时**覆盖** `csa_reuse_every`。**改语义但不改 `state_dict` 键**（旧 Full/Reuse 权重可直接互载，装载需 `sync_arch_from_checkpoint` 对齐来源）；Reindex 只在 `sparse_indexer` 开启时才与 Reuse 有区别。详见 `docs/details/csa-modes.md` | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 | `o_groups`(1) / `o_lora_rank`(0) | MLA 分组低秩输出投影（V4.1：8/1024）：按头分组、每组压到 `o_lora_rank` 再拼接升维。**默认关**（改 `state_dict` 键，旧 ckpt 无法直接载入）；开启需重训或 `scripts/migrate_model.py --o-groups G --o-lora-rank r`（SVD 迁移，近似）。详见 `docs/details/mla-grouped-output.md` | `mla.py`/`migrate.py` |
@@ -393,6 +394,10 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   续训判定（lr 2e-5/1e-5 各一轮，同 seed 同数据）：差距随收敛深度增长（r=−0.45），
   两个独立 lr 复现同一残差——是**小而稳的固有容量差额，非适配滞后**；故是**可辩护的
   取舍，不是无损**。细节见 `docs/details/csa-kv-reuse.md`。
+- **CSA2 非均匀 KV 源层（`kv_source_layer_ids`）**：显式列出生产者层（如 `"2,8,14,20"`），
+  其余全注意力层复用**最近**生产者的 main KV——即 V4.1 的静态分配口径，间距可任意非均匀
+  （`csa_modes`/`csa_reuse_every` 是均匀循环的特例）。合法性早失败（只能列全注意力层）；
+  优先级 `kv_source_layer_ids` > `csa_modes` > `csa_reuse_every`。
 - **CSA2 三模式（`csa_modes`）**：逐全注意力层静态分配 **Full**（自算自存 KV + 自选 Top-K）/
   **Reindex**（借 main KV 与 indexer K，自带 indexer Q 重选 Top-K）/ **Reuse**（直接用最新
   Top-K）。借用层（Reindex/Reuse）与最近生产者共享 `w_dkv`/`w_kr`（indexer 开启时 Reindex

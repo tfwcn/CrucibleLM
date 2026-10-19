@@ -95,6 +95,24 @@ aux   += indexer_loss_coef * kl                            # 进各层 aux 汇�
 不会污染主损失的口径）；设为 0 = 不训 indexer（口径可关）。层内多块取均值、层间由模型
 累加进 `aux_loss`，另以 `indexer_loss`（层间均值、未缩放）单独打日志便于读。
 
+### 5. 非均匀 KV 源层：`kv_source_layer_ids`（V4.1 的静态分配）
+
+`csa_modes`/`csa_reuse_every` 都是**均匀**的（按序号循环），而 V4.1 的分配是**非均匀**的：
+它直接给出"KV 源层"清单（论文/配置里形如 `[2, 8, 14, 20]`），列表里的层自己造 main KV，
+其余层复用**最近**源层的 main KV。我们用 `kv_source_layer_ids`（逗号分隔的层号，
+如 `"2,8,14,20"`）承接这条：
+
+- 优先级：`kv_source_layer_ids` > `csa_modes` > `csa_reuse_every`；
+- 它只决定**谁生产**：表内层 = 生产者（`Full`，除非 `csa_modes` 在**该层序号**处显式写了
+  `reindex`——那层就是"只生产索引"的 Reindex 生产者）；表外全注意力层 = 消费者
+  （`Reuse`，或 `csa_modes` 处写 `reindex` 时为 Reindex）；
+- 合法性强校验：只能列**全注意力层**（否则报错，早失败）；首个全注意力层若不在表里，
+  `_link_csa_reuse` 仍会把它退化为 Full 兜底（不能没有共享源）；
+- 依然**不改 `state_dict` 键**（与 `csa_modes` 同族），续训/迁移自动沿用 checkpoint。
+
+这就是 #4 的"非均匀"那一半：把"每 N 层统一"升级成任意间距的显式分配，
+KV 缓存只由源层承担（`kv_cache_bytes` 如实反映）。
+
 ## 从想法到代码
 
 ```python
@@ -120,6 +138,7 @@ if sel and self.csa_mode in ("full", "reindex"): ch.put(self.csa_index, chunk, s
 |---|---|---|
 | `csa_modes` | `""` | 逐全注意力层模式串（`full`/`reindex`/`reuse`，别名 `f`/`ri`/`re`）；空 = 由 `csa_reuse_every` 推导旧行为。**改语义但不改 `state_dict` 键**，续训/迁移自动沿用 checkpoint |
 | `csa_reuse_every` | 2 | 旧的均匀两态（未设 `csa_modes` 时生效）：每 N 个全注意力层留 1 个 Full |
+| `kv_source_layer_ids` | `""` | 显式非均匀 KV 源层（如 `"2,8,14,20"`）：只决定"谁生产"，模式仍听 `csa_modes`；空 = 均匀分配 |
 | `indexer_loss_coef` | 0.01 | indexer 蒸馏损失系数；只影响 indexer 自身学习步长，0 = 不训 |
 
 ## 代价与口径
@@ -148,3 +167,6 @@ if sel and self.csa_mode in ("full", "reindex"): ch.put(self.csa_index, chunk, s
 - 因果（改未来 token 前部不变）+ 梯度 Finite；
 - `prefill + 增量解码 == 全前向`、**梯度检查点开关不改梯度**（通道键控的回归锁）；
 - `kv_cache_bytes` 只计生产者；来源对齐（`sync_arch_from_checkpoint`）+ CLI `--csa-modes` 三态。
+- **非均匀源层**（`kv_source_layer_ids`）：`"0,6"` 时层 0/6 为生产者、其余复用最近生产者
+  （`csa_src` 正确、共享对象正确）、KV 只计 2 个源层；非法层号（非全注意力层/越界/非整数）
+  报错；首层不在表内时兜底为 Full；键集合与均匀分配相同；CLI `--kv-source-layer-ids` 来源对齐。
