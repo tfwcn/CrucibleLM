@@ -667,3 +667,61 @@ Gated-DeltaNet-lite）想"状态不可回退，那就沿用缓存里的末态"�
 - 回归锁：`test_bounded_replay_rebuilds_hybrid_state_from_segment`（hybrid 下
   整段重放 `1e-5` 内精确）**外加对照**：手写"沿用末态"的版本误差必须大 100 倍
   ——防止有人图省事改回去。
+## 40. CED 跳算的边界必须**块对齐**：否则全局 pattern 变了，末位置差 1e-1
+
+**现象**：CED 的推理预填充只让解码器层跑尾巴，第一版把起点取成 `n_tok - 2*window`
+（一个"看起来够用"的位置）。结果末位置 hidden 与全量 prefill 差 **1e-1** 量级——
+不是数值噪声，是算错了东西。`swa_window=0` 时更明显：本该严格等价，却差 8e-3。
+
+**机制**：稀疏注意力不是逐点独立的——它先按 `sparse_chunk` 把查询**分块**，再为整块
+选静态列（sink/stride/窗口都以**块起点**为基准，见 pitfall 35）。跳算若把起点挪到
+块中间，尾段第一块就变成 `[q_off, q_off+chunk)`，与全量的块边界错位 → 静态列集合不同
+→ 末位置看到的历史不同。`swa_window>0` 时更绕：窗口列的 K/V 由窗口内各位置**自己的
+hidden** 生成，"将来会被解码读到"的那 W 个环行自身也得自洽，所以还要再往前留一个 W。
+
+**教训**：
+- `q_off` 一律取 `((n_tok - 1) // sparse_chunk) * sparse_chunk`（最后一个 token 所在块的
+  起点），再按窗口需求整块前推：`while n_tok - q_off < 2*swa_window: q_off -= chunk`。
+- 尾段长度固定按 **2×窗口**（不是 1×）：实测 tail=2W 时末位置与环都逐位一致，
+  tail=W 时差 1e-1——这条差距写进单测当对照，防止有人"优化"回 1×。
+- 回归锁：`test_ced_prefill_skip_is_exact_without_swa`（块对齐后 1e-6）、
+  `test_ced_prefill_skip_with_swa_replays_two_windows`（2W 精确 + 1W 必错）。
+
+## 41. 梯度检查点下 `ced_src` 必须当**输入**传，不能靠闭包捕获
+
+**现象**：CED 解码器层的 KV 来自编码器输出 `H_enc`。训练开梯度检查点时，首版把
+`ced_src` 和 `retro_mem`/`engram_ids` 一样丢进闭包（`fn(hh)` 里直接用）。loss 正常、
+训练不报错，但**编码器层的 KV 下投影梯度恒为 0**——模型看起来在训，实际只有解码器
+和 MoE 在学。
+
+**机制**：`torch.utils.checkpoint.checkpoint(fn, h)` 只把**显式传入的张量**当作可微
+输入；闭包里捕获的张量在重算时被当作常量，反向不会经过它。`retro_mem`/`engram_ids`
+本来就是 frozen 的（不要求梯度），所以以前放在闭包里没事；`ced_src` 是**要回传梯度**
+的编码器输出，放闭包就断链。
+
+**教训**：
+- 任何"上一层输出、要回传梯度"的张量都必须列进 `checkpoint(...)` 的参数表
+  （`checkpoint(fn, h, ced_src, use_reentrant=False)`，`ced_src` 为 None 时显式传 None）。
+- 判断口径：**这个张量 requires_grad 吗？** 是 → 必须是 checkpoint 的输入。
+- 回归锁：`test_ced_grad_ckpt_still_reaches_encoder` 同时断言"开/关梯度检查点梯度一致"
+  与"编码器 `w_dkv` 梯度非零"——只比一致性抓不到"两边都断"。
+
+## 42. CED 解码器区间混进线性层 = 跳算静默算错（必须构建期拒绝）
+
+**现象**：CED 的收益全在"解码器层只跑尾巴"。线性注意力层（Gated-DeltaNet-lite）的
+状态是**递推**的：位置 `i` 的状态依赖 `i-1`。若它落在解码器区间里，跳算前缀就等于
+丢掉那段递推状态——不报错、不崩，只是输出静默偏离全量（而且偏差会随层数累积）。
+更隐蔽的是"看起来还行"：随机权重下 loss 依然有限。
+
+**机制**：CED 只改**全局注意力的 KV 来源**；SWA 和线性层的状态都必须逐位置算。
+论文的架构里解码器半全是 CSA2（全注意力），所以没这个问题；本仓 1:3 hybrid 有。
+
+**教训**：
+- `ced_split_validated()` 里校验"解码器区间必须全是全注意力层"，构建期 `ValueError`；
+  别指望运行时能发现（不会报错）。
+- 文档要写清代价：本仓 base（`full_attn_every=4`）因此**不能开 CED**，要用
+  `full_attn_every=1` 这类配置；这不是实现残缺，是架构约束。
+- 顺带一条：CED 解码器层**恒为 Full**（不借前层缓存），所以 `kv_cache_bytes` 会变大
+  （实测 8192 ctx 下 +38%）。"省算力"和"省显存"是两笔账，开之前先算清楚。
+- 回归锁：`test_ced_requires_full_attention_decoder`（含线性层 → 抛错）、
+  `test_ced_decoder_layers_are_full_mode`（解码器层 `csa_mode == "full"`）。

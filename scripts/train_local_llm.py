@@ -139,6 +139,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
                         "读不到 checkpoint 架构则保守按 1）")
+    p.add_argument("--ced-split", type=int, default=None,
+                   help="CED 编码器-解码器（V4.1）：前 N 层当因果编码器、其余当解码器，"
+                        "解码器的全局 KV 由编码器输出逐层投影（预填充省近半）；"
+                        "0=关（默认）。改键（解码器层 w_dkv/w_kr → w_ced_*），旧 ckpt 需重训；"
+                        "要求解码器区间全是全注意力层")
+    p.add_argument("--ced-prefill-skip", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="CED 预填充跳算（默认开）：解码器层只跑最后 swa_window 个 token；"
+                        "SWA 关时与全量逐位等价，SWA 开时是论文承认的近似")
     p.add_argument("--swa-window", type=int, default=None,
                    help="层内 SWA 窗口（V4.1：每层自带滑动窗口注意力，窗口定长、"
                         "缓存与序列长度无关）；0=关（默认）。改键（新增 swa.*），旧 ckpt 需重训")
@@ -872,6 +881,11 @@ def main(argv=None) -> int:
         _srcs = sorted(config.kv_source_set())
         print(f"CSA2 非均匀 KV 源层已开：生产者层 {_srcs}（其余全注意力层复用最近"
               f"生产者的 main KV；间距可任意非均匀）", flush=True)
+    if config.ced_split > 0:
+        print(f"CED 已开（V4.1）：前 {config.ced_split} 层为编码器、其余"
+              f" {config.n_layers - config.ced_split} 层为解码器；解码器全局 KV 由"
+              f"编码器输出逐层投影，预填充跳算="
+              f"{'开' if config.ced_prefill_skip else '关'}", flush=True)
     if config.swa_window > 0:
         print(f"层内 SWA 已开（V4.1）：窗口 {config.swa_window} token/层，"
               f"缓存为定长环（与序列长度无关）；全局主 KV 只出选中条目",

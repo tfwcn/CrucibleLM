@@ -223,11 +223,12 @@ class SparseMLAModule(MLAModule):
         indexer_loss_coef: float = 0.01,
         compress_ratio: int = 1,
         swa_window: int = 0,
+        ced: bool = False,
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
             max_seq_len, rope_theta, yarn_scale, dropout,
-            o_groups=o_groups, o_lora_rank=o_lora_rank,
+            o_groups=o_groups, o_lora_rank=o_lora_rank, ced=ced,
         )
         # 纯超参，不注册为 Parameter/Buffer（state_dict 与 MLA 一致，checkpoint 通用）
         self.sparse_threshold = sparse_threshold
@@ -502,13 +503,17 @@ class SparseMLAModule(MLAModule):
         return torch.matmul(probs, v_cols), sel, kl
 
     def _full_qkv_for_gather(
-        self, h: torch.Tensor,
+        self, h: torch.Tensor, ced_src: torch.Tensor | None = None,
+        q_off: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """由 hidden 算全序列 q/k/v（含 rope 拼接）+ latent 缓存原料.
+        """由 hidden 算全序列（或查询尾段）q/k/v（含 rope 拼接）+ latent 缓存原料.
 
         返回 (q_full, k_full, v_full, c_kv, k_rope_raw)，一次投影处处复用。
+        `ced_src`/`q_off`：CED 解码器层的 KV 来自编码器输出，且跳算时查询只覆盖
+        尾部（KV 仍覆盖全序列）——见 `forward`。
         """
-        q, k, v, q_rope, k_rope, c_kv, k_rope_raw = self._qkv(h)
+        q, k, v, q_rope, k_rope, c_kv, k_rope_raw = self._qkv(
+            h, ced_src=ced_src, q_off=q_off)
         k_rope_full = k_rope.expand(-1, -1, self.n_heads, -1)
         q_full = torch.cat([q, q_rope], dim=-1).transpose(1, 2)
         k_full = torch.cat([k, k_rope_full], dim=-1).transpose(1, 2)
@@ -525,6 +530,8 @@ class SparseMLAModule(MLAModule):
         csa_sel: "CsaChannel | None" = None,
         write_cache: bool = True,
         swa_floor: int = 0,
+        ced_src: torch.Tensor | None = None,
+        q_off: int = 0,
     ) -> tuple[torch.Tensor, tuple | None]:
         """稀疏前向：短序列/解码缓存命中时退化为 dense 等价，超长才分块聚集.
 
@@ -535,11 +542,14 @@ class SparseMLAModule(MLAModule):
             行已由权威前向写好，重放只重建 SWA 环，绝不覆盖权威值（V4.1 §3.2.2
             "reusing the cached global KV without recomputation or overwriting"）。
         swa_floor：SWA 列的下界（重放起点 s），见 `_swa_read`。
+        ced_src：CED 解码器层的编码器输出 `H_enc`（全局 KV/rope 键由它投影）；
+            `q_off` 非 0 时 `h` 只覆盖查询尾段、`ced_src` 仍覆盖全序列（跳算预填充，
+            见 `TinyLLM._prefill`）。CED 恒走分块路径（dense 兜底没有这套语义）。
         """
         b, t, _ = h.shape
         if past is not None:
             return self._decode(h, past, csa_sel, write_cache=write_cache,
-                                swa_floor=swa_floor)
+                                swa_floor=swa_floor, ced_src=ced_src)
         self._last_indexer_aux = None  # 每次前向重算（赋值语义，梯度检查点重算幂等）
         self._last_indexer_kl = None
         if reuse is not None:
@@ -547,7 +557,7 @@ class SparseMLAModule(MLAModule):
             # 压缩/SWA 开启时恒走分块路径：dense 用未压缩 latent、且不走层内
             # SWA（近端走全局窗口），与解码路径分叉。
             if (self.compress_ratio == 1 and self.swa is None
-                    and t <= self.sparse_threshold):
+                    and not self.ced and t <= self.sparse_threshold):
                 return super().forward(h, None, return_state, reserve, reuse)
             q_full = self._q_only(h)
             k_full, v_full = self._kv_from_latent(reuse[0], reuse[1], total=t)
@@ -565,29 +575,34 @@ class SparseMLAModule(MLAModule):
                 packed = packed + self._pack_swa(
                     *swa_kv, t, self._swa_capacity(1))
             return self._out_proj(out), packed
-        if (self.compress_ratio == 1 and self.swa is None
+        if (self.compress_ratio == 1 and self.swa is None and not self.ced
                 and t <= self.sparse_threshold):
             # 短序列：与 MLAModule 逐位一致（reserve 透传装箱）
             return super().forward(h, None, return_state, reserve)
         # 长序列分块预填充（压缩/SWA 开启时短序列也走这里：dense 兜底路径不带
         # 层内 SWA，若短 prompt 走 dense、解码走 SWA，两者必然分叉）
-        q_full, k_full, v_full, c_kv, k_rope_raw = self._full_qkv_for_gather(h)
-        # SWA 全量投影：prefill 的**每个**查询都要有自己的 SWA 列，
-        # 否则前段输出与全前向分叉（Bounded Replay 只作用于"重建缓存"，
-        # 不削减 prefill 的注意力范围）；环另由 `_pack_swa` 建（定长）。
+        q_full, k_full, v_full, c_kv, k_rope_raw = self._full_qkv_for_gather(
+            h, ced_src=ced_src, q_off=q_off)
+        # 全序列长（KV/缓存覆盖到 `total`）；`h`/`q_full` 只覆盖查询段
+        # `[q_off, total)`——CED 跳算时它们就是尾段
+        total = q_off + t
+        # SWA 投影：查询段里的**每个**位置都要有自己的 SWA 列（否则前段输出与
+        # 全前向分叉）；环另由 `_pack_swa` 按绝对位置装（定长）。
         swa_kv = self.swa.project(h) if self.swa is not None else None
         out = self._run_blocks(
-            q_full, k_full, v_full, h, t, c_kv=c_kv, csa_sel=csa_sel,
-            kr_raw=k_rope_raw, swa_kv=swa_kv)
+            q_full, k_full, v_full, h, total, c_kv=c_kv, csa_sel=csa_sel,
+            kr_raw=k_rope_raw, swa_kv=swa_kv, q_off=q_off)
         if not return_state:
             return self._out_proj(out), None
         # 缓存仍存 latent（与 MLA 一致，200K 上下文每 token 仅 ~320B/层），
-        # 静态装箱（reserve 由 _prefill 按 prompt+max_new 精确给出）
-        packed = self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
+        # 静态装箱（reserve 由 _prefill 按 prompt+max_new 精确给出）；
+        # CED 解码器层的 latent 来自编码器输出 → 长度就是全序列，`pos` 为 `total`
+        packed = self._pack_cache(c_kv, k_rope_raw, max(reserve, total))
         if swa_kv is not None:
             # 环只服务**之后**的单 token 解码 → 容量 `window`（多 token 解码时
             # `_grow_swa_rings` 再按需扩），绝不按 prompt 长度建环
-            packed = packed + self._pack_swa(*swa_kv, t, self._swa_capacity(1))
+            packed = packed + self._pack_swa(
+                *swa_kv, total, self._swa_capacity(1))
         return self._out_proj(out), packed
 
     def empty_swa_rings(
@@ -709,6 +724,7 @@ class SparseMLAModule(MLAModule):
         csa_sel: "CsaChannel | None" = None,
         kr_raw: torch.Tensor | None = None,
         swa_kv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        q_off: int = 0,
     ) -> torch.Tensor:
         """分块聚集注意力并返回 `(b, t, n_heads*head_dim)`（头维已并回特征维）.
 
@@ -718,12 +734,15 @@ class SparseMLAModule(MLAModule):
         生产者（full/reindex）逐块写通道；消费者（reindex/reuse）先按块序从通道
         读前层的选择（生产者先于消费者执行，故读到的一定是同一次 forward 里
         最近生产者写下的值）。
+        `q_off > 0` 时 `q_full`/`h` 只覆盖查询尾段 `[q_off, t)`（CED 跳算预填充），
+        KV 仍覆盖全序列——块循环从 `q_off` 起，局部下标统一减 `q_off`。
         """
         outs = []
         auxs: list[torch.Tensor] = []
         kls: list[torch.Tensor] = []
-        for i, s in enumerate(range(0, t, self.sparse_chunk)):
+        for i, s in enumerate(range(q_off, t, self.sparse_chunk)):
             e = min(s + self.sparse_chunk, t)
+            qs, qe = s - q_off, e - q_off
             # 消费者按 `csa_src` 读最近生产者的同块选择（生产者先执行故已就绪）
             shared = (csa_sel.get(self.csa_src, i) if csa_sel is not None else None)
             swa_cols = None
@@ -737,8 +756,8 @@ class SparseMLAModule(MLAModule):
                         swa_kv[2][:, lo - off:e - off],
                         torch.arange(lo, e, device=h.device))
             o, sel, kl = self._sparse_scores(
-                q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t,
-                c_kv=c_kv, h_c=h[:, s:e], shared=shared, kr_raw=kr_raw,
+                q_full[:, :, qs:qe, :].contiguous(), k_full, v_full, s, e, t,
+                c_kv=c_kv, h_c=h[:, qs:qe], shared=shared, kr_raw=kr_raw,
                 swa=swa_cols)
             if (sel is not None and csa_sel is not None
                     and self.csa_mode in ("full", "reindex")
@@ -753,7 +772,7 @@ class SparseMLAModule(MLAModule):
         self._last_indexer_aux = (torch.stack(auxs).mean() if auxs else None)
         self._last_indexer_kl = (torch.stack(kls).mean() if kls else None)
         return torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(
-            q_full.shape[0], t, -1)
+            q_full.shape[0], t - q_off, -1)
 
     @torch._dynamo.disable
     def _decode(
@@ -763,6 +782,7 @@ class SparseMLAModule(MLAModule):
         csa_sel: "CsaChannel | None" = None,
         write_cache: bool = True,
         swa_floor: int = 0,
+        ced_src: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """增量解码：latent 缓存展开后按 pattern 聚集（短上下文自动退化为全量）.
 
@@ -782,8 +802,12 @@ class SparseMLAModule(MLAModule):
             # 生产者（Full 层）：按位写自己的 latent；Reindex/Reuse 跳过
             # （共享缓冲已由生产者写好，两者都借 main KV）
             w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
-            buf_c.index_copy_(1, w_idx, self.w_dkv(h))
-            buf_kr.index_copy_(1, w_idx, self.w_kr(h))
+            # 对齐缓冲 dtype：prefill 可能建在 autocast 下（bf16 缓冲），解码若
+            # 不带 autocast 会得到 fp32；同 dtype 时 `.to` 是 no-op
+            buf_c.index_copy_(1, w_idx,
+                              self._kv_latent(h, ced_src).to(buf_c.dtype))
+            buf_kr.index_copy_(1, w_idx,
+                               self._rope_key(h, ced_src).to(buf_kr.dtype))
         pos_next = pos + t
         # 实际长度（pattern 按实际算；一次同步，eager 可忽略；
         # compile 下此处 graph-break 但不重编）
@@ -793,7 +817,12 @@ class SparseMLAModule(MLAModule):
         q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
         q_rope = self.w_qr(q_c).view(b, t, self.n_heads, self.qk_rope_dim)
         off = total - t
-        q_rope = apply_rope_wrap(q_rope, self.rope_cos[off:off + t], self.rope_sin[off:off + t])
+        # 位置下标钳制在 rope 表内：解码到接近 max_seq_len 时（prompt 已占满表）
+        # 直接用切片会得到空表 → apply_rope 里 view 崩在无关的地方（MLA 侧同款处理）
+        _rlen = self.rope_cos.shape[0]
+        _qidx = (off + torch.arange(t, device=h.device)).clamp(max=_rlen - 1)
+        q_rope = apply_rope_wrap(
+            q_rope, self.rope_cos[_qidx], self.rope_sin[_qidx])
         # 全缓冲展开（latent 省的是缓存不是计算，单步展开可接受；
         # pattern 只 gather 有效下标，空位不参与；rope 下标钳制防 L 超缓存）
         k = self.k_norm(self.w_uk(buf_c).view(b, -1, self.n_heads, self.head_dim))

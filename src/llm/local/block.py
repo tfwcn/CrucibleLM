@@ -71,6 +71,7 @@ class HybridBlock(nn.Module):
         csa_mode: str = "full",
         compress_ratio: int = 1,
         swa_window: int = 0,
+        ced: bool = False,
     ):
         super().__init__()
         self.full_attn = full_attn
@@ -90,6 +91,7 @@ class HybridBlock(nn.Module):
                 indexer_loss_coef=indexer_loss_coef,
                 compress_ratio=compress_ratio,
                 swa_window=swa_window,
+                ced=ced,
             )
             # CSA2 三模式（V4.1）：full 自算自存；reindex/reuse 借生产者 main KV
             # （`csa_reuse=True` 时解码不写自己的缓冲），纯超参不进 state_dict
@@ -138,6 +140,8 @@ class HybridBlock(nn.Module):
         engram_ids: torch.Tensor | None = None,
         reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         csa_sel: object | None = None,
+        ced_src: torch.Tensor | None = None,
+        q_off: int = 0,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
         """前向：past 为解码缓存（MLA 传 latent 元组，线性层传状态矩阵）.
 
@@ -149,6 +153,8 @@ class HybridBlock(nn.Module):
         None 或本层无 Engram 时跳过。
         reuse: CSA2 跨层复用（最近生产者的 latent 缓存），全注意力层 prefill 用。
         csa_sel: CSA2 层间选择通道（`sparse_indexer` 开启时由 TinyLLM 建，逐层共享）。
+        ced_src: CED 解码器层的编码器输出 `H_enc`（KV/rope 键由它投影；None=本层自算）。
+        q_off: 查询首 token 的绝对位置（CED 跳算预填充时 `h` 只覆盖尾部）。
         h: 无超连接时 (b, t, d)；有超连接时 (b, t, n, d) n 路流。
         """
         xs = h
@@ -160,8 +166,12 @@ class HybridBlock(nn.Module):
             h = self.engram(h, engram_ids)
         if self.full_attn:
             a_out, new_past = self.attn(  # type: ignore[call-arg]
-                self.norm1(h), past, return_state, reserve, reuse, csa_sel)
+                self.norm1(h), past, return_state, reserve, reuse, csa_sel,
+                ced_src=ced_src, q_off=q_off)
         else:
+            if ced_src is not None or q_off:
+                raise ValueError(
+                    "线性注意力层不支持 CED（递推状态无法从编码器输出投影）")
             a_out, new_past = self.attn(self.norm1(h), past, return_state)  # type: ignore[arg-type]
         h = h + a_out
         m_out, aux = self.moe(self.norm2(h))

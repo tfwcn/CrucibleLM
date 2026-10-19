@@ -156,6 +156,27 @@ class SmallLLMConfig:
     # 窗口别照搬 `sparse_window`：环是逐 token 的满维 K/V，n 大时环比主 KV 还贵
     # （base 规模 n=4096 时 3 层共 38.6MB，比 32K 全局主 KV 的 21MB 还多），建议 ≤512。
     swa_window: int = 0
+    # CED 编码器-解码器（V4.1 §2.2，YoCo 路线的结构改进）：前 `ced_split` 层当
+    # **因果编码器**，其余层当**解码器**——解码器的全局 KV 不再由自己的 hidden
+    # 产生，而是由第 `ced_split` 层的输出 `H_enc` 用**逐层投影权重**投影
+    # （`C_l = H_enc W_l^{KV}`、`Z_l = H_enc W_l^{Z}`，rope 键同理），于是推理
+    # 预填充只需在前缀上算完编码器层，解码器层只跑最后 `swa_window` 个 token
+    # （其输出仅服务于自己的 SWA 环）→ 预填充计算量近半（论文 O(NL)→O(NL/2)）。
+    # 0 = 关（默认，无新增参数/键，逐位兼容旧 ckpt）；>0 时解码器层的
+    # `w_dkv`/`w_kr` 换成 `w_ced_kv`/`w_ced_kr`（**改键** → opt-in）。
+    # 约束（早失败）：`0 < ced_split < n_layers`，且解码器区间必须**全是全注意力层**
+    # （线性层的递推状态没法从 `H_enc` 投影，必须逐位置跑，跳算就不成立——
+    # 本仓 1:3 hybrid 的 base 配置因此不满足，需要 `full_attn_every=1` 之类的配置）。
+    # 与 CSA2 复用互斥：CED 解码器层恒为 Full（各层投影权重本就逐层不同，
+    # 借用会把 layer-dependent 投影又合并回一份缓存）。
+    ced_split: int = 0
+    # CED 预填充跳算（只在 `ced_split>0` 时有意义，默认**开**）：解码器层只在前
+    # `ced_split` 层之后**最后 n_win 个 token** 上跑（V4.1 §3.2.2 Decoder SWA
+    # Bounded Replay）。`swa_window=0` 时退化为"只跑最后 1 个 token"，与全量
+    # prefill **逐位等价**（解码器层没有局部依赖）；`swa_window>0` 时是论文承认的
+    # 近似（重建出的解码器 SWA 与全量前向不严格相等）。关掉即"全量 prefill"，
+    # 严格对齐训练口径，代价是失去 CED 的省算。
+    ced_prefill_skip: bool = True
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
@@ -324,6 +345,36 @@ class SmallLLMConfig:
         vals = self.compress_ratio_list()
         k = layer_idx // max(1, self.full_attn_every)
         return int(vals[k % len(vals)])
+
+    def ced_split_validated(self) -> int:
+        """校验并返回 CED 的编码器层数（0=关）；非法配置早失败.
+
+        早失败的理由：解码头区一旦混进线性注意力层，"只跑最后 n_win 个 token"
+        就缺了前缀的递推状态（静默算错比报错贵得多），所以宁可构建期就拒绝。
+        """
+        split = int(self.ced_split)
+        if split <= 0:
+            return 0
+        if split >= self.n_layers:
+            raise ValueError(
+                f"ced_split={split} 必须小于层数 {self.n_layers}（留至少一层解码器）")
+        bad = [i for i in range(split, self.n_layers)
+               if not self.is_full_attn_layer(i)]
+        if bad:
+            raise ValueError(
+                f"CED 解码器层必须全是全注意力层，但 {bad} 是线性注意力层"
+                f"（full_attn_every={self.full_attn_every}）：线性层的递推状态"
+                "无法从编码器输出投影，预填充跳算会静默算错")
+        return split
+
+    def is_ced_decoder(self, layer_idx: int) -> bool:
+        """该层是否为 CED 解码器层（全局 KV 由编码器输出投影）."""
+        return 0 < int(self.ced_split) <= layer_idx < self.n_layers
+
+    def ced_decoder_layers(self) -> tuple[int, ...]:
+        """CED 解码器层序号（空 = 关）."""
+        split = self.ced_split_validated()
+        return tuple(range(split, self.n_layers)) if split else ()
 
 
 # 16G 训练配方建议（bf16 + AdamW + 梯度检查点）
@@ -568,6 +619,10 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "compress_ratios": ("", _norm_compress_ratios),
     # 层内 SWA（V4.1）；改 state_dict 键（新增 swa.*），旧 ckpt 回退 0=关
     "swa_window": (0, _norm_nonneg_int),
+    # CED 编码器-解码器（V4.1）；改 state_dict 键（解码器层换成 w_ced_*），旧 ckpt 回退 0=关
+    "ced_split": (0, _norm_nonneg_int),
+    # CED 预填充跳算（推理近似性开关，不改键）；旧 ckpt 沿用默认开
+    "ced_prefill_skip": (True, _norm_bool),
 }
 
 

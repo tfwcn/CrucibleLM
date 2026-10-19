@@ -47,6 +47,7 @@ class MLAModule(nn.Module):
         dropout: float = 0.0,
         o_groups: int = 1,
         o_lora_rank: int = 0,
+        ced: bool = False,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -59,11 +60,23 @@ class MLAModule(nn.Module):
         # Q 解耦 RoPE 部分（每头独立旋转）
         self.w_qr = nn.Linear(q_lora_rank, n_heads * qk_rope_dim, bias=False)
         # KV 联合下投影 -> 每头上投影
-        self.w_dkv = nn.Linear(d_model, kv_lora_rank, bias=False)
+        # CED（V4.1 §2.2）：解码器层的全局 KV 由**编码器输出** `H_enc` 投影（逐层
+        # 投影权重），不再看自己的 hidden；因此这层的 `w_dkv`/`w_kr` 换成
+        # `w_ced_kv`/`w_ced_kr`（键集不同 → 改键、opt-in）。Q 与 SWA 仍来自自己。
+        self.ced = bool(ced)
+        if not self.ced:
+            self.w_dkv = nn.Linear(d_model, kv_lora_rank, bias=False)
         self.w_uk = nn.Linear(kv_lora_rank, n_heads * self.head_dim, bias=False)
         self.w_uv = nn.Linear(kv_lora_rank, n_heads * self.head_dim, bias=False)
         # 共享 RoPE 键（全头共用一份，省缓存）
-        self.w_kr = nn.Linear(d_model, qk_rope_dim, bias=False)
+        if self.ced:
+            # 占位 None（不进 state_dict）：借用层链接/迁移工具可据此判断键集
+            self.w_dkv = None
+            self.w_ced_kv = nn.Linear(d_model, kv_lora_rank, bias=False)
+            self.w_ced_kr = nn.Linear(d_model, qk_rope_dim, bias=False)
+            self.w_kr = None
+        else:
+            self.w_kr = nn.Linear(d_model, qk_rope_dim, bias=False)
         # 输出投影 + QK-Norm（Qwen3 系做法，稳定训练）
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
@@ -171,39 +184,75 @@ class MLAModule(nn.Module):
             mask = mask & (keys <= q_pos.view(1, 1, t, 1))
         return mask
 
+    def _kv_latent(self, h: torch.Tensor,
+                   ced_src: torch.Tensor | None = None) -> torch.Tensor:
+        """主 KV 的下投影 latent：CED 解码器层来自编码器输出，其余来自本层 hidden."""
+        if not self.ced:
+            return self.w_dkv(h)
+        if ced_src is None:
+            raise ValueError("CED 解码器层必须传 ced_src（编码器输出 H_enc）")
+        return self.w_ced_kv(ced_src)
+
+    def _rope_key(self, h: torch.Tensor,
+                  ced_src: torch.Tensor | None = None) -> torch.Tensor:
+        """共享 rope 键（未旋转）：CED 解码器层同样来自编码器输出.
+
+        必须与 `_kv_latent` 同源：否则"跳算前缀"时还需要在前缀上跑解码器层
+        才能算出 rope 键，预填充就省不下来了。
+        """
+        if not self.ced:
+            return self.w_kr(h)
+        if ced_src is None:
+            raise ValueError("CED 解码器层必须传 ced_src（编码器输出 H_enc）")
+        return self.w_ced_kr(ced_src)
+
     def _qkv(
-        self, h: torch.Tensor
+        self, h: torch.Tensor, ced_src: torch.Tensor | None = None,
+        q_off: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor]:
         """由 hidden 计算各头 q/k/v、旋转 q_rope/k_rope，并附带 latent 原料.
 
         后两项是未旋转的 c_kv 与共享 rope 键，供解码缓存复用（省两次投影）。
+        `ced_src`：CED 解码器层的编码器输出（KV 与 rope 键由它投影）。
+        `q_off`：查询首 token 的绝对位置（CED 跳算预填充时只喂尾部，位置从
+        `q_off` 起；0 = 从头开始，逐位等价旧行为）。
         """
         b, t, _ = h.shape
         # Q 内容流
         q_c = self.w_dq(h)
         q = self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim)
         q = self.q_norm(q)
-        # Q 旋转流
+        # Q 旋转流（相位按绝对位置取：跳算时查询不从 0 起）
         q_rope = self.w_qr(q_c).view(b, t, self.n_heads, self.qk_rope_dim)
-        q_rope = apply_rope(q_rope, self.rope_cos, self.rope_sin)
-        # KV 压缩流（训练时展开；解码时只缓存 c_kv）
-        c_kv = self.w_dkv(h)
-        k = self.w_uk(c_kv).view(b, t, self.n_heads, self.head_dim)
+        q_rope = apply_rope(
+            q_rope, self.rope_cos[q_off:], self.rope_sin[q_off:])
+        # KV 压缩流（训练时展开；解码时只缓存 c_kv）。
+        # CED 跳算时 `h` 只覆盖查询尾段、而 KV 覆盖**全序列**（来自 `ced_src`），
+        # 故 KV 侧的长度要单独取；rope 相位也从 0 起（KV 的绝对位置从 0 起）。
+        c_kv = self._kv_latent(h, ced_src)
+        t_kv = c_kv.shape[1]
+        k = self.w_uk(c_kv).view(b, t_kv, self.n_heads, self.head_dim)
         k = self.k_norm(k)
-        v = self.w_uv(c_kv).view(b, t, self.n_heads, self.head_dim)
+        v = self.w_uv(c_kv).view(b, t_kv, self.n_heads, self.head_dim)
         # 共享旋转键（先旋转再补头维度，避免广播错位）
-        k_rope_raw = self.w_kr(h)
-        k_rope = apply_rope(k_rope_raw, self.rope_cos, self.rope_sin).unsqueeze(2)
+        k_rope_raw = self._rope_key(h, ced_src)
+        k_rope = apply_rope(
+            k_rope_raw, self.rope_cos, self.rope_sin
+        ).unsqueeze(2)
         return q, k, v, q_rope, k_rope, c_kv, k_rope_raw
 
-    def _q_only(self, h: torch.Tensor) -> torch.Tensor:
-        """只算 Q（含 RoPE，位置从 0 起），供跨层复用层（K/V 借共享 latent）."""
+    def _q_only(self, h: torch.Tensor, q_off: int = 0) -> torch.Tensor:
+        """只算 Q（含 RoPE），供跨层复用层（K/V 借共享 latent）.
+
+        `q_off` 为查询首 token 的绝对位置（CED 跳算时非 0）。
+        """
         b, t, _ = h.shape
         q_c = self.w_dq(h)
         q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
         q_rope = self.w_qr(q_c).view(b, t, self.n_heads, self.qk_rope_dim)
-        q_rope = apply_rope(q_rope, self.rope_cos, self.rope_sin)
+        q_rope = apply_rope(
+            q_rope, self.rope_cos[q_off:], self.rope_sin[q_off:])
         return torch.cat([q, q_rope], dim=-1).transpose(1, 2)
 
     def _kv_from_latent(
@@ -230,7 +279,14 @@ class MLAModule(nn.Module):
         reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         return_state: bool,
     ) -> tuple[torch.Tensor, tuple | None]:
-        """跨层复用（prefill/训练）：Q 自算，K/V 借共享 latent，因果掩码同 prefill."""
+        """跨层复用（prefill/训练）：Q 自算，K/V 借共享 latent，因果掩码同 prefill.
+
+        CED 解码器层**恒为 Full**（`build_block` 保证）：它的 KV 是
+        `H_enc @ W_l`，逐层权重不同，"借用"会把 layer-dependent 投影合并回一份。
+        """
+        if self.ced:
+            raise RuntimeError(
+                "CED 解码器层不支持 CSA2 借用（全局 KV 由编码器输出逐层投影）")
         b, t, _ = h.shape
         buf_c, buf_kr, pos = reuse
         total = buf_c.shape[1]
@@ -251,16 +307,23 @@ class MLAModule(nn.Module):
         h: torch.Tensor,
         past: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         write: bool = True,
+        ced_src: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """从静态缓冲读 K/V 做掩码注意力；`write=False` 用于跨层复用层（不重复写）."""
+        """从静态缓冲读 K/V 做掩码注意力；`write=False` 用于跨层复用层（不重复写）.
+
+        `ced_src`：CED 解码器层的编码器输出（当步），KV/rope 键由它投影后写入缓存。
+        """
         b, t, _ = h.shape
         buf_c, buf_kr, pos = past
         total = buf_c.shape[1]
         if write:
             # 范围写（t==1 即单槽；dynamo 安全，形状恒定）
             w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
-            buf_c.index_copy_(1, w_idx, self.w_dkv(h))
-            buf_kr.index_copy_(1, w_idx, self.w_kr(h))
+            # 对齐缓冲 dtype（prefill 可能建于 autocast 下；同 dtype 时是 no-op）
+            buf_c.index_copy_(1, w_idx,
+                              self._kv_latent(h, ced_src).to(buf_c.dtype))
+            buf_kr.index_copy_(1, w_idx,
+                               self._rope_key(h, ced_src).to(buf_kr.dtype))
         pos_next = pos + t
         q_c = self.w_dq(h)
         q = self.q_norm(self.w_uq(q_c).view(b, t, self.n_heads, self.head_dim))
@@ -304,6 +367,8 @@ class MLAModule(nn.Module):
         return_state: bool = True,
         reserve: int = 0,
         reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        ced_src: torch.Tensor | None = None,
+        q_off: int = 0,
     ) -> tuple[torch.Tensor, tuple | None]:
         """训练/Prefill 前向：全序列并行注意力.
 
@@ -319,11 +384,13 @@ class MLAModule(nn.Module):
         b, t, _ = h.shape
         if past is not None:
             # 增量解码；Reuse 层跳过写入、只读共享缓冲（由最近的 Full 层写好）
-            return self._decode_attend(h, past, write=not self.csa_reuse)
+            return self._decode_attend(h, past, write=not self.csa_reuse,
+                                       ced_src=ced_src)
         if reuse is not None:
             return self._forward_reuse(h, reuse, return_state)
         # 训练/Prefill：全序列并行
-        q, k, v, q_rope, k_rope, c_kv, k_rope_raw = self._qkv(h)
+        q, k, v, q_rope, k_rope, c_kv, k_rope_raw = self._qkv(
+            h, ced_src=ced_src, q_off=q_off)
         k_rope_full = k_rope.expand(-1, -1, self.n_heads, -1)
         q_full = torch.cat([q, q_rope], dim=-1).transpose(1, 2)
         k_full = torch.cat([k, k_rope_full], dim=-1).transpose(1, 2)

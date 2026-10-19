@@ -183,6 +183,11 @@ replace manual staged curriculum. Starting fully loaded from step 0 works too
   prefix memory segment; build the index with `scripts/build_retrieval.py`);
   V2 interleave with `--retro-every N --retro-len L` (per-layer fusion over
   token-level chunks, frozen-embedding encoded);
+- Causal Encoder-Decoder: `--ced-split N` (V4.1 §2.2: the first N layers encode, later layers
+  project their global KV from the encoder output, so prefill only runs the tail. Requires the
+  decoder range to be all full-attention layers - the 1:3 hybrid base preset does not qualify.
+  Decoder layers stay Full, so KV storage grows ~38%: you trade storage for compute.
+  See `docs/details/ced.md`);
 - Per-layer SWA: `--swa-window N` (V4.1: every layer keeps its own sliding-window
   branch with a **fixed-size ring cache**, independent of context length; the local
   span moves entirely into it, global entries shrink to sink/stride only. Persistence
@@ -211,6 +216,7 @@ python -m pytest tests/ -q
 | Attention | Hybrid interleave (1 full : 3 linear) | Quality + efficiency balance | `block.py` |
 | Attention | Lightweight sparse attention (sink + window + strided) | Makes 200K+ computable; exact-dense below threshold | `sparse_attn.py` (DSA-inspired) |
 | Attention | Per-layer SWA + bounded replay (`swa_window`, off by default) | Each layer owns a window branch (fixed-size cache, independent of context length); persistence keeps global KV only and rebuilds rings by replay | `sparse_attn.py` (V4.1 §3.2) |
+| Attention | Causal Encoder-Decoder (`ced_split`, off by default) | Upper-half global KV is projected from the encoder output; prefill runs the encoder over the full prompt and the decoder only over its tail (measured -43.75% total layer compute) | `model.py`/`mla.py` (V4.1 §2.2) |
 | MoE | Fine-grained MoE + shared expert + aux loss | 128M params / 48M active per token | `moe.py` (DeepSeek-style) |
 | Objective | MTP extra head (predict t+2) | Denser training signal, off at inference | `model.py` (DeepSeek-style) |
 | Position | RoPE + YaRN scaling | Extrapolate 8K training to 200K inference | `rope.py` |
