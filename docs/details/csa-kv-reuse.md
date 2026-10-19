@@ -22,11 +22,11 @@ DeepSeek-V4.1 的 CSA2 指出：**跨层复用**是继"低秩压缩"之后的第
 论文把全注意力层分三种模式轮转：
 
 - **Full**：自己算 latent（`c_kv`）+ 共享 RoPE 键，写进缓存；
-- **Reindex**：自己算 Q，但**重建** key 索引（跳过写缓存）；
-- **Reuse**：连索引都复用最近 Full 层的，只算 Q 和输出。
+- **Reindex**：自己算 Q，复用前层 main KV，但**用自己的 indexer Q 重选 Top-K**（不写缓存）；
+- **Reuse**：连索引都复用最近生产者的，只算 Q 和输出。
 
-我们实现 **Full / Reuse 两态**（Reindex 依赖分层稀疏索引器，属于定制 kernel 范畴，
-暂不移植）：
+本文档讲的是**旧的均匀两态**（Full / Reuse，由 `csa_reuse_every` 控制）；
+三模式（含 Reindex）见 [`csa-modes.md`](./csa-modes.md)——`csa_modes` 非空时覆盖本文档的分配：
 
 ```
 full_attn_every=2 时全注意力层序号 ordinal=0,1,2,…
@@ -130,3 +130,4 @@ if reuse is not None:                       # prefill/训练：K/V 借共享 lat
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `csa_reuse_every` | 2 | 每 N 个全注意力层留 1 个 Full；1=全 Full（关），2=KV 减半。**默认开**，续训/迁移自动沿用 checkpoint 架构 |
+| `csa_modes` | `""` | 非空时**覆盖** `csa_reuse_every`：逐全注意力层指定 Full/Reindex/Reuse（见 `csa-modes.md`） |

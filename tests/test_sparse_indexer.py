@@ -165,6 +165,49 @@ def test_indexer_batch_finite():
     assert o.shape == (3, 20, 128) and torch.isfinite(o).all()
 
 
+def test_indexer_gets_gradients_from_distillation():
+    """indexer 只产掩码（不可微）→ 必须靠**蒸馏损失**才拿得到梯度（DSA 做法）.
+
+    没有蒸馏时 `w_iq`/`w_ik` 梯度恒为 0（等于没在训），所以这条是"indexer 真在学"
+    的硬契约；系数设 0 则确实无梯度（口径可关）。
+    """
+    torch.manual_seed(0)
+
+    def _model(coef: float) -> TinyLLM:
+        cfg = tiny_test_config()
+        cfg.sparse_indexer = True
+        # 必须让序列真被切成多块：静态候选 = 块起点之前的 token（单块时恒为 0，
+        # indexer 不会被调用 → 也就没有蒸馏损失）
+        cfg.sparse_threshold = 4
+        cfg.sparse_chunk = 4
+        cfg.sparse_window = 4
+        cfg.sparse_sink = 2
+        cfg.sparse_stride = 2
+        cfg.indexer_topk = 4
+        cfg.indexer_pool_blocks = 1
+        cfg.indexer_loss_coef = coef
+        cfg.grad_ckpt = False
+        m = TinyLLM(cfg)
+        m.train()
+        return m
+
+    ids = torch.randint(0, 256, (2, 16))
+    m = _model(0.01)
+    out = m(ids, targets=ids)
+    assert "indexer_loss" in out and float(out["indexer_loss"]) > 0
+    out["loss"].backward()
+    for name in ("w_iq", "w_ik"):
+        g = getattr(m.layers[0].attn, name).weight.grad
+        assert g is not None and float(g.abs().sum()) > 0, \
+            f"{name} 无梯度（indexer 没在学）"
+
+    m0 = _model(0.0)  # 系数 0：确实无梯度（口径可关）
+    o0 = m0(ids, targets=ids)
+    o0["loss"].backward()
+    g0 = m0.layers[0].attn.w_iq.weight.grad
+    assert g0 is None or float(g0.abs().sum()) == 0
+
+
 # ------------------------------- 来源对齐/CLI -------------------------------
 def test_sync_reads_indexer_switches(tmp_path):
     """装载既有权重时对齐 indexer 开关与超参；旧格式回退关/默认."""

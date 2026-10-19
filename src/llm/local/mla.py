@@ -93,9 +93,15 @@ class MLAModule(nn.Module):
         else:
             self.w_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
         self.dropout = dropout
-        # CSA2 跨层复用：True 时本层为 "Reuse" 层——推理/解码复用最近 Full 层的
-        # latent 缓存，不重复写自己的 KV（由 build_block 按 csa_reuse_every 设）；
-        # False=Full（默认，自算自存）。纯超参，不进 state_dict。
+        # CSA2 跨层复用（DeepSeek-V4.1 三模式，由 build_block 按 config.csa_modes /
+        # csa_reuse_every 设，均纯超参、不进 state_dict）：
+        #   "full"    —— 自算 main KV（下投影 latent + rope）+ 自写缓存 + 自选 Top-K；
+        #   "reindex" —— 复用最近生产者的 main KV（借 latent），但用**自己的**
+        #                indexer Q 重新选 Top-K；
+        #   "reuse"   —— 复用 main KV 且复用最近的 Top-K，不算 indexer。
+        # `csa_reuse` 为"借用者"布尔（reindex/reuse 均为 True），供解码判断
+        # 是否写自己的缓冲（只有 full 写）。
+        self.csa_mode = "full"
         self.csa_reuse = False
         # 预计算 RoPE 缓存（解耦部分维度小，可一次建好）
         cos, sin = build_rope_cache(max_seq_len, qk_rope_dim, rope_theta, yarn_scale)

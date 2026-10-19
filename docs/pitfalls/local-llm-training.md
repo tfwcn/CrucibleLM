@@ -452,3 +452,46 @@ kernel**，我们没实现——文档必须诚实写明"这里省的是选择�
 - 该开关**新增参数 `w_iq`/`w_ik`（改键）** → 按 28 号教训：默认关 + 登记 `_ARCH_SWITCHES`
   + CLI 三态（`--sparse-indexer`/`--no-sparse-indexer`），旧 ckpt 来源对齐回退关。
 
+## 30. 层间"选择通道"必须按**层号**键控，不能按执行序——否则梯度检查点静默错梯度
+
+**现象**：CSA2 三模式（Full/Reindex/Reuse）要在**同一次前向内**把"Top-K 选择"从生产者
+（Full/Reindex）传给借用者（Reindex/Reuse），于是加了一个前向内的临时通道。第一版写成
+"按轮到的第几层"的列表（`items[i]` 顺序 append/覆盖）。**不报错**，loss 也正常下降，
+但 `--grad-ckpt`（梯度检查点）开关下与前向的数学**不一致**。
+
+**机制**：通道里 Reindex 层既读（用生产者的候选池）又写（把自己的新选择作为"最新"）。
+按执行序键控时，重算阶段是**逆序**重放：Reindex 层的重算**先于**它的生产者，于是它读到的
+是本层在**首次前向时覆盖上去**的值——池从"生产者的池"变成"自己的池"，重算出来的前向
+与首次前向不同，反向传播的梯度因此是**错的**（静默、无报错、loss 曲线看不出来）。
+
+**教训**：
+- 通道按**层号**键控（`items[层号][块号]`）：每层只写自己的槽，借用者按记录的生产者层号
+  （`csa_src`）去读。这样重算写入**幂等**（同输入同输出），任何层读到的都是生产者上一次
+  前向写下的同值内容，与执行顺序无关。
+- 凡"前向内跨层传中间量"的结构（本通道、`_last_load`、router 偏置统计）都要问一句：
+  **反向重算时会读到谁写的值？** 只要存在"后面的层会覆盖前面的层"的写法就有坑。
+- **回归锁**：`tests/test_csa_modes.py::test_grad_ckpt_matches_plain_grads` 直接比较
+  `grad_ckpt` 开/关两次反向的梯度（同权重同数据，必须逐位接近）。只测前向是无法发现的。
+
+## 31. 学习式 indexer 里，"打分"只进掩码 → 没有蒸馏损失就恒零梯度（假装在学）
+
+**现象**：#5 落地分层稀疏 indexer 后，前向/反向都正常、单测全绿，但 `w_iq`/`w_ik` 的
+`grad` **恒为 0**（或 `None`）——indexer 从来没在学，只是随机初始化在那里选 Top-K。
+
+**机制**：indexer 的产物是 `topk_mask`（布尔），它只被用来给注意力掩码**填 `-inf`**；
+`masked_fill`/布尔运算**不可微**，所以 KL/CE 的反向到不了 indexer 的打分器。
+
+**教训**：
+- 任何"离散选择"模块都需要**显式的训练信号**。按 DSA 的做法：让 indexer 的打分去拟合
+  主注意力的分布，加一项 `KL(target ‖ softmax(indexer 分数))`，**目标 detach**（只训
+  indexer，不反向拉主注意力），系数单独可调（`indexer_loss_coef`，0 = 不训）。
+- KL 的 reduction 别用 `batchmean`：它只除第 0 维（batch），`(b, n_q, n_cand)` 会被
+  `n_q` 放大成"看着吓人"的数百 nats。要么 `reduction="none"` 再 `.sum(-1).mean()`，
+  要么先 reshape 成 `(b*n_q, -1)`。
+- **硬契约单测**：`tests/test_sparse_indexer.py::test_indexer_gets_gradients_from_distillation`
+  断言 `w_iq`/`w_ik` 的梯度非零（系数 0 时为零）——这是"indexer 真在学"的回归锁。
+- 顺带一个配置坑：`sparse_chunk` 太大时**整个序列只有一块**，静态候选（块起点之前的
+  token）数恒为 0，indexer 根本不会被调用——测试里必须把 `sparse_chunk` 调小，
+  否则会误判"indexer 没生效"。
+
+

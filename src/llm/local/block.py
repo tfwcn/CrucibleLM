@@ -47,6 +47,7 @@ class HybridBlock(nn.Module):
         indexer_topk: int = 64,
         indexer_block: int = 8,
         indexer_pool_blocks: int = 32,
+        indexer_loss_coef: float = 0.01,
         dropout: float = 0.0,
         sparse_threshold: int = 4096,
         sparse_window: int = 4096,
@@ -67,7 +68,7 @@ class HybridBlock(nn.Module):
         engram_table_size: int = 8191,
         engram_conv: int = 4,
         vocab_size: int = 8192,
-        csa_reuse: bool = False,
+        csa_mode: str = "full",
     ):
         super().__init__()
         self.full_attn = full_attn
@@ -84,9 +85,12 @@ class HybridBlock(nn.Module):
                 indexer_head_dim=indexer_head_dim, indexer_topk=indexer_topk,
                 indexer_block=indexer_block,
                 indexer_pool_blocks=indexer_pool_blocks,
+                indexer_loss_coef=indexer_loss_coef,
             )
-            # CSA2 跨层复用：Reuse 层解码复用最近 Full 层的 latent 缓存（纯超参）
-            self.attn.csa_reuse = bool(csa_reuse)
+            # CSA2 三模式（V4.1）：full 自算自存；reindex/reuse 借生产者 main KV
+            # （`csa_reuse=True` 时解码不写自己的缓冲），纯超参不进 state_dict
+            self.attn.csa_mode = csa_mode
+            self.attn.csa_reuse = csa_mode != "full"
         else:
             # Qwen3-Next 系线性注意力（超长自动切块递推）
             self.attn = GatedDeltaLite(d_model, n_heads, dropout, linear_chunk)
@@ -129,6 +133,7 @@ class HybridBlock(nn.Module):
         reserve: int = 0,
         engram_ids: torch.Tensor | None = None,
         reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        csa_sel: object | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
         """前向：past 为解码缓存（MLA 传 latent 元组，线性层传状态矩阵）.
 
@@ -138,7 +143,8 @@ class HybridBlock(nn.Module):
         reserve: prefill 预留总长（只用于全注意力静态缓存装箱；线性层忽略）。
         engram_ids: 本层 Engram 的上下文 token id（(b,L)，右对齐到 h 末位）；
         None 或本层无 Engram 时跳过。
-        reuse: CSA2 跨层复用（最近 Full 层的 latent 缓存），仅全注意力 prefill 用。
+        reuse: CSA2 跨层复用（最近生产者的 latent 缓存），全注意力层 prefill 用。
+        csa_sel: CSA2 层间选择通道（`sparse_indexer` 开启时由 TinyLLM 建，逐层共享）。
         h: 无超连接时 (b, t, d)；有超连接时 (b, t, n, d) n 路流。
         """
         xs = h
@@ -148,13 +154,17 @@ class HybridBlock(nn.Module):
             # Engram 在注意力之前：先把静态模式"查"出来（论文：早期注入最优，
             # 替主干省下早期层的特征组装）；h_in 不变，超连接写回仍以 h_in 为基准
             h = self.engram(h, engram_ids)
-        if past is None and self.full_attn:
+        if self.full_attn:
             a_out, new_past = self.attn(  # type: ignore[call-arg]
-                self.norm1(h), past, return_state, reserve, reuse)
+                self.norm1(h), past, return_state, reserve, reuse, csa_sel)
         else:
             a_out, new_past = self.attn(self.norm1(h), past, return_state)  # type: ignore[arg-type]
         h = h + a_out
         m_out, aux = self.moe(self.norm2(h))
+        # indexer 蒸馏损失（仅有 indexer 的全注意力层提供；进各层 aux 统一汇总）
+        idx_aux = getattr(self.attn, "_last_indexer_aux", None)
+        if idx_aux is not None:
+            aux = aux + idx_aux
         h = h + m_out
         if self.memory is not None:
             # 记忆层自带 norm + 残差，直接叠加

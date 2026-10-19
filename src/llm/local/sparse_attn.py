@@ -27,11 +27,52 @@ class IndexerSelect(NamedTuple):
 
     topk_mask: (b, n_q, n_static) bool —— token 级最终选择（True=该候选参与注意力）；
     pool_mask: (b, n_q, n_static) bool —— 块级候选池（True=该候选属于入选块），
-        供后续 Reindex 层缩小打分范围（复用池、但重选 Top-K）。
+        供后续 Reindex 层缩小打分范围（复用池、但重选 Top-K）；
+    logits: (b, n_q, n_static) fp32 —— 候选上的**未掩** indexer 打分（蒸馏损失用；
+        只有生产者 full/reindex 有，Reuse 层直接复用时为生产者的打分）。
     """
 
     topk_mask: torch.Tensor
     pool_mask: torch.Tensor
+    logits: torch.Tensor | None = None
+
+
+class CsaChannel:
+    """CSA2 层间选择通道：生产者（full/reindex）写、消费者（reindex/reuse）读.
+
+    **按"层序号"键控**（`items[层序号][块序号]`），而不是按"轮到的第几层"：
+    每层只写自己的槽，消费者按 `csa_src`（最近生产者的层序号）去读。
+    这样在梯度检查点反向重算时，任何层读到的都是它的生产者在**上一次前向**写下的
+    同值内容（重算写入幂等），不会读到被"后面的层"覆盖掉的值（Reindex 层会覆写
+    "最新选择"，若共用单一槽会让重算数学与首次前向不一致 → 静默错梯度）。
+
+    - 预填充：块序号 = 该层分块循环的下标（各层 `sparse_chunk` 一致故对齐）；
+    - 解码：单步单块，块序号恒为 0，生产者每步重写自己的槽；
+    - 只有 `sparse_indexer` 开启且真有借用层时才创建（否则 `None`，零开销）。
+
+    V4.1 CSA2 三模式静态分配靠它落地：Full 造池 + 选 Top-K；Reindex 借池
+    （复用 main KV 与 indexer K）但用自己的 indexer Q 重选 Top-K；Reuse 直接
+    取最近生产者槽里最新的 Top-K。
+    """
+
+    def __init__(self) -> None:
+        self.items: dict[int, list["IndexerSelect | None"]] = {}
+
+    def get(self, layer: "int | None", chunk: int) -> "IndexerSelect | None":
+        """取某层第 chunk 块的选择（未写过/层号为空返回 None）."""
+        if layer is None:
+            return None
+        per = self.items.get(layer)
+        if per is None or chunk >= len(per):
+            return None
+        return per[chunk]
+
+    def put(self, layer: int, chunk: int, sel: "IndexerSelect") -> None:
+        """写某层第 chunk 块的选择（同一 forward 内按层序、块序推进）."""
+        per = self.items.setdefault(layer, [])
+        while len(per) <= chunk:
+            per.append(None)
+        per[chunk] = sel
 
 
 def select_keys(
@@ -103,6 +144,7 @@ class SparseMLAModule(MLAModule):
         indexer_topk: int = 64,
         indexer_block: int = 8,
         indexer_pool_blocks: int = 32,
+        indexer_loss_coef: float = 0.01,
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
@@ -122,12 +164,21 @@ class SparseMLAModule(MLAModule):
         self.indexer_topk = int(indexer_topk)
         self.indexer_block = int(indexer_block)
         self.indexer_pool_blocks = int(indexer_pool_blocks)
+        # indexer 蒸馏损失系数（DSA：学习式打分拟合主注意力分布；0=不训 indexer）
+        self.indexer_loss_coef = float(indexer_loss_coef)
+        # 最近一次前向的 indexer 辅助损失（已缩放/未缩放；赋值语义，重算幂等）
+        self._last_indexer_aux: torch.Tensor | None = None
+        self._last_indexer_kl: torch.Tensor | None = None
         if self.sparse_indexer:
             # indexer Q 来自 hidden，indexer K 由主 KV latent 投影（V4.1：不另开压缩路径）
             self.w_iq = nn.Linear(
                 d_model, self.indexer_heads * self.indexer_head_dim, bias=False)
             self.w_ik = nn.Linear(
                 kv_lora_rank, self.indexer_heads * self.indexer_head_dim, bias=False)
+        # CSA2 三模式（由 TinyLLM.build_block / _link_csa_reuse 填，纯超参）：
+        # csa_index = 本层层序号（写通道用）；csa_src = 最近生产者的层序号（读通道用）
+        self.csa_index: int | None = None
+        self.csa_src: int | None = None
 
     def _indexer_select(
         self,
@@ -178,7 +229,8 @@ class SparseMLAModule(MLAModule):
         topk = masked.topk(min(self.indexer_topk, n_static), dim=-1).indices
         topk_mask = torch.zeros_like(masked, dtype=torch.bool)
         topk_mask.scatter_(2, topk, True)
-        return IndexerSelect(topk_mask=topk_mask, pool_mask=pool_mask)
+        return IndexerSelect(topk_mask=topk_mask, pool_mask=pool_mask,
+                             logits=scores)
 
     def _sparse_scores(
         self,
@@ -191,13 +243,20 @@ class SparseMLAModule(MLAModule):
         c_kv: torch.Tensor | None = None,
         h_c: torch.Tensor | None = None,
         shared: "IndexerSelect | None" = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, "IndexerSelect | None", torch.Tensor | None]:
         """对查询 [start, end) 做聚集 + 掩码 + 注意力（softmax 提 fp32 保精度）.
 
         q_c 为已切好的查询块 (b, h, C=end-start, d)；k/v 为全历史。
         解码时 q_c 只有当步 1 个位置（下标与全历史不对齐，由 start/end 表达绝对位置）。
-        indexer 开启且给了 c_kv/h_c 时：静态候选先经学习式 top-K（块级池 → 池内 top-K），
-        未入选的静态列掩 -inf（当前块的本地 SWA 列不受影响）。
+        indexer 开启且给了 c_kv/h_c 时按 `self.csa_mode` 选主 KV（块级池 → 池内
+        top-K），未入选的静态列掩 -inf（当前块的本地 SWA 列不受影响）：
+        - `full`：全候选上造池 + 自选 Top-K；
+        - `reindex`：只在 `shared`（前层）的候选池内打分，用**自己的** indexer Q 重选；
+        - `reuse`：直接复用 `shared` 的 Top-K（不算 indexer）；`shared` 缺失时退化为
+          `full` 自选（安全兜底）。
+        返回 (注意力输出, 本层选择, indexer 蒸馏 KL)。
+        训练且为生产者（full/reindex）时额外算**蒸馏损失**（DSA 做法：让学习式打分
+        去拟合主注意力在候选上的分布）——否则 indexer 只进掩码、拿不到任何梯度。
         """
         b, h, _, d = k_full.shape
         idx, n_static = select_keys(
@@ -210,9 +269,27 @@ class SparseMLAModule(MLAModule):
         scores = torch.matmul(q_c, k_sel.transpose(-1, -2)) * scale
         mask = chunk_causal_mask(
             end - start, n_static, end - start, q_c.device, scores.dtype)
+        sel: IndexerSelect | None = None
+        kl: torch.Tensor | None = None
         if (self.sparse_indexer and n_static > 0
                 and c_kv is not None and h_c is not None):
-            sel = self._indexer_select(h_c, c_kv, idx[:n_static], end - start, shared)
+            if self.csa_mode == "reuse" and shared is not None:
+                # Reuse：复用最新的 Top-K，不算 indexer（V4.1：Reuse 只借 KV + 索引）
+                sel = shared
+            else:
+                # Full：全候选造池自选；Reindex：借前层池、自选（V4.1 三模式核心差异）
+                sel = self._indexer_select(
+                    h_c, c_kv, idx[:n_static], end - start,
+                    shared if self.csa_mode == "reindex" else None)
+                if (self.training and sel.logits is not None
+                        and self.csa_mode in ("full", "reindex")):
+                    # 蒸馏目标：主注意力在（全可见的）静态候选上的头平均分布；detach 目标
+                    with torch.no_grad():
+                        target = F.softmax(
+                            scores[:, :, :, :n_static].float(), dim=-1).mean(1)
+                    # 每查询平均（不能用 batchmean：它只除 batch 维 → 被 n_q 放大）
+                    kl = F.kl_div(F.log_softmax(sel.logits, dim=-1), target,
+                                  reduction="none").sum(-1).mean()
             # (b, 1, n_q, n_static)：静态列按 top-K 掩码，块列（本地 SWA）保持因果掩码
             static = mask[:, :n_static].unsqueeze(0).unsqueeze(0).masked_fill(
                 ~sel.topk_mask[:, None], float("-inf"))
@@ -223,7 +300,7 @@ class SparseMLAModule(MLAModule):
         probs = F.softmax(scores.float() + mask.float(), dim=-1).to(scores.dtype)
         if self.training and self.dropout > 0:
             probs = F.dropout(probs, p=self.dropout)
-        return torch.matmul(probs, v_sel)
+        return torch.matmul(probs, v_sel), sel, kl
 
     def _full_qkv_for_gather(
         self, h: torch.Tensor,
@@ -246,51 +323,88 @@ class SparseMLAModule(MLAModule):
         return_state: bool = True,
         reserve: int = 0,
         reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        csa_sel: "CsaChannel | None" = None,
     ) -> tuple[torch.Tensor, tuple | None]:
         """稀疏前向：短序列/解码缓存命中时退化为 dense 等价，超长才分块聚集.
 
-        reuse: 跨层复用（CSA2）最近 Full 层的 latent 缓存；None=正常自算。
+        reuse: 跨层复用（CSA2）最近生产者的 main KV latent 缓存；None=正常自算。
+        csa_sel: CSA2 层间选择通道（仅 `sparse_indexer` 开启时非 None）——生产者
+            （full/reindex）写、消费者（reindex/reuse）读；短序列走 dense 时不参与。
         """
         b, t, _ = h.shape
         if past is not None:
-            return self._decode(h, past)
+            return self._decode(h, past, csa_sel)
+        self._last_indexer_aux = None  # 每次前向重算（赋值语义，梯度检查点重算幂等）
+        self._last_indexer_kl = None
         if reuse is not None:
             # 跨层复用：Q 自算、K/V 借共享 latent（短序列走 dense，超长走分块聚集）
             if t <= self.sparse_threshold:
                 return super().forward(h, None, return_state, reserve, reuse)
             q_full = self._q_only(h)
             k_full, v_full = self._kv_from_latent(reuse[0], reuse[1], total=t)
-            outs = []
-            for s in range(0, t, self.sparse_chunk):
-                e = min(s + self.sparse_chunk, t)
-                outs.append(self._sparse_scores(
-                    q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t,
-                    c_kv=reuse[0], h_c=h[:, s:e]))
-            out = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, t, -1)
+            out = self._run_blocks(
+                q_full, k_full, v_full, h, t, c_kv=reuse[0], csa_sel=csa_sel)
             return self._out_proj(out), (reuse if return_state else None)
         if t <= self.sparse_threshold:
             # 短序列：与 MLAModule 逐位一致（reserve 透传装箱）
             return super().forward(h, None, return_state, reserve)
         # 长序列分块预填充
         q_full, k_full, v_full, c_kv, k_rope_raw = self._full_qkv_for_gather(h)
-        outs = []
-        for s in range(0, t, self.sparse_chunk):
-            e = min(s + self.sparse_chunk, t)
-            outs.append(self._sparse_scores(
-                q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t,
-                c_kv=c_kv, h_c=h[:, s:e]))
-        out = torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(b, t, -1)
+        out = self._run_blocks(
+            q_full, k_full, v_full, h, t, c_kv=c_kv, csa_sel=csa_sel)
         if not return_state:
             return self._out_proj(out), None
         # 缓存仍存 latent（与 MLA 一致，200K 上下文每 token 仅 ~320B/层），
         # 静态装箱（reserve 由 _prefill 按 prompt+max_new 精确给出）
         return self._out_proj(out), self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
 
+    def _run_blocks(
+        self,
+        q_full: torch.Tensor,
+        k_full: torch.Tensor,
+        v_full: torch.Tensor,
+        h: torch.Tensor,
+        t: int,
+        c_kv: torch.Tensor,
+        csa_sel: "CsaChannel | None" = None,
+    ) -> torch.Tensor:
+        """分块聚集注意力并返回 `(b, t, n_heads*head_dim)`（头维已并回特征维）.
+
+        生产者（full/reindex）逐块写通道；消费者（reindex/reuse）先按块序从通道
+        读前层的选择（生产者先于消费者执行，故读到的一定是同一次 forward 里
+        最近生产者写下的值）。
+        """
+        outs = []
+        auxs: list[torch.Tensor] = []
+        kls: list[torch.Tensor] = []
+        for i, s in enumerate(range(0, t, self.sparse_chunk)):
+            e = min(s + self.sparse_chunk, t)
+            # 消费者按 `csa_src` 读最近生产者的同块选择（生产者先执行故已就绪）
+            shared = (csa_sel.get(self.csa_src, i) if csa_sel is not None else None)
+            o, sel, kl = self._sparse_scores(
+                q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t,
+                c_kv=c_kv, h_c=h[:, s:e], shared=shared)
+            if (sel is not None and csa_sel is not None
+                    and self.csa_mode in ("full", "reindex")
+                    and self.csa_index is not None):
+                csa_sel.put(self.csa_index, i, sel)
+            if kl is not None:
+                kls.append(kl)
+                auxs.append(kl * self.indexer_loss_coef)
+            outs.append(o)
+        # 蒸馏损失（已按系数缩放，进各层 aux 汇总统一加）；重算幂等（赋值语义）。
+        # 层内多块取**均值**（否则随块数线性放大），层间由模型侧累加。
+        self._last_indexer_aux = (torch.stack(auxs).mean() if auxs else None)
+        self._last_indexer_kl = (torch.stack(kls).mean() if kls else None)
+        return torch.cat(outs, dim=2).transpose(1, 2).contiguous().view(
+            q_full.shape[0], t, -1)
+
     @torch._dynamo.disable
     def _decode(
         self,
         h: torch.Tensor,
         past: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        csa_sel: "CsaChannel | None" = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """增量解码：latent 缓存展开后按 pattern 聚集（短上下文自动退化为全量）.
 
@@ -299,8 +413,11 @@ class SparseMLAModule(MLAModule):
         """
         b, t, _ = h.shape
         buf_c, buf_kr, pos = past
+        self._last_indexer_aux = None  # 解码不算蒸馏损失（推理路径）
+        self._last_indexer_kl = None
         if not self.csa_reuse:
-            # Full 层：按位写自己的 latent；Reuse 层跳过（共享缓冲已由 Full 写好）
+            # 生产者（Full 层）：按位写自己的 latent；Reindex/Reuse 跳过
+            # （共享缓冲已由生产者写好，两者都借 main KV）
             w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
             buf_c.index_copy_(1, w_idx, self.w_dkv(h))
             buf_kr.index_copy_(1, w_idx, self.w_kr(h))
@@ -330,8 +447,14 @@ class SparseMLAModule(MLAModule):
         v_full = v.transpose(1, 2)
         # 查询即最后 t 个位置：select_keys(total, total-t, total)，t==1 时与旧式一致；
         # t>1 为投机解码并行验证服务（块内因果由 chunk_causal_mask 保证）
-        out = self._sparse_scores(q_full, k_full, v_full, total - t, total, total,
-                                  c_kv=buf_c, h_c=h)
+        out, sel, _kl = self._sparse_scores(
+            q_full, k_full, v_full, total - t, total, total, c_kv=buf_c, h_c=h,
+            shared=(csa_sel.get(self.csa_src, 0) if csa_sel is not None else None))
+        if (sel is not None and csa_sel is not None
+                and self.csa_mode in ("full", "reindex")
+                and self.csa_index is not None):
+            # 解码单块：生产者把本步选择写进自己的槽（后续层同一步内读）
+            csa_sel.put(self.csa_index, 0, sel)
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
         return self._out_proj(out), (buf_c, buf_kr, pos_next)
 

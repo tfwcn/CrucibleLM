@@ -101,6 +101,9 @@ class SmallLLMConfig:
     indexer_head_dim: int = 64
     # 每个查询最终读的 token 级主 KV 条数（V4.1：attention top-k = 512）
     indexer_topk: int = 64
+    # indexer 蒸馏损失系数（DSA 做法：让学习式打分拟合主注意力在候选上的分布；
+    # **必须 >0 否则 indexer 只进掩码、拿不到任何梯度**；0=不训 indexer）
+    indexer_loss_coef: float = 0.01
     # 块级候选池：块大小（按候选的全局位置分块）与选中的块数（V4.1：2048 块 × 8 位置）
     indexer_block: int = 8
     indexer_pool_blocks: int = 32
@@ -112,6 +115,17 @@ class SmallLLMConfig:
     # 注意：改默认值只影响"新建模型"；续训/迁移时训练脚本会从 checkpoint 的
     # hparams.json 沿用架构，读不到则保守按 1 处理，避免静默换架构。
     csa_reuse_every: int = 2
+    # CSA2 三模式静态分配（V4.1）：逐"全注意力层"指定 Full/Reindex/Reuse。
+    # 逗号分隔，按全注意力层序号循环；别名 full/f、reindex/ri、reuse/re。
+    #   例 "full,reindex,reuse"：第 1 个全注意力层自算全局 KV + 索引（Full）；
+    #   之后 Reindex 层复用 main KV + indexer K、但用自己的 indexer Q 重选 Top-K；
+    #   Reuse 层直接复用最新的 Top-K（V4.1 CSA2 decode 的静态分配思路）。
+    # 空 = 由 `csa_reuse_every` 推导旧行为（Full/Reuse 交替，Reuse 复用最新选择），
+    # 逐位兼容旧 checkpoint；非空时**覆盖** `csa_reuse_every`。
+    # 语义变更但**不改 state_dict 键**（`csa_reuse_every` 同族）；Reindex 只在
+    # `sparse_indexer` 开启时才与 Reuse 有区别（无 indexer 时退化为 Reuse，
+    # 因为选择与 query 内容无关、逐层相同）——见 docs/details/csa-modes.md。
+    csa_modes: str = ""
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
@@ -214,6 +228,28 @@ class SmallLLMConfig:
     def n_full_layers(self) -> int:
         """全注意力层数量（决定 KV 缓存大小）."""
         return sum(1 for i in range(self.n_layers) if self.is_full_attn_layer(i))
+
+    def csa_mode_list(self) -> tuple[str, ...]:
+        """CSA2 模式表（按全注意力层序号循环）.
+
+        非空 `csa_modes` 直接展开；空则由 `csa_reuse_every` 推导旧行为：
+        `("full", "reuse", ...)`（长度 = csa_reuse_every；1 时全 Full）。
+        """
+        if self.csa_modes:
+            return tuple(_norm_csa_modes(self.csa_modes).split(","))
+        if self.csa_reuse_every <= 1:
+            return ("full",)
+        return tuple(
+            "full" if k % self.csa_reuse_every == 0 else "reuse"
+            for k in range(self.csa_reuse_every))
+
+    def csa_mode_of(self, layer_idx: int) -> str:
+        """某层的 CSA2 模式（非全注意力层恒为 "full"，不受影响）."""
+        if not self.is_full_attn_layer(layer_idx):
+            return "full"
+        modes = self.csa_mode_list()
+        k = layer_idx // max(1, self.full_attn_every)
+        return modes[k % len(modes)]
 
 
 # 16G 训练配方建议（bf16 + AdamW + 梯度检查点）
@@ -347,6 +383,36 @@ def _norm_bool(v) -> bool:
     return bool(v)
 
 
+_CSA_MODE_ALIASES: dict[str, str] = {
+    "full": "full", "f": "full",
+    "reindex": "reindex", "ri": "reindex",
+    "reuse": "reuse", "re": "reuse",
+}
+
+
+def _norm_csa_modes(v) -> str:
+    """CSA2 模式串归一化："full,reindex,reuse" 式逗号列表（别名 f/ri/re）.
+
+    非法模式直接报错（配置错误是用户可见的，早失败好过静默按 Full 跑）。
+    """
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple)):
+        items = [str(x) for x in v]
+    else:
+        items = str(v).replace(";", ",").split(",")
+    out = []
+    for raw in items:
+        tok = raw.strip().lower()
+        if not tok:
+            continue
+        if tok not in _CSA_MODE_ALIASES:
+            raise ValueError(
+                f"csa_modes 非法模式 {raw!r}；仅支持 full/reindex/reuse（别名 f/ri/re）")
+        out.append(_CSA_MODE_ALIASES[tok])
+    return ",".join(out)
+
+
 _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "csa_reuse_every": (1, _norm_at_least_one_int),
     "swiglu_limit": (0.0, _norm_nonneg_float),
@@ -366,6 +432,8 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "indexer_topk": (64, _norm_at_least_one_int),
     "indexer_block": (8, _norm_at_least_one_int),
     "indexer_pool_blocks": (32, _norm_at_least_one_int),
+    # CSA2 三模式（V4.1）；语义变更但不改键，空=旧行为（由 csa_reuse_every 推导）
+    "csa_modes": ("", _norm_csa_modes),
 }
 
 

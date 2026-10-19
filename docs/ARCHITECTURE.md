@@ -15,8 +15,8 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek-V4.1 | 免辅助损失路由（sqrtsoftplus + noaux_tc） | `moe.py`：打分 `sqrt(softplus(z))`，按 `打分+逐专家偏置` 选 top-k，权重取原始打分归一化 ×`routed_scaling_factor`；偏置 sign 式按负载调价、不进梯度（`router_aux_free`，**默认开**，关=旧 softmax+aux loss） |
 | DeepSeek V3 / V4.1 | MTP 多 token 预测（深度 3） | `model.py:MTPHead`：第 1 级押 t+2（键兼容旧实现），更深级（`mtp.extra.*`）链式喂"下一 token 嵌入"押到 t+1+depth（V4.1 `num_nextn_predict_layers=3`）；推理只用第 1 级（`mtp_depth`，**默认 1**=旧口径，>1 改键需重训） |
 | DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
-| DeepSeek-V4.1 | CSA2 跨层 KV 复用 | `mla.py`/`sparse_attn.py`：Full/Reuse 交替，Reuse 借最近 Full 层 latent（`csa_reuse_every`，**默认 2=开**，1=关） |
-| DeepSeek-V4.1 | 分层稀疏 indexer | `sparse_attn.py`：学习式打分器选 Top-K 主 KV，先块级粗选候选池再池内 token 级 Top-K（`sparse_indexer`，**默认关**：新增 `w_iq`/`w_ik` 改键） |
+| DeepSeek-V4.1 | CSA2 三模式（Full/Reindex/Reuse） | `mla.py`/`sparse_attn.py`：逐全注意力层静态分配——Full 自算自存 KV + 自选 Top-K；Reindex 借 main KV/indexer K、**自带 indexer Q 重选**；Reuse 直接复用最新 Top-K（`csa_modes`，空=旧 Full/Reuse 交替） |
+| DeepSeek-V4.1 | 分层稀疏 indexer | `sparse_attn.py`：学习式打分器选 Top-K 主 KV，先块级粗选候选池再池内 token 级 Top-K，并用蒸馏损失（`indexer_loss_coef`）训练打分器（`sparse_indexer`，**默认关**：新增 `w_iq`/`w_ik` 改键） |
 | DeepSeek-V4.1 | 3×3 pixel-unshuffle 视觉压缩 | `vision_compress.py`：`vision_unshuffle=3` 先按 3×3 重排降采样，视觉 token /9（默认 1=关） |
 | DeepSeek DSpark | 置信调度验证（spec decoding） | `spec_decode.py`：按草稿存活置信度动态定验证长度，截断必被拒后缀（`dspark_enabled`，默认关） |
 | Qwen3-Next | Hybrid 注意力（全/线性交替） | `block.py`：每 4 层 1 层 MLA，其余 `GatedDeltaLite` 线性层 |
@@ -185,7 +185,13 @@ GPU 利用率低时先看 CPU 是否被 parquet 解码/分词占满。
   候选池（块分=块内最大分），再在池内取 token 级 Top-K；当前块（含自身）的本地
   SWA 列不受影响。**注意口径**：我们的候选集本就是常数规模，indexer 改的是"读哪些
   主 KV"（学习式选择）而非张量形状，真实加速需 block-sparse kernel（未实现）。
-  详见 `docs/details/sparse-indexer.md`。
+  打分器只产掩码（不可微）→ 靠**蒸馏损失**（拟合主注意力的候选分布，目标 detach，
+  `indexer_loss_coef`）才拿得到梯度，否则恒零梯度。详见 `docs/details/sparse-indexer.md`。
+- CSA2 三模式（可选，`csa_modes`，空=旧 Full/Reuse 交替）：逐全注意力层静态分配
+  **Full**（自算自存 KV + 自选 Top-K）/ **Reindex**（借 main KV + indexer K，自带
+  indexer Q 重选 Top-K）/ **Reuse**（直接用最新 Top-K）。Reindex 让"复用 KV"不必
+  连"选择权"一起交出；无 indexer 时 Reindex 数学上退化为 Reuse。选择经前向内通道
+  按**层号**键控传递（梯度检查点重算安全）。详见 `docs/details/csa-modes.md`。
 - 线性层超 `linear_chunk`（默认 2048）切块递推：前向精确，反向块间截断
   （Transformer-XL 式）；另修了两处训推不一致：跨块项补 `×scale`、
   解码补卷积状态缓存（否则每步 k/v 与全前向对不上，Mamba 系同理）。
@@ -343,9 +349,10 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
 | `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
 | `csa_reuse_every`(2) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，实测 8192 ctx KV −30%、32768 −32%）。**默认 2=开**（实测有代价的净收益），1=关 | `mla.py`/`sparse_attn.py`/`model.py` |
+| `csa_modes`("") | CSA2 三模式静态分配（V4.1）：`full,reindex,reuse` 逗号分隔、按全注意力层序号循环（别名 `f`/`ri`/`re`）；非空时**覆盖** `csa_reuse_every`。**改语义但不改 `state_dict` 键**（旧 Full/Reuse 权重可直接互载，装载需 `sync_arch_from_checkpoint` 对齐来源）；Reindex 只在 `sparse_indexer` 开启时才与 Reuse 有区别。详见 `docs/details/csa-modes.md` | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 | `o_groups`(1) / `o_lora_rank`(0) | MLA 分组低秩输出投影（V4.1：8/1024）：按头分组、每组压到 `o_lora_rank` 再拼接升维。**默认关**（改 `state_dict` 键，旧 ckpt 无法直接载入）；开启需重训或 `scripts/migrate_model.py --o-groups G --o-lora-rank r`（SVD 迁移，近似）。详见 `docs/details/mla-grouped-output.md` | `mla.py`/`migrate.py` |
-| `sparse_indexer`(False) / `indexer_heads`(4) / `indexer_head_dim`(64) / `indexer_topk`(64) / `indexer_block`(8) / `indexer_pool_blocks`(32) | 分层稀疏 indexer（V4.1：32 头/128 维/top-k 512/2048 块×8）：学习式 top-K 主 KV + 块级候选池。**默认关**（新增 `w_iq`/`w_ik` 改 `state_dict` 键，旧 ckpt 无法直接载入，需重训）；只影响长序列（`t > sparse_threshold`），短序列 dense 逐位不变。详见 `docs/details/sparse-indexer.md` | `sparse_attn.py` |
+| `sparse_indexer`(False) / `indexer_heads`(4) / `indexer_head_dim`(64) / `indexer_topk`(64) / `indexer_block`(8) / `indexer_pool_blocks`(32) / `indexer_loss_coef`(0.01) | 分层稀疏 indexer（V4.1：32 头/128 维/top-k 512/2048 块×8）：学习式 top-K 主 KV + 块级候选池，打分器用蒸馏损失训练（DSA：拟合主注意力分布，目标 detach；系数只缩放 indexer 学习步长，**0=不训**）。**默认关**（新增 `w_iq`/`w_ik` 改 `state_dict` 键，旧 ckpt 无法直接载入，需重训）；只影响长序列（`t > sparse_threshold`），短序列 dense 逐位不变。详见 `docs/details/sparse-indexer.md` | `sparse_attn.py` |
 | `mtp_depth`(1) | MTP 预测深度（V4.1 `num_nextn_predict_layers=3`）：第 1 级押 t+2（键兼容），更深级链式喂"下一 token 嵌入"押到 t+1+depth，多级 loss 取均值。**默认 1**（>1 新增 `mtp.extra.*`、改键，旧 ckpt 需重训）；`--mtp-depth` 三态，续训从 hparams 沿用。详见 `docs/details/mtp.md` | `model.py` |
 
 - **投机解码**：先用 `scripts/measure_mtp_acceptance.py` 卡接受率门槛（>50%）；
@@ -386,6 +393,14 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   续训判定（lr 2e-5/1e-5 各一轮，同 seed 同数据）：差距随收敛深度增长（r=−0.45），
   两个独立 lr 复现同一残差——是**小而稳的固有容量差额，非适配滞后**；故是**可辩护的
   取舍，不是无损**。细节见 `docs/details/csa-kv-reuse.md`。
+- **CSA2 三模式（`csa_modes`）**：逐全注意力层静态分配 **Full**（自算自存 KV + 自选 Top-K）/
+  **Reindex**（借 main KV 与 indexer K，自带 indexer Q 重选 Top-K）/ **Reuse**（直接用最新
+  Top-K）。借用层（Reindex/Reuse）与最近生产者共享 `w_dkv`/`w_kr`（indexer 开启时 Reindex
+  连 `w_ik` 也借），第一个全注意力层永远退化为 Full 兜底；`kv_cache_bytes` 只计 Full 层。
+  选择经前向内通道按**层号**键控传递（梯度检查点反向重算安全，见 pitfalls 30）。
+  **无 `sparse_indexer` 时 Reindex 数学上等于 Reuse**（选择与 query 无关）。三模式**不改
+  `state_dict` 键**，但"默认值升级"风险仍在：装载脚本必须 `sync_arch_from_checkpoint`。
+  收益尚未 A/B（依赖 indexer 训得动）。细节见 `docs/details/csa-modes.md`。
 
 ## 直觉头/RAG（`heads.py` + `retrieval.py`，SFT 后启用）
 

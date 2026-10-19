@@ -10,6 +10,7 @@ from src.llm.local.block import HybridBlock
 from src.llm.local.config import SmallLLMConfig
 from src.llm.local.linear_attn import GatedDeltaLite
 from src.llm.local.mla import RMSNorm
+from src.llm.local.sparse_attn import CsaChannel
 
 
 def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
@@ -22,12 +23,10 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
     use_engram = (config.engram_every > 0
                   and layer_idx % config.engram_every == 0)
     full = config.is_full_attn_layer(layer_idx)
-    # CSA2 跨层复用：每 csa_reuse_every 个全注意力层留 1 个 Full，其余 Reuse
-    csa_reuse = False
-    if full and config.csa_reuse_every > 1:
-        ordinal = layer_idx // max(1, config.full_attn_every)
-        csa_reuse = (ordinal % config.csa_reuse_every) != 0
-    return HybridBlock(
+    # CSA2 三模式静态分配（V4.1）：`csa_modes` 显式指定，空则由 csa_reuse_every
+    # 推导旧行为（Full/Reuse 交替）。full=自算自存；reindex/reuse=借生产者 main KV。
+    csa_mode = config.csa_mode_of(layer_idx)
+    blk = HybridBlock(
         d_model=config.d_model,
         n_heads=config.n_heads,
         full_attn=full,
@@ -61,6 +60,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         indexer_topk=config.indexer_topk,
         indexer_block=config.indexer_block,
         indexer_pool_blocks=config.indexer_pool_blocks,
+        indexer_loss_coef=config.indexer_loss_coef,
         linear_chunk=config.linear_chunk,
         use_memory=use_memory,
         memory_slots=config.memory_slots,
@@ -75,8 +75,12 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         engram_table_size=config.engram_table_size,
         engram_conv=config.engram_conv,
         vocab_size=config.vocab_size,
-        csa_reuse=csa_reuse,
+        csa_mode=csa_mode,
     )
+    if full:
+        # 层序号：CSA2 选择通道按层号键控，生产者写、借用者读（见 CsaChannel）
+        blk.attn.csa_index = layer_idx
+    return blk
 
 
 class _MTPLevel(nn.Module):
@@ -173,25 +177,47 @@ class TinyLLM(nn.Module):
                 config.dropout, config.vision_unshuffle)
         self._init_weights()
 
-    def _link_csa_reuse(self) -> None:
-        """CSA2：Reuse 层与最近的 Full 层共享 KV 下投影（`w_dkv`/`w_kr` 同权重对象）.
+    def _csa_channel(self) -> CsaChannel | None:
+        """CSA2 选择通道：仅 `sparse_indexer` 开启且真有借用层时创建（否则 None）."""
+        if not (self.config.sparse_indexer and self._csa_active):
+            return None
+        return CsaChannel()
 
-        避免 Reuse 层留下永不更新的死参数，也让"复用"名实相符：Reuse 层借的是
-        同一份 latent 投影（各层仍用自己的上投影 `w_uk`/`w_uv` 展开 K/V）。
+    def _link_csa_reuse(self) -> None:
+        """CSA2：借用层与最近生产者的 KV 下投影共享（`w_dkv`/`w_kr` 同权重对象）.
+
+        生产者 = `full`（自算 main KV + 索引 + 写缓存）/ `reindex`（借 main KV，
+        但用自己的 indexer Q 重选 Top-K，并把结果作为新的"最新选择"给后续 Reuse）。
+        借用者 = `reindex`/`reuse`（复用最近生产者的 main KV）。共享下投影既避免
+        "永不更新的死参数"，也让"复用"名实相符：各层仍用自己的上投影 `w_uk`/`w_uv`
+        展开 K/V，也有自己的 Q 与输出投影。
+        `sparse_indexer` 开启时，Reindex 连 **indexer K**（`w_ik`）也借生产者的
+        （V4.1：Reindex 复用 main KV + indexer K，只自带 indexer Q）。
+        借用层记下 `csa_src`（最近生产者的层序号），供选择通道读取。
         """
         last_full = None
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
             if not getattr(layer, "full_attn", False):
                 continue
-            if getattr(layer.attn, "csa_reuse", False) and last_full is not None:
+            mode = getattr(layer.attn, "csa_mode", "full")
+            if mode != "full" and last_full is not None:
                 layer.attn.w_dkv = last_full.attn.w_dkv
                 layer.attn.w_kr = last_full.attn.w_kr
+                if (getattr(layer.attn, "sparse_indexer", False)
+                        and getattr(last_full.attn, "sparse_indexer", False)):
+                    layer.attn.w_ik = last_full.attn.w_ik
+                layer.attn.csa_src = last_full.attn.csa_index
+                if mode == "reindex":
+                    last_full = layer  # Reindex 也是生产者（更新"最新选择"）
             else:
-                # 首个全注意力层（或 Reuse 无前置 Full）退化为 Full，保证有共享源
+                # 首个全注意力层（或借用者无前置生产者）退化为 Full，保证有共享源
+                layer.attn.csa_mode = "full"
                 layer.attn.csa_reuse = False
+                layer.attn.csa_src = idx
                 last_full = layer
         self._csa_active = any(
-            bool(getattr(layer.attn, "csa_reuse", False)) for layer in self.layers)
+            getattr(layer.attn, "csa_mode", "full") != "full"
+            for layer in self.layers if getattr(layer, "full_attn", False))
 
     def _init_weights(self) -> None:
         """GPT-2 式初始化：embedding 小方差 + 残差输出投影按深度缩放.
@@ -274,22 +300,30 @@ class TinyLLM(nn.Module):
                          if chunk_mask is not None else None)
         elif self._has_interleaved_retro():
             pass  # 评测/生成无检索：各层跳过，测 backbone 本体
-        shared = None  # CSA2：最近 Full 全注意力层的 latent 缓存（供 Reuse 层借用）
+        shared = None  # CSA2：最近生产者的 main KV latent 缓存（供借用层复用）
+        csa_sel = self._csa_channel()  # CSA2 选择通道（indexer 关时为 None）
+        idx_kl: torch.Tensor | None = None  # indexer 蒸馏损失（未缩放，供日志）
+        idx_n = 0  # 贡献蒸馏损失的层数（日志取层间均值）
         for layer in self.layers:
             # 梯度检查点只在训练时生效（推理/生成走正常路径，保留解码缓存）；
             # 训练不返回解码缓存（return_state=False），省状态循环与两次投影
             is_full = bool(getattr(layer, "full_attn", False))
             is_reuse = is_full and bool(getattr(layer.attn, "csa_reuse", False))
             reuse = shared if is_reuse else None
-            # CSA2 开启时 Full 层需返回缓存（reserve=0，不补零、数值不变）供 Reuse 借用
+            # CSA2 开启时全注意力层需返回缓存（reserve=0，不补零、数值不变）供借用
             rs = bool(self._csa_active and is_full)
             if self.config.grad_ckpt and self.training:
                 h, aux_total, p = self._layer_ckpt(
-                    layer, h, aux_total, retro_mem, engram_ids, reuse, rs)
+                    layer, h, aux_total, retro_mem, engram_ids, reuse, rs, csa_sel)
             else:
                 h, (p, aux) = layer(h, None, rs, retro_mem,
-                                    engram_ids=engram_ids, reuse=reuse)
+                                    engram_ids=engram_ids, reuse=reuse,
+                                    csa_sel=csa_sel)
                 aux_total = aux_total + aux
+            kl = getattr(layer.attn, "_last_indexer_kl", None)
+            if kl is not None:
+                idx_kl = kl if idx_kl is None else idx_kl + kl
+                idx_n += 1
             if self._csa_active and is_full and not is_reuse:
                 shared = p
         if hyper_n:
@@ -306,6 +340,9 @@ class TinyLLM(nn.Module):
             raise ValueError("传了 v1 mem 但单点融合未开（retro_enabled=False 或 retro_every>0 走交错）")
         logits = self.lm_head(h)
         out: dict = {"logits": logits, "aux_loss": aux_total.detach()}
+        if idx_kl is not None:
+            # indexer 蒸馏损失（层间均值、未缩放，便于和主 loss 比大小；已按系数计入 aux_loss）
+            out["indexer_loss"] = (idx_kl / max(idx_n, 1)).detach()
         if targets is None:
             return out
         # 主 loss：预测下一 token（视觉前缀存在时只取文本段，视觉段不参与）
@@ -414,13 +451,15 @@ class TinyLLM(nn.Module):
         engram_ids: torch.Tensor | None = None,
         reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         return_state: bool = False,
+        csa_sel: CsaChannel | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple | None]:
         """单层梯度检查点：重算换显存（训练 past=None，不用解码缓存）."""
         from torch.utils.checkpoint import checkpoint
 
         def fn(hh: torch.Tensor):
             out, (p, aux) = layer(hh, None, return_state, retro_mem,
-                                  engram_ids=engram_ids, reuse=reuse)
+                                  engram_ids=engram_ids, reuse=reuse,
+                                  csa_sel=csa_sel)
             return out, aux, p
 
         h_new, aux, p = checkpoint(fn, h, use_reentrant=False)
@@ -469,14 +508,15 @@ class TinyLLM(nn.Module):
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
         if hyper_n:
             h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
-        shared = None  # CSA2：最近 Full 全注意力层的 latent 缓存（供 Reuse 层借用）
+        shared = None  # CSA2：最近生产者的 main KV latent 缓存（供借用层复用）
+        csa_sel = self._csa_channel()  # CSA2 选择通道（indexer 关时为 None）
         pasts: list = []
         for layer in self.layers:
             is_full = bool(getattr(layer, "full_attn", False))
             is_reuse = is_full and bool(getattr(layer.attn, "csa_reuse", False))
             reuse = shared if is_reuse else None
             h, (p, _) = layer(h, retro_mem=retro_mem, reserve=reserve,
-                              engram_ids=input_ids, reuse=reuse)
+                              engram_ids=input_ids, reuse=reuse, csa_sel=csa_sel)
             pasts.append(p)
             if self._csa_active and is_full and not is_reuse:
                 shared = p
@@ -537,6 +577,7 @@ class TinyLLM(nn.Module):
         if hyper_n:
             hh = hh.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         new_pasts: list = []
+        csa_sel = self._csa_channel()  # 每步一个：生产者本步写、借用者同步读
         for layer, p in zip(self.layers, pasts):
             # 每层 norm 由 block 内部处理，这里直接走 attn+moe 等价路径：
             # 为复用逻辑，重新拼 block 前向（单 token 开销可忽略）
@@ -547,7 +588,10 @@ class TinyLLM(nn.Module):
                 # Engram 与 block.forward 同序（注意力之前残差并联）
                 hh = layer.engram(hh, engram_ids)
             hh_norm = layer.norm1(hh)
-            a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
+            if layer.full_attn:
+                a_out, p2 = layer.attn(hh_norm, p, csa_sel=csa_sel)  # type: ignore[call-arg]
+            else:
+                a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
             hh = hh + a_out
             m_out, _ = layer.moe(layer.norm2(hh))
             hh = hh + m_out
@@ -590,6 +634,7 @@ class TinyLLM(nn.Module):
             hh = hh.unsqueeze(2).expand(-1, -1, hyper_n, -1)
         new_pasts: list = []
         lin_steps: dict[int, list] = {}
+        csa_sel = self._csa_channel()  # 并行验证同一批 token：单块选择通道
         for li, (layer, p) in enumerate(zip(self.layers, pasts)):
             xxs = hh
             hh_in = layer.hyper.pre_mix(hh) if hyper_n and layer.hyper is not None else hh
@@ -598,8 +643,10 @@ class TinyLLM(nn.Module):
                 # Engram 与 block.forward 同序（并行验证的算术也必须一致）
                 hh = layer.engram(hh, engram_ids)
             hh_norm = layer.norm1(hh)
-            a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
-            if isinstance(layer.attn, GatedDeltaLite):
+            if layer.full_attn:
+                a_out, p2 = layer.attn(hh_norm, p, csa_sel=csa_sel)  # type: ignore[call-arg]
+            else:
+                a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
                 lin_steps[li] = layer.attn.multi_steps
             hh = hh + a_out
             m_out, _ = layer.moe(layer.norm2(hh))
@@ -824,13 +871,15 @@ class TinyLLM(nn.Module):
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
         if hyper_n:
             h = h.unsqueeze(2).expand(-1, -1, hyper_n, -1)
-        shared = None  # CSA2：最近 Full 全注意力层的 latent 缓存
+        shared = None  # CSA2：最近生产者的 main KV latent 缓存
+        csa_sel = self._csa_channel()  # CSA2 选择通道（indexer 关时为 None）
         for layer in self.layers:
             is_full = bool(getattr(layer, "full_attn", False))
             is_reuse = is_full and bool(getattr(layer.attn, "csa_reuse", False))
             reuse = shared if is_reuse else None
             rs = bool(self._csa_active and is_full)
-            h, (p, _) = layer(h, None, rs, engram_ids=input_ids, reuse=reuse)
+            h, (p, _) = layer(h, None, rs, engram_ids=input_ids, reuse=reuse,
+                              csa_sel=csa_sel)
             if self._csa_active and is_full and not is_reuse:
                 shared = p
         if hyper_n:

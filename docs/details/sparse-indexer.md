@@ -50,9 +50,30 @@ token 级：只在池内对每个查询取 Top-K → 这些主 KV 才是这一�
 - `w_iq`（hidden→indexer Q）、`w_ik`（主 KV latent→indexer K）；打分提 fp32 保稳定
 - 落点：`_sparse_scores` 在静态候选列上叠加"未入选掩 `-inf`"的掩码，
   当前块列保持原因果掩码 → softmax 后等价于"只读 top-K 主 KV + 本地 SWA"
-- 返回 `IndexerSelect(topk_mask, pool_mask)`：`pool_mask` 即块级候选池，
-  供后续 CSA2 **Reindex** 层复用（见下节）
+- 返回 `IndexerSelect(topk_mask, pool_mask, logits)`：`pool_mask` 即块级候选池，
+  供后续 CSA2 **Reindex** 层复用；`logits` 是未掩的 fp32 打分（**蒸馏损失**用，见下节）
 - 来源对齐：登记进 `config._ARCH_SWITCHES`（旧 ckpt 回退关）；CLI `--sparse-indexer` 等
+
+### 打分器怎么训：蒸馏损失（否则恒零梯度）
+
+indexer 的产出是**布尔掩码**，只用来填 `-inf`——`masked_fill` 不可微，
+所以 `w_iq`/`w_ik` **拿不到任何梯度**（不加信号就是随机初始化在那儿选 Top-K，
+"假装在学"）。按 DSA 的做法，用**主注意力自己的分布**当老师：
+
+```
+target = softmax(主注意力打分[:, :, 静态候选列]).mean(头)   # detach：只训 indexer
+kl     = KL(target ‖ softmax(indexer 打分))                 # 每查询平均（nats）
+aux   += indexer_loss_coef * kl                             # 进该层 aux 汇总
+```
+
+- 目标**必须 detach**：否则这项会把主注意力也往 indexer 的分布上拽，污染主任务；
+- 系数 `indexer_loss_coef`（默认 0.01）只缩放 indexer 自身的等效学习步长，设 0 = 不训；
+- 归约别用 `F.kl_div(..., reduction="batchmean")`：它只除 batch 维，`(b, n_q, n_cand)`
+  会被 `n_q` 放大成几百 nats（看着吓人）；用 `reduction="none"` 后 `.sum(-1).mean()`；
+- 层内多块取均值、层间由模型累加进 `aux_loss`；另以 `indexer_loss`（层间均值、未缩放）
+  单独打日志；
+- 初期 KL 很小（主注意力与 indexer 都接近均匀），随主注意力变尖而增大——
+  这正是 indexer 需要开始追的时段，属正常现象。
 
 ## 从想法到代码
 
@@ -68,10 +89,16 @@ top_blk = blk_s.topk(P).indices     # 目录：选 P 个块
 pool = is_block_selected(blk)       # 候选池掩码
 topk = s.masked_fill(~pool, -inf).topk(K).indices   # 翻页：池内 Top-K
 # 注意力：静态列只留 topk，当前块列照旧（本地 SWA）
+# 训练信号：让 s 去拟合主注意力在候选上的分布（target detach）
+kl = KL(softmax(主注意力打分[:, :, 静态列]).mean(头) ‖ softmax(s))
 ```
 
 ## 代价与坑
 
+- **不打分器就没梯度**：掩码不可微，务必带蒸馏损失（见上节）；单测
+  `test_indexer_gets_gradients_from_distillation` 是硬契约。
+- **`sparse_chunk` 太大 = indexer 不参与**：整段序列只有一块时，静态候选（块起点之前的
+  token）数为 0，indexer 根本不会被调用——测 indexer 必须把 `sparse_chunk` 调小。
 - **改 `state_dict` 键**（新增 `w_iq`/`w_ik`）：属"改键"的 opt-in → **默认关**，
   开启需重训；已登记 `_ARCH_SWITCHES` 让续训自动沿用。
 - **只影响长序列**：`t ≤ sparse_threshold` 走 dense（与 MLA 逐位一致），

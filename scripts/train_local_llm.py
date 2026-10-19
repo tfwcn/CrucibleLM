@@ -139,6 +139,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
                         "读不到 checkpoint 架构则保守按 1）")
+    p.add_argument("--csa-modes", type=str, default=None,
+                   help="CSA2 三模式逐层分配（V4.1）：逗号分隔，按全注意力层序号循环，"
+                        "如 'full,reindex,reuse'（别名 f/ri/re）；非空时覆盖 "
+                        "--csa-reuse-every；Reindex 只在 --sparse-indexer 开启时才与 "
+                        "Reuse 有区别（不传时沿用/默认空=旧 Full/Reuse 交替）")
     p.add_argument("--swiglu-limit", type=float, default=None,
                    help="SwiGLU gate/up 预激活对称限幅（DeepSeek-V4.1=10.0；0=关；"
                         "不传时新训练取架构默认=10.0，续训/迁移沿用 checkpoint，"
@@ -172,6 +177,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--indexer-block", type=int, default=None, help="候选池块大小（V4.1=8）")
     p.add_argument("--indexer-pool-blocks", type=int, default=None,
                    help="候选池选中的块数（V4.1=2048）")
+    p.add_argument("--indexer-loss-coef", type=float, default=None,
+                   help="indexer 蒸馏损失系数（DSA：学习式打分拟合主注意力分布；"
+                        "必须 >0 否则 indexer 拿不到梯度；0=不训 indexer）")
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
@@ -306,6 +314,24 @@ def resolve_csa_reuse_every(args: argparse.Namespace,
     """（兼容包装）CSA2 档位与来源；实现见 `resolve_arch_switches`."""
     src = resolve_arch_switches(args, config)["csa_reuse_every"]
     return config.csa_reuse_every, src
+
+
+# indexer 超参（非架构开关）：键名不变但改参数形状，装错会大声报 shape 错，
+# 因此允许 CLI 直接覆盖；`None`（未传）时沿用默认/checkpoint。
+_INDEXER_CLI_FIELDS = ("indexer_heads", "indexer_head_dim", "indexer_topk",
+                       "indexer_block", "indexer_pool_blocks", "indexer_loss_coef")
+
+
+def apply_indexer_overrides(args: argparse.Namespace,
+                            config: SmallLLMConfig) -> list[str]:
+    """把显式传入的 indexer 超参覆盖到 config，返回被覆盖的字段名."""
+    changed: list[str] = []
+    for field in _INDEXER_CLI_FIELDS:
+        val = getattr(args, field, None)
+        if val is not None:
+            setattr(config, field, val)
+            changed.append(field)
+    return changed
 
 
 def resolve_swiglu_limit(args: argparse.Namespace,
@@ -812,6 +838,9 @@ def main(argv=None) -> int:
     from src.llm.local.config import _ARCH_SWITCHES
     for field in _ARCH_SWITCHES:
         setattr(args, field, getattr(config, field))
+    # indexer 超参（不是架构开关：键名不变但**改形状**，装错会大声报 shape 错，
+    # 故允许 CLI 直接覆盖；显式传入才生效，None=沿用默认/checkpoint）
+    apply_indexer_overrides(args, config)
     every = config.csa_reuse_every
     limit = config.swiglu_limit
     if arch_src.get("csa_reuse_every") == "checkpoint":
@@ -822,6 +851,14 @@ def main(argv=None) -> int:
     if every > 1:
         print(f"CSA2 跨层 KV 复用已开：每 {every} 个全注意力层留 1 个 Full，"
               f"其余 Reuse 借共享 latent（KV 缓存下降）", flush=True)
+    if arch_src.get("csa_modes") == "checkpoint":
+        print(f"CSA2 三模式：沿用 checkpoint 分配 csa_modes={config.csa_modes!r}",
+              flush=True)
+    if config.csa_modes:
+        modes = ",".join(config.csa_mode_list())
+        print(f"CSA2 三模式静态分配已开：{modes}（按全注意力层序号循环；"
+              f"Reindex 借 main KV + indexer K、自带 indexer Q 重选 Top-K；"
+              f"无 sparse_indexer 时 Reindex 退化为 Reuse）", flush=True)
     if arch_src.get("swiglu_limit") == "checkpoint":
         print(f"SwiGLU 限幅：沿用 checkpoint 架构 swiglu_limit={limit}", flush=True)
     elif arch_src.get("swiglu_limit") == "conservative":
@@ -854,7 +891,8 @@ def main(argv=None) -> int:
     if config.sparse_indexer:
         print(f"分层稀疏 indexer 已开：{config.indexer_heads} 头 × "
               f"{config.indexer_head_dim} 维，top-k={config.indexer_topk}，"
-              f"块 {config.indexer_block} 位置 × {config.indexer_pool_blocks} 块"
+              f"块 {config.indexer_block} 位置 × {config.indexer_pool_blocks} 块，"
+              f"蒸馏系数 {config.indexer_loss_coef}"
               f"（仅影响长序列 > sparse_threshold={config.sparse_threshold}；"
               f"键已变，旧 ckpt 需重训）", flush=True)
     # 断点续流：先读上次消费数（无文件/无键则从头，兼容旧 checkpoint）
@@ -1339,6 +1377,8 @@ def accumuloss(stats: dict) -> dict:
             out["mtp_loss"] = v
         elif k == "aux_loss":
             out["aux_loss"] = v
+        elif k == "indexer_loss":
+            out["indexer_loss"] = v
         elif k == "kd_loss":
             out["kd_loss"] = v
         elif k == "ema_loss":
