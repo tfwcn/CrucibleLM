@@ -52,12 +52,13 @@ class SessionCache:
 
     @staticmethod
     def _is_static_triple(p) -> bool:
-        """MLA 系静态缓存三元组（buf_c, buf_kr, pos）判定.
+        """MLA 系静态缓存判定：三元组 `(buf_c, buf_kr, pos)` 或
+        六元组 `(buf_c, buf_kr, pos, k_ring, kr_ring, v_ring)`（层内 SWA 开启）.
 
         线性层 past 也是三元组 (S, k_buf, v_buf)，但第 3 元是 float 卷积尾；
-        静态三元组的第 3 元恒为 long 标量 pos，以此区分。
+        静态缓存的第 3 元恒为 long 标量 pos，以此区分。
         """
-        return (isinstance(p, tuple) and len(p) == 3
+        return (isinstance(p, tuple) and len(p) in (3, 6)
                 and isinstance(p[2], torch.Tensor)
                 and p[2].dtype == torch.long and p[2].numel() == 1)
 
@@ -67,24 +68,45 @@ class SessionCache:
 
         eager 重分配（拷贝旧有效区）；编译过的 decode 重编一次，
         指数扩容下均摊可忽略。线性层状态定长，无需处理。
+
+        CSA2 借用层（reindex/reuse）与生产者**共享同一个 latent 缓冲**，
+        扩容必须按张量身份去重：否则逐层各建一份新缓冲，生产者写进自己那份、
+        借用层读到的还是旧副本（pitfall 36）。SWA 环定长，原样带上。
         """
         if self.pasts is None:
             return
+        # 第 1 遍：按旧张量身份汇总目标容量（共享缓冲取各请求的最大值）
+        plans: dict[int, tuple[torch.Tensor, int]] = {}
+        for p in self.pasts:
+            if not self._is_static_triple(p):
+                continue
+            cur = int(p[2].item())
+            for t in (p[0], p[1]):
+                if cur + need <= t.shape[1]:
+                    continue
+                nlen = max(t.shape[1] * 2, cur + need)
+                old = plans.get(id(t))
+                if old is None or nlen > old[1]:
+                    plans[id(t)] = (t, nlen)
+        if not plans:
+            return
+        # 第 2 遍：生成新张量（同一旧张量只生成一次）
+        fresh: dict[int, torch.Tensor] = {}
+        for key, (t, nlen) in plans.items():
+            new = torch.zeros(t.shape[0], nlen, t.shape[2],
+                              device=t.device, dtype=t.dtype)
+            new[:, :t.shape[1]] = t
+            fresh[key] = new
+        # 第 3 遍：就地替换（未扩容的 past 保持原对象，SWA 环元组原样续接）
         for li, p in enumerate(self.pasts):
             if not self._is_static_triple(p):
                 continue
-            buf_c, buf_kr, pos = p
-            cur = int(pos.item())
-            if cur + need <= buf_c.shape[1]:
+            nc, nkr = fresh.get(id(p[0])), fresh.get(id(p[1]))
+            if nc is None and nkr is None:
                 continue
-            nlen = max(buf_c.shape[1] * 2, cur + need)
-            new_c = torch.zeros(buf_c.shape[0], nlen, buf_c.shape[2],
-                                device=buf_c.device, dtype=buf_c.dtype)
-            new_c[:, :cur, :] = buf_c[:, :cur, :]
-            new_kr = torch.zeros(buf_kr.shape[0], nlen, buf_kr.shape[2],
-                                 device=buf_kr.device, dtype=buf_kr.dtype)
-            new_kr[:, :cur, :] = buf_kr[:, :cur, :]
-            self.pasts[li] = (new_c, new_kr, pos)
+            self.pasts[li] = (nc if nc is not None else p[0],
+                              nkr if nkr is not None else p[1], p[2]) \
+                + tuple(p[3:])
 
     def _device(self) -> torch.device:
         """模型所在设备."""
@@ -93,15 +115,31 @@ class SessionCache:
         except StopIteration:
             return torch.device("cpu")
 
-    def save(self, path: str) -> None:
-        """落盘（past 全是小张量：latent/状态/卷积尾，无 O(N^2) 大物）."""
+    def save(self, path: str, drop_swa: bool = True) -> None:
+        """落盘（past 全是小张量：latent/状态/卷积尾，无 O(N^2) 大物）.
+
+        `drop_swa=True`（默认，对齐 V4.1 §3.2.2）：**SWA 环不落盘**，持久化
+        只存全局主 KV；环定长且可由最近 `n_win` 个 token 重放重建，存它纯属
+        浪费带宽——它的体积是 `2*n_heads*head_dim*n_win` 每层（n_win=4096、
+        n_heads=64、head_dim=128 时约 67MB/层，与 200K 会话的全局主 KV 同量级）。
+        代价：`load` 需一次 Bounded Replay（近似，见 `replay_swa`）。
+        `drop_swa=False`：环也存 → `load` 逐位精确（调试/对照用）。
+        """
         assert self.pasts is not None, "空缓存无需存盘"
-        torch.save({"pasts": self.pasts,
-                    "ids": self.ids}, path)
+        slim = ([p[:3] if isinstance(p, tuple) and len(p) == 6 else p
+                 for p in self.pasts] if drop_swa else self.pasts)
+        torch.save({"pasts": slim, "ids": self.ids,
+                    "swa_dropped": bool(drop_swa)}, path)
 
     @classmethod
     def load(cls, path: str, model) -> "SessionCache":
-        """读回（map 到模型所在设备）."""
+        """读回（map 到模型所在设备）；缺 SWA 环时用 Bounded Replay 近似重建.
+
+        V4.1 §3.2.2：落盘只存全局主 KV，SWA 环由**最近 `n_win` 个 token** 重放
+        重建（精确重建需 `L × n_win`）。重放走
+        `model.replay_swa_from_ids(ids)`——它只读权威全局主 KV、只重建 SWA 环，
+        见 `TinyLLM.replay_swa_from_ids`（近似来源写在那边的 docstring）。
+        """
         sc = cls(model)
         try:
             dev = next(model.parameters()).device
@@ -109,8 +147,27 @@ class SessionCache:
             dev = torch.device("cpu")
         blob = torch.load(path, map_location=dev)
         sc.pasts = blob["pasts"]
-        sc.ids = blob["ids"]
+        # ids 只是记账（`extend` 往 CPU 上拼），**别跟着 map 到设备**：否则 GPU 上
+        # 读回后第一次 `extend` 会在 `torch.cat` 处设备不一致而炸（本仓踩过）。
+        sc.ids = blob["ids"].to("cpu") if blob["ids"] is not None else None
+        if blob.get("swa_dropped"):
+            sc.replay_swa()
         return sc
+
+    @torch.no_grad()
+    def replay_swa(self) -> None:
+        """用最近 `n_win` 个 token 重建各层 SWA 环（Bounded Replay）.
+
+        重建后 `pasts` 从三元组补齐为六元组
+        `(buf_c, buf_kr, pos, k_ring, kr_ring, v_ring)`，
+        与未落盘直接续跑的解码路径完全同构。
+        """
+        if self.pasts is None or self.ids is None:
+            return
+        rebuild = getattr(self.model, "replay_swa_from_ids", None)
+        if rebuild is None:
+            return
+        self.pasts = rebuild(self.ids, self.pasts)
 
     def clear(self) -> None:
         """清空（会话结束/超长截断时调用，调用方另行处理）."""

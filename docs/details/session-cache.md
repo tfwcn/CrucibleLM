@@ -17,7 +17,8 @@
 
 存的是三样东西（恰好是两类注意力的全部家当）：
 
-1. MLA latent 缓存（静态三元组 `(buf_c, buf_kr, pos)`，见《推理加速》）；
+1. MLA latent 缓存（静态三元组 `(buf_c, buf_kr, pos)`，见《推理加速》；
+   开了层内 SWA 时是六元组 `+ (k_ring, kr_ring, v_ring)`，见下）；
 2. 线性层状态（`(S, k_buf, v_buf)` 常数大小）；
 3. 已见 token id（`ids`，续跑对账用）。
 
@@ -34,6 +35,14 @@
 - 只动推理路径（`no_grad`，不碰 train/eval 状态），训练循环不用它；
 - 服务进程按会话 id 复用待接线（现状）；和 RETRO 正交可叠加
   （一个管"说过的话"，一个管"库里的知识"）。
+- **层内 SWA 的环默认不落盘**（`save(drop_swa=True)`，对齐 V4.1 §3.2.2）：
+  环定长、可由最近 `n_win` 个 token 重放重建，存它纯属浪费带宽；`load` 见
+  `swa_dropped` 标记就调 `model.replay_swa_from_ids()` 补环（只读权威全局主 KV，
+  **只重建环**）。代价是读回的状态是**近似**的（`n_win` 覆盖不到整段时）。
+  调试/对照要逐位精确就 `save(path, drop_swa=False)`（环也存）。详见
+  `docs/details/per-layer-swa.md`。
+- `ensure_room` 扩容必须**按张量对象身份去重**：CSA2 借用层与生产者共享同一份
+  latent 缓冲，逐层各建新缓冲会让借用层读到旧副本（pitfall 36，已有回归单测）。
 
 ## 从想法到代码
 
@@ -42,8 +51,9 @@
 ```python
 h, self.pasts = model._prefill(ids, max_new_tokens=N)  # 首段预留
 h, self.pasts = model._decode_step(tok, self.pasts)    # 后续单步续跑
-torch.save({"pasts": ..., "ids": ...}, path)           # 落盘
-self.ensure_room(need)                                 # 不够就 2x 扩
+torch.save({"pasts": ..., "ids": ...}, path)           # 落盘（SWA 环默认丢弃）
+SessionCache.load(path, model)                         # 读回；丢环则 Bounded Replay 补齐
+self.ensure_room(need)                                 # 不够就 2x 扩（按张量身份去重）
 ```
 
 ## 代价与坑

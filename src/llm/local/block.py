@@ -70,6 +70,7 @@ class HybridBlock(nn.Module):
         vocab_size: int = 8192,
         csa_mode: str = "full",
         compress_ratio: int = 1,
+        swa_window: int = 0,
     ):
         super().__init__()
         self.full_attn = full_attn
@@ -88,6 +89,7 @@ class HybridBlock(nn.Module):
                 indexer_pool_blocks=indexer_pool_blocks,
                 indexer_loss_coef=indexer_loss_coef,
                 compress_ratio=compress_ratio,
+                swa_window=swa_window,
             )
             # CSA2 三模式（V4.1）：full 自算自存；reindex/reuse 借生产者 main KV
             # （`csa_reuse=True` 时解码不写自己的缓冲），纯超参不进 state_dict

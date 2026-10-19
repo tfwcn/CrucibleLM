@@ -183,6 +183,11 @@ replace manual staged curriculum. Starting fully loaded from step 0 works too
   prefix memory segment; build the index with `scripts/build_retrieval.py`);
   V2 interleave with `--retro-every N --retro-len L` (per-layer fusion over
   token-level chunks, frozen-embedding encoded);
+- Per-layer SWA: `--swa-window N` (V4.1: every layer keeps its own sliding-window
+  branch with a **fixed-size ring cache**, independent of context length; the local
+  span moves entirely into it, global entries shrink to sink/stride only. Persistence
+  keeps global KV only and rebuilds rings by replaying the last N tokens. Keep N <= 512:
+  the ring costs more than the main KV it saves. See `docs/details/per-layer-swa.md`);
 - Session state: `SessionCache` (persist MLA latents, linear states and conv tails
   across turns and processes; library-side, used by the serving path);
 - Hyper-connections: `--hyper-streams 2` (mHC-lite, n-stream mixing with identity
@@ -205,6 +210,7 @@ python -m pytest tests/ -q
 | Attention | Gated-DeltaNet-lite linear attention | O(N) compute, O(1) state, causal conv + gating | `linear_attn.py` (Qwen3-Next-style) |
 | Attention | Hybrid interleave (1 full : 3 linear) | Quality + efficiency balance | `block.py` |
 | Attention | Lightweight sparse attention (sink + window + strided) | Makes 200K+ computable; exact-dense below threshold | `sparse_attn.py` (DSA-inspired) |
+| Attention | Per-layer SWA + bounded replay (`swa_window`, off by default) | Each layer owns a window branch (fixed-size cache, independent of context length); persistence keeps global KV only and rebuilds rings by replay | `sparse_attn.py` (V4.1 §3.2) |
 | MoE | Fine-grained MoE + shared expert + aux loss | 128M params / 48M active per token | `moe.py` (DeepSeek-style) |
 | Objective | MTP extra head (predict t+2) | Denser training signal, off at inference | `model.py` (DeepSeek-style) |
 | Position | RoPE + YaRN scaling | Extrapolate 8K training to 200K inference | `rope.py` |

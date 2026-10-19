@@ -3,6 +3,9 @@
 > 一句话：query 不看全文，只看"开头 + 附近 + 等距抽样"，计算量从 O(N²) 降到 O(N·K)。
 >
 > 想让它**自己学**该看哪里？见 [分层稀疏 indexer](./sparse-indexer.md)（可选开关 `sparse_indexer`）。
+>
+> 近端还想要"每层自带、缓存定长"的精确窗口？见 [层内 SWA](./per-layer-swa.md)（`swa_window`，
+> 开启后本页的 `sparse_window` 失效：近端全交给层内 SWA，远端仍由 sink+stride 提供）。
 
 ## 痛点
 

@@ -134,10 +134,66 @@ def chunk_causal_mask(
     return mask
 
 
+class SwaBranch(nn.Module):
+    """层内滑动窗口注意力（V4.1：**每层自带**、与全局主 KV 完全独立）.
+
+    论文口径：每层同时有全局注意力与 SWA；SWA KV 由**当前层 hidden** 产生
+    （不跨层复用、不压缩、不进 kv_lora_rank 瓶颈），窗口定长 → 存储与序列长度无关。
+    CSA2 的"selected entries together with the layer-local SWA KV"就是
+    **同一次 softmax** 里既放全局稀疏列、也放 SWA 列。
+
+    结构与 MLA 同构（content + 解耦 rope，二者拼起来才和全局 K 同维）：
+    `w_k` 出 content（每头 head_dim）、`w_kr` 出共享 rope 键（qk_rope_dim）、`w_v` 出值。
+    缓存为三个**定长环**（k content / v / rope 键），按 `pos % n_win` 覆盖写。
+    """
+
+    def __init__(self, d_model: int, n_heads: int, qk_rope_dim: int,
+                 window: int, dropout: float = 0.0):
+        super().__init__()
+        from src.llm.local.mla import RMSNorm
+
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.qk_rope_dim = int(qk_rope_dim)
+        self.window = int(window)
+        assert self.window > 0, "SWA 窗口须为正"
+        # SWA 的 K/V 走独立投影（论文里全局与本地是两条分支，不共用上投影）
+        self.w_k = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.w_kr = nn.Linear(d_model, self.qk_rope_dim, bias=False)
+        self.w_v = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+        self.k_norm = RMSNorm(self.head_dim)
+        self.dropout = dropout
+
+    def project(self, h: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """hidden → 本层 SWA 的 (k_content, k_rope_raw, v)，**未加 rope**."""
+        b, t, _ = h.shape
+        k = self.k_norm(self.w_k(h).view(b, t, self.n_heads, self.head_dim))
+        kr = self.w_kr(h)
+        v = self.w_v(h).view(b, t, self.n_heads, self.head_dim)
+        return k, kr, v
+
+    def band_mask(
+        self, q_pos: torch.Tensor, kv_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """带状因果掩码（加性）：位置 q 只看 `[q-n_win+1, q]` 内的 KV.
+
+        q_pos: (n_q,) 查询绝对位置；kv_pos: (n_kv,) KV 绝对位置。
+        返回 (n_q, n_kv)，0=放行、-inf=屏蔽。位置 < 0 的槽位（环里没写过）
+        由调用方裁掉，不进这里。
+        """
+        vis = ((kv_pos[None, :] <= q_pos[:, None])
+               & (kv_pos[None, :] > q_pos[:, None] - self.window))
+        return torch.where(
+            vis, torch.zeros((), device=q_pos.device, dtype=torch.float32),
+            torch.tensor(float("-inf"), device=q_pos.device, dtype=torch.float32))
+
+
 class SparseMLAModule(MLAModule):
     """稀疏 MLA：继承 MLA 全部投影与缓存，只替换注意力核心.
 
-    无新增参数，state_dict 与 MLAModule 完全兼容。
+    `swa_window=0`（默认）时无新增参数，state_dict 与 MLAModule 完全兼容；
+    `swa_window>0` 时新增层内 SWA 分支（`swa.*`，改键、opt-in）。
     """
 
     def __init__(
@@ -166,6 +222,7 @@ class SparseMLAModule(MLAModule):
         indexer_pool_blocks: int = 32,
         indexer_loss_coef: float = 0.01,
         compress_ratio: int = 1,
+        swa_window: int = 0,
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
@@ -194,6 +251,12 @@ class SparseMLAModule(MLAModule):
             # 压缩权重：(m, kv_lora_rank) 的逐位置逐通道权重，初值 1 → 块内算术平均。
             # 只对 m>1 的层建参数（改键）→ 默认关（`compress_ratios` 为空）。
             self.z_cmp = nn.Parameter(torch.ones(self.compress_ratio, kv_lora_rank))
+        # 层内 SWA（V4.1：每层自带、窗口定长）：0=关（无新增参数/键，逐位兼容旧 ckpt）
+        self.swa_window = int(swa_window)
+        self.swa: SwaBranch | None = (
+            SwaBranch(d_model, n_heads, qk_rope_dim, self.swa_window, dropout)
+            if self.swa_window > 0 else None
+        )
         # 最近一次前向的 indexer 辅助损失（已缩放/未缩放；赋值语义，重算幂等）
         self._last_indexer_aux: torch.Tensor | None = None
         self._last_indexer_kl: torch.Tensor | None = None
@@ -261,7 +324,8 @@ class SparseMLAModule(MLAModule):
         return IndexerSelect(topk_mask=topk_mask, pool_mask=pool_mask,
                              logits=scores)
 
-    def _far_block_ids(self, total: int, start: int) -> torch.Tensor:
+    def _far_block_ids(self, total: int, start: int,
+                       window: int | None = None) -> torch.Tensor:
         """远端（压缩）块 id：只取"完整且在查询块之前"的块（因果安全）.
 
         - 完整：块尾 `(b+1)*m-1 < total`（缓存/当前段里真有这些行）；
@@ -270,8 +334,9 @@ class SparseMLAModule(MLAModule):
         建议 `m ≤ sparse_window`（否则窗口与压缩列之间会漏掉不足一个块的近端 token）。
         """
         m = self.compress_ratio
+        win = self.sparse_window if window is None else window
         n_valid = min(total // m, start // m)
-        n_far = min(n_valid, max(0, (start - self.sparse_window + m - 1) // m))
+        n_far = min(n_valid, max(0, (start - win + m - 1) // m))
         return select_block_keys(n_far, self.sparse_sink, self.sparse_stride, m)
 
     def _compressed_columns(
@@ -310,6 +375,7 @@ class SparseMLAModule(MLAModule):
         h_c: torch.Tensor | None = None,
         shared: "IndexerSelect | None" = None,
         kr_raw: torch.Tensor | None = None,
+        swa: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, "IndexerSelect | None", torch.Tensor | None]:
         """对查询 [start, end) 做聚集 + 掩码 + 注意力（softmax 提 fp32 保精度）.
 
@@ -323,32 +389,48 @@ class SparseMLAModule(MLAModule):
           `full` 自选（安全兜底）。
         `compress_ratio > 1` 时远端列改由 `kr_raw`/`c_kv` 按 m 块池化而来（见
         `_compressed_columns`），本地窗口与当前块保持未压缩。
+        `swa=(k_swa, kr_swa, v_swa, kv_pos)` 给定时，把**层内 SWA 列**拼进同一次 softmax
+        （V4.1：selected entries together with the layer-local SWA KV），
+        SWA 列对块内所有查询可见、但受带状窗口掩码限制（`SwaBranch.band_mask`）。
         返回 (注意力输出, 本层选择, indexer 蒸馏 KL)。
         训练且为生产者（full/reindex）时额外算**蒸馏损失**（DSA 做法：让学习式打分
         去拟合主注意力在候选上的分布）——否则 indexer 只进掩码、拿不到任何梯度。
         """
         b, h, _, d = k_full.shape
         n_q = end - start
+        # SWA 分支开启时：本地（窗口 + 当前块）**全部**由 SWA 列承担，
+        # 全局主 KV 只出"选中条目"（V4.1：selected entries + layer-local SWA KV），
+        # 避免近端 token 在两条分支里被重复计权。
+        has_swa = swa is not None and self.swa is not None
+        win = 0 if has_swa else self.sparse_window
+        n_chunk = 0 if has_swa else n_q
+        # SWA 开启时全局 pattern 必须按**块对齐起点**取：stride 集合依赖起点，
+        # 若用查询位置（解码时 start=total）会与预填充的块起点不一致，
+        # 近端 token 就会同时出现在"全局列"和"SWA 列"里被重复计权（解码≠全前向）。
+        blk_start = (start // max(1, self.sparse_chunk)) * max(1, self.sparse_chunk) \
+            if has_swa else start
         cols_c: torch.Tensor | None = None
         cols_pos: torch.Tensor | None = None
         if self.compress_ratio > 1 and c_kv is not None and kr_raw is not None:
             # 压缩路径（V4.1 CSA2(ratio, mode)）：远端 main KV 压成 m 块列，
             # 本地窗口 + 当前块保持未压缩（SWA KV 不压缩，逐层本地）。
-            blk_ids = self._far_block_ids(total, start).to(k_full.device)
-            local = torch.arange(
-                max(0, start - self.sparse_window), end, device=k_full.device)
+            blk_ids = self._far_block_ids(total, blk_start, win).to(k_full.device)
+            lo = max(0, start - win)
+            local = (torch.arange(lo, end, device=k_full.device) if n_chunk
+                     else torch.zeros(0, dtype=torch.long, device=k_full.device))
             c_blk, k_blk, v_blk, blk_end = self._compressed_columns(
                 c_kv, kr_raw, blk_ids)
             k_cols = torch.cat([k_blk, k_full[:, :, local, :]], dim=2).contiguous()
             v_cols = torch.cat([v_blk, v_full[:, :, local, :]], dim=2).contiguous()
             # 静态列 = 压缩块列 + 窗口列（窗口全 < start，对块内所有查询可见）
-            n_near = local.numel() - n_q
+            n_near = local.numel() - n_chunk
             cols_c = torch.cat([c_blk, c_kv[:, local[:n_near]]], dim=1)
             cols_pos = torch.cat([blk_end, local[:n_near]])
             n_static = blk_ids.numel() + n_near
         else:
             idx, n_static = select_keys(
-                total, start, end, self.sparse_sink, self.sparse_window, self.sparse_stride)
+                total, blk_start, blk_start + n_chunk,
+                self.sparse_sink, win, self.sparse_stride)
             idx = idx.to(k_full.device)
             # 聚集 key（index_select 可微，反向走 index_add）
             k_cols = k_full[:, :, idx, :].contiguous()  # (b, h, K, d)
@@ -360,7 +442,30 @@ class SparseMLAModule(MLAModule):
         scale = q_c.shape[-1] ** -0.5
         scores = torch.matmul(q_c, k_cols.transpose(-1, -2)) * scale
         mask = chunk_causal_mask(
-            end - start, n_static, end - start, q_c.device, scores.dtype)
+            n_q, n_static, n_chunk, q_c.device, scores.dtype)
+        # 层内 SWA 列（同一次 softmax）：拼在最后，掩码换成带状窗口（对块内所有查询）
+        n_swa = 0
+        if has_swa:
+            k_swa, kr_swa, v_swa, swa_pos = swa
+            if k_swa.shape[1] > 0:
+                swa_pos = swa_pos.to(q_c.device)
+                # SWA 的 K 也按**绝对位置**旋转（局部顺序必须可辨）；
+                # 环里存未加 rope 的原料，读时现算（rope 只占 qk_rope_dim）
+                _rc = self.rope_cos.shape[0]
+                _ri = swa_pos.clamp(max=_rc - 1)
+                kr_swa = apply_rope_wrap(
+                    kr_swa, self.rope_cos[_ri], self.rope_sin[_ri])
+                k_swa = torch.cat(
+                    [k_swa, kr_swa.unsqueeze(2).expand(
+                        -1, -1, self.n_heads, -1)], dim=-1)
+                k_swa = k_swa.transpose(1, 2).to(scores.dtype)
+                v_swa = v_swa.transpose(1, 2).to(scores.dtype)
+                n_swa = k_swa.shape[2]
+                s_swa = torch.matmul(q_c, k_swa.transpose(-1, -2)) * scale
+                scores = torch.cat([scores, s_swa], dim=-1)
+                q_pos = torch.arange(start, end, device=q_c.device)
+                band = self.swa.band_mask(q_pos, swa_pos)
+                mask = torch.cat([mask, band.to(mask.dtype)], dim=-1)
         sel: IndexerSelect | None = None
         kl: torch.Tensor | None = None
         if (self.sparse_indexer and n_static > 0
@@ -392,6 +497,8 @@ class SparseMLAModule(MLAModule):
         probs = F.softmax(scores.float() + mask.float(), dim=-1).to(scores.dtype)
         if self.training and self.dropout > 0:
             probs = F.dropout(probs, p=self.dropout)
+        if n_swa > 0:
+            v_cols = torch.cat([v_cols, v_swa], dim=2)
         return torch.matmul(probs, v_cols), sel, kl
 
     def _full_qkv_for_gather(
@@ -416,42 +523,180 @@ class SparseMLAModule(MLAModule):
         reserve: int = 0,
         reuse: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         csa_sel: "CsaChannel | None" = None,
+        write_cache: bool = True,
+        swa_floor: int = 0,
     ) -> tuple[torch.Tensor, tuple | None]:
         """稀疏前向：短序列/解码缓存命中时退化为 dense 等价，超长才分块聚集.
 
         reuse: 跨层复用（CSA2）最近生产者的 main KV latent 缓存；None=正常自算。
         csa_sel: CSA2 层间选择通道（仅 `sparse_indexer` 开启时非 None）——生产者
             （full/reindex）写、消费者（reindex/reuse）读；短序列走 dense 时不参与。
+        write_cache=False：**只读**解码（SWA Bounded Replay 用）——全局主 KV 的
+            行已由权威前向写好，重放只重建 SWA 环，绝不覆盖权威值（V4.1 §3.2.2
+            "reusing the cached global KV without recomputation or overwriting"）。
+        swa_floor：SWA 列的下界（重放起点 s），见 `_swa_read`。
         """
         b, t, _ = h.shape
         if past is not None:
-            return self._decode(h, past, csa_sel)
+            return self._decode(h, past, csa_sel, write_cache=write_cache,
+                                swa_floor=swa_floor)
         self._last_indexer_aux = None  # 每次前向重算（赋值语义，梯度检查点重算幂等）
         self._last_indexer_kl = None
         if reuse is not None:
             # 跨层复用：Q 自算、K/V 借共享 latent（短序列走 dense，超长走分块聚集）
-            # 压缩开启时恒走分块路径：dense 用未压缩 latent，与压缩表示不一致。
-            if self.compress_ratio == 1 and t <= self.sparse_threshold:
+            # 压缩/SWA 开启时恒走分块路径：dense 用未压缩 latent、且不走层内
+            # SWA（近端走全局窗口），与解码路径分叉。
+            if (self.compress_ratio == 1 and self.swa is None
+                    and t <= self.sparse_threshold):
                 return super().forward(h, None, return_state, reserve, reuse)
             q_full = self._q_only(h)
             k_full, v_full = self._kv_from_latent(reuse[0], reuse[1], total=t)
+            swa_kv = self.swa.project(h) if self.swa is not None else None
             out = self._run_blocks(
                 q_full, k_full, v_full, h, t, c_kv=reuse[0], csa_sel=csa_sel,
-                kr_raw=reuse[1])
-            return self._out_proj(out), (reuse if return_state else None)
-        if self.compress_ratio == 1 and t <= self.sparse_threshold:
+                kr_raw=reuse[1], swa_kv=swa_kv)
+            if not return_state:
+                return self._out_proj(out), None
+            # 只借生产者的全局主 KV（buf/pos），**SWA 环必须各建各的**：层内
+            # SWA 是本层自己的分支，若整份 past 元组照抄，解码时两层会往同一个
+            # 环里写、彼此覆盖（pitfall 38）。
+            packed = (reuse[0], reuse[1], reuse[2])
+            if swa_kv is not None:
+                packed = packed + self._pack_swa(
+                    *swa_kv, t, self._swa_capacity(1))
+            return self._out_proj(out), packed
+        if (self.compress_ratio == 1 and self.swa is None
+                and t <= self.sparse_threshold):
             # 短序列：与 MLAModule 逐位一致（reserve 透传装箱）
             return super().forward(h, None, return_state, reserve)
-        # 长序列分块预填充（压缩开启时短序列也走这里）
+        # 长序列分块预填充（压缩/SWA 开启时短序列也走这里：dense 兜底路径不带
+        # 层内 SWA，若短 prompt 走 dense、解码走 SWA，两者必然分叉）
         q_full, k_full, v_full, c_kv, k_rope_raw = self._full_qkv_for_gather(h)
+        # SWA 全量投影：prefill 的**每个**查询都要有自己的 SWA 列，
+        # 否则前段输出与全前向分叉（Bounded Replay 只作用于"重建缓存"，
+        # 不削减 prefill 的注意力范围）；环另由 `_pack_swa` 建（定长）。
+        swa_kv = self.swa.project(h) if self.swa is not None else None
         out = self._run_blocks(
             q_full, k_full, v_full, h, t, c_kv=c_kv, csa_sel=csa_sel,
-            kr_raw=k_rope_raw)
+            kr_raw=k_rope_raw, swa_kv=swa_kv)
         if not return_state:
             return self._out_proj(out), None
         # 缓存仍存 latent（与 MLA 一致，200K 上下文每 token 仅 ~320B/层），
         # 静态装箱（reserve 由 _prefill 按 prompt+max_new 精确给出）
-        return self._out_proj(out), self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
+        packed = self._pack_cache(c_kv, k_rope_raw, max(reserve, t))
+        if swa_kv is not None:
+            # 环只服务**之后**的单 token 解码 → 容量 `window`（多 token 解码时
+            # `_grow_swa_rings` 再按需扩），绝不按 prompt 长度建环
+            packed = packed + self._pack_swa(*swa_kv, t, self._swa_capacity(1))
+        return self._out_proj(out), packed
+
+    def empty_swa_rings(
+        self, t: int = 1, batch: int = 1,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """新建三个空环（容量 `window + max(0, t-1)`，行号 = 位置 % 容量）.
+
+        SWA Bounded Replay 的起点：环从空开始，重放过程中按位置逐行写入，
+        环里只会有重放段 `[s, total)` 的内容——这正是论文"把 SWA 截断到
+        重放段"的实现（更早的 SWA 键不复存在，也就不可能被读到）。
+        """
+        assert self.swa is not None, "本层未开 SWA（swa_window=0）"
+        cap = self._swa_capacity(t)
+        k = torch.zeros(batch, cap, self.n_heads, self.swa.head_dim,
+                        device=device, dtype=dtype)
+        kr = torch.zeros(batch, cap, self.swa.qk_rope_dim,
+                         device=device, dtype=dtype)
+        return k, kr, torch.zeros_like(k)
+
+    def _swa_capacity(self, t: int = 1) -> int:
+        """SWA 环容量：`window + max(0, t-1)`.
+
+        单 token 解码只需 `window` 行；多 token 增量（投机验证一次喂 t 个）需要
+        查询并集 `[start-window+1, end)` 共 `window + t - 1` 行，否则最前面几个
+        查询会读到被覆盖的槽位（与"环 = 窗口"的直觉冲突，见 pitfalls 34）。
+        """
+        return self.swa.window + max(0, int(t) - 1)
+
+    def _pack_swa(
+        self, k: torch.Tensor, kr: torch.Tensor, v: torch.Tensor,
+        pos_end: int, cap: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """把本层 SWA 的 k/kr/v 尾巴装进**定长环**（行号 = 绝对位置 % 容量）.
+
+        SWA 存储与序列长度无关（V4.1：窗口定长 → 与 L 无关），这是它相对
+        全局主 KV 的根本优势；环只保留最近 `window + max(0, t-1)` 个位置
+        （t = 之后可能一次解码的 token 数：预填充给 1、多 token 解码给 t）。
+        `pos_end` 是最后写入 token 的绝对位置 +1，尾巴按绝对位置右对齐写。
+
+        注意 `cap` 与 `pos_end` 必须分开传：预填充时 `pos_end=L` 而 `cap=window`
+        ——若按 `window+L-1` 建环，SWA 缓存就退化成 O(L)，与"存储有界"矛盾
+        （pitfall 34）。
+        """
+        b = k.shape[0]
+        k_ring = torch.zeros(b, cap, self.n_heads, self.swa.head_dim,
+                             device=k.device, dtype=k.dtype)
+        kr_ring = torch.zeros(b, cap, self.swa.qk_rope_dim,
+                              device=k.device, dtype=k.dtype)
+        v_ring = torch.zeros_like(k_ring)
+        # k/kr/v 可能只覆盖尾部（Bounded Replay）：按**绝对位置**右对齐写入
+        t_proj = k.shape[1]
+        n = min(t_proj, cap)
+        rows = torch.arange(pos_end - n, pos_end, device=k.device) % cap
+        k_ring[:, rows] = k[:, t_proj - n:t_proj]
+        kr_ring[:, rows] = kr[:, t_proj - n:t_proj]
+        v_ring[:, rows] = v[:, t_proj - n:t_proj]
+        return k_ring, kr_ring, v_ring
+
+    def _grow_swa_rings(
+        self, rings: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        pos: int, need: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """扩容环（多 token 解码超过 slack 时）：按位置重映射有效槽位.
+
+        旧环里的有效位置是 `[pos - cap_old, pos)`（行号 = 位置 % cap_old），
+        新环容量取 2x 与 `need` 的较大者；重映射后旧槽位仍可按 `位置 % cap_new` 命中。
+        """
+        cap_old = rings[0].shape[1]
+        if cap_old >= need:
+            return rings
+        cap_new = max(cap_old * 2, need)
+        b = rings[0].shape[0]
+        n_old = min(cap_old, pos)
+        old_pos = torch.arange(pos - n_old, pos, device=rings[0].device)
+        src = old_pos % cap_old
+        dst = old_pos % cap_new
+        out = []
+        for ring, width in zip(rings, (None, self.swa.qk_rope_dim, None)):
+            if ring.dim() == 4:  # (b, cap, n_heads, head_dim)
+                new = torch.zeros(b, cap_new, ring.shape[2], ring.shape[3],
+                                  device=ring.device, dtype=ring.dtype)
+            else:
+                new = torch.zeros(b, cap_new, width,
+                                  device=ring.device, dtype=ring.dtype)
+            new[:, dst] = ring[:, src]
+            out.append(new)
+        return tuple(out)
+
+    def _swa_read(
+        self, rings: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        start: int, end: int, floor: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """从环里取查询 [start, end) 需要的 SWA 列（升序绝对位置）.
+
+        需要的并集 = `[start - n_win + 1, end)`；行号按 `pos % cap` 映射，
+        位置 < 0 的部分裁掉（序列开头本无历史）。
+        `floor` 给 SWA Bounded Replay 用：论文口径"重放起点 s 之后，查询 i 只看
+        `[max(s, i-W+1), i]`"——重放段之前的位置**根本没进环**，必须靠 floor
+        显式裁掉，否则会读到环里未初始化的零行（软注意力照付权重）。
+        """
+        n_win = self.swa.window
+        k_ring, kr_ring, v_ring = rings
+        cap = k_ring.shape[1]
+        lo = max(0, int(floor), start - n_win + 1)
+        pos = torch.arange(lo, end, device=k_ring.device)
+        rows = pos % cap
+        return k_ring[:, rows], kr_ring[:, rows], v_ring[:, rows], pos
 
     def _run_blocks(
         self,
@@ -463,8 +708,12 @@ class SparseMLAModule(MLAModule):
         c_kv: torch.Tensor,
         csa_sel: "CsaChannel | None" = None,
         kr_raw: torch.Tensor | None = None,
+        swa_kv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """分块聚集注意力并返回 `(b, t, n_heads*head_dim)`（头维已并回特征维）.
+
+        `swa_kv=(k_swa, kr_swa, v_swa)`（本层 SWA 全序列投影）给定时，
+        每块再切出 `[start-window+1, end)` 的 SWA 列一起参与同一次 softmax。
 
         生产者（full/reindex）逐块写通道；消费者（reindex/reuse）先按块序从通道
         读前层的选择（生产者先于消费者执行，故读到的一定是同一次 forward 里
@@ -477,9 +726,20 @@ class SparseMLAModule(MLAModule):
             e = min(s + self.sparse_chunk, t)
             # 消费者按 `csa_src` 读最近生产者的同块选择（生产者先执行故已就绪）
             shared = (csa_sel.get(self.csa_src, i) if csa_sel is not None else None)
+            swa_cols = None
+            if swa_kv is not None:
+                off = t - swa_kv[0].shape[1]      # 投影起点（Bounded Replay）
+                lo = max(off, s - self.swa.window + 1)
+                if e > lo:
+                    swa_cols = (
+                        swa_kv[0][:, lo - off:e - off],
+                        swa_kv[1][:, lo - off:e - off],
+                        swa_kv[2][:, lo - off:e - off],
+                        torch.arange(lo, e, device=h.device))
             o, sel, kl = self._sparse_scores(
                 q_full[:, :, s:e, :].contiguous(), k_full, v_full, s, e, t,
-                c_kv=c_kv, h_c=h[:, s:e], shared=shared, kr_raw=kr_raw)
+                c_kv=c_kv, h_c=h[:, s:e], shared=shared, kr_raw=kr_raw,
+                swa=swa_cols)
             if (sel is not None and csa_sel is not None
                     and self.csa_mode in ("full", "reindex")
                     and self.csa_index is not None):
@@ -501,17 +761,24 @@ class SparseMLAModule(MLAModule):
         h: torch.Tensor,
         past: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         csa_sel: "CsaChannel | None" = None,
+        write_cache: bool = True,
+        swa_floor: int = 0,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """增量解码：latent 缓存展开后按 pattern 聚集（短上下文自动退化为全量）.
 
         静态缓存版：按位写进预分配缓冲（不再 `cat`），pattern 按实际长度算
         （gather 下标全落在有效区，无需额外掩码，与 cat 版逐位一致）。
+
+        `write_cache=False` 为 SWA Bounded Replay 的只读模式：全局主 KV 的
+        `[pos, pos+t)` 行已由权威前向写好，重放只重建 SWA 环，不重写全局
+        （V4.1 §3.2.2）。此时 `pos` 是**回退**后的重放起点。
         """
         b, t, _ = h.shape
-        buf_c, buf_kr, pos = past
+        buf_c, buf_kr, pos = past[0], past[1], past[2]
+        rings = tuple(past[3:6]) if len(past) > 3 else None
         self._last_indexer_aux = None  # 解码不算蒸馏损失（推理路径）
         self._last_indexer_kl = None
-        if not self.csa_reuse:
+        if not self.csa_reuse and write_cache:
             # 生产者（Full 层）：按位写自己的 latent；Reindex/Reuse 跳过
             # （共享缓冲已由生产者写好，两者都借 main KV）
             w_idx = pos.reshape(1) + torch.arange(t, device=h.device)
@@ -543,17 +810,37 @@ class SparseMLAModule(MLAModule):
         v_full = v.transpose(1, 2)
         # 查询即最后 t 个位置：select_keys(total, total-t, total)，t==1 时与旧式一致；
         # t>1 为投机解码并行验证服务（块内因果由 chunk_causal_mask 保证）
+        swa_cols = None
+        if self.swa is not None:
+            k_swa, kr_swa, v_swa = self.swa.project(h)
+            if rings is None:
+                # 兼容旧缓存（无 SWA 环）：本步现场补一个（后续步即走环）
+                rings = self._pack_swa(k_swa, kr_swa, v_swa, total,
+                                       self._swa_capacity(t))
+            else:
+                rings = self._grow_swa_rings(
+                    rings, int(pos.item()), self._swa_capacity(t))
+                cap = rings[0].shape[1]
+                rows = ((pos.reshape(1) + torch.arange(t, device=h.device))
+                        % cap)
+                rings = tuple(
+                    ring.index_copy(1, rows, new.to(ring.dtype)).clone()
+                    for ring, new in zip(rings, (k_swa, kr_swa, v_swa)))
+            swa_cols = self._swa_read(rings, total - t, total, floor=swa_floor)
         out, sel, _kl = self._sparse_scores(
             q_full, k_full, v_full, total - t, total, total, c_kv=buf_c, h_c=h,
             shared=(csa_sel.get(self.csa_src, 0) if csa_sel is not None else None),
-            kr_raw=buf_kr)
+            kr_raw=buf_kr, swa=swa_cols)
         if (sel is not None and csa_sel is not None
                 and self.csa_mode in ("full", "reindex")
                 and self.csa_index is not None):
             # 解码单块：生产者把本步选择写进自己的槽（后续层同一步内读）
             csa_sel.put(self.csa_index, 0, sel)
         out = out.transpose(1, 2).contiguous().view(b, t, -1)
-        return self._out_proj(out), (buf_c, buf_kr, pos_next)
+        new_past = (buf_c, buf_kr, pos_next)
+        if self.swa is not None:
+            new_past = new_past + tuple(rings)
+        return self._out_proj(out), new_past
 
 
 def apply_rope_wrap(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:

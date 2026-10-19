@@ -174,6 +174,10 @@ EMA 影子评测 + 冠军快照兜底——分阶段的手工课程已被这三�
 - 检索融合：`--enable-retro --retro-db <pickle>`（RETRO-lite，BM25 捞回片段拼成前缀
   mem 段；索引用 `scripts/build_retrieval.py` 构建）；V2 交错用
   `--retro-every N --retro-len L`（每 N 层融合 token 级 chunk，frozen 编码）；
+- 层内 SWA：`--swa-window N`（V4.1：每层自带的滑动窗口分支，缓存是**定长环**、
+  与序列长度无关；开启后近端全交给它、全局分支只出 sink/stride 远端条目；
+  落盘只存全局 KV，读回用"最近 N 个 token"重放重建环。窗口建议 ≤512——环比主 KV 还贵。
+  详见 `docs/details/per-layer-swa.md`）；
 - 会话落盘：`SessionCache`（MLA latent / 线性状态 / 卷积尾跨 turn、跨进程存取，
   库侧组件，服务进程按会话 id 复用）；
 - 超连接残差：`--hyper-streams 2`（mHC-lite，n 路流混合 + 动态写回，恒等起点；
@@ -195,6 +199,7 @@ python -m pytest tests/ -q
 | 注意力 | Gated-DeltaNet-lite 线性注意力 | O(N) 计算、O(1) 状态，因果卷积 + 门控 | `linear_attn.py`（Qwen3-Next 系） |
 | 注意力 | Hybrid 交替（1 全 : 3 线性） | 质量与效率平衡 | `block.py` |
 | 注意力 | 轻量稀疏注意力（汇点 + 窗口 + 跨步） | 让 200K 可算，阈值下等价 dense | `sparse_attn.py`（DSA 思想简化） |
+| 注意力 | 层内 SWA + 有界重放（`swa_window`，默认关） | 每层自带滑动窗口（缓存定长、与序列长度无关），落盘只存全局 KV、读回重放重建 | `sparse_attn.py`（V4.1 §3.2） |
 | MoE | 细粒度 MoE + 共享专家 + aux | 128M 参数/每 token 激活 48M | `moe.py`（DeepSeek 系） |
 | 训练目标 | MTP 额外头（预测 t+2） | 训练信号加密，推理关闭 | `model.py`（DeepSeek 系） |
 | 位置 | RoPE + YaRN | 8K 训练外推 200K 推理 | `rope.py` |

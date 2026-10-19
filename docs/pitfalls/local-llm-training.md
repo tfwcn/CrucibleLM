@@ -542,3 +542,128 @@ kernel**，我们没实现——文档必须诚实写明"这里省的是选择�
 
 
 
+## 34. SWA 环的"容量"与"位置"是两个数：按 prompt 长度建环，存储就有界不了
+
+**现象**：层内 SWA（`swa_window>0`）第一版把"环容量"和"最后写入位置"合成一个参数传：
+`_pack_swa(k, kr, v, t)` 里 `cap = window + t - 1`。看起来天经地义——"多 token 解码
+需要 `window+t-1` 行"。但预填充时 `t = prompt 长度`，于是 8K prompt 直接建了一个
+8192 行的环：**SWA 缓存退化成 O(L)**，"窗口定长、存储与序列长度无关"这条论文卖点
+被自己写没了，而且没人会注意到——`kv_cache_bytes` 的加法项还写着 `window`。
+
+**机制**：环里真正需要的只有"之后解码可能读到的位置" `[pos-window+1, pos+1)`，
+与"这次一次喂了几个 token"无关。预填充只需要装**最后 `window` 个**（解码第一步只读这么远），
+多 token 解码的 slack 是**之后**才需要的，可以由 `_grow_swa_rings` 按需 2x 扩。
+
+**教训**：
+- `_pack_swa(k, kr, v, pos_end, cap)` 把 `cap` 与 `pos_end` **拆成两个参数**：
+  预填充 `pos_end=L, cap=window`；多 token 解码 `cap=window+t-1`。写错时行为"看起来正常"
+  （输出对），只有显存曲线会慢慢露馅。
+- 环行号一律用 `位置 % cap`（不是 `% window`）——扩容后旧槽位才还能按新模命中
+  （`_grow_swa_rings` 按位置重映射就是为此）。
+- 回归锁：`test_ring_is_bounded_and_grows_only_for_multi_token`（40 token 预填充后环仍是
+  8 行；4 步解码才扩到 16）+ `test_kv_cache_swa_term_is_seq_independent`
+  （`kv_cache_bytes` 的 L 增量里一字节 SWA 都不含）。
+
+## 35. 层内 SWA 只活在**分块路径**里：短 prompt 走 dense 兜底就会"预填充没 SWA、解码有 SWA"
+
+**现象**：`sparse_threshold` 以下的短序列原本走 `MLAModule.forward` 的 dense 兜底
+（省掉 pattern/gather 的开销）。开了层内 SWA 后，dense 兜底**不带** SWA 列（它连
+`SparseMLAModule` 的分块逻辑都不进），而解码路径（`_decode`）恒带 SWA 列——
+于是同一个模型"短 prompt 预填充"与"解码续写"看到两种注意力范围，前几步就开始分叉。
+更阴的是：短 prompt 恰恰是 agent 多轮会话的常态，这是主战场。
+
+**机制**：SWA 的列在 `_run_blocks`/`_decode` 里拼进同一次 softmax，dense 兜底是另一条
+完全独立的实现（`MLAModule`），没有"层内 SWA"这个概念。开关一开，两条路径的
+注意力集合就不同了。
+
+**教训**：
+- `swa_window>0` 时**恒走分块路径**（和 `compress_ratio>1` 同一条处理：
+  `if self.compress_ratio == 1 and self.swa is None and t <= self.sparse_threshold`），
+  `sparse_threshold` 在 SWA 开启后失效。
+- 顺带一个同源教训：SWA 开启后全局 pattern 的 **stride 集合依赖起点**
+  （`range(0, start, stride)`），解码时 `start=total`、预填充时 `start=块起点`，
+  两者取的静态列不同 → 近端 token 会同时出现在"全局列"和"SWA 列"里被**计权两次**。
+  所以 `blk_start = (start // sparse_chunk) * sparse_chunk`，让解码与预填充按同一块起点取
+  （多 token 一步解码只在**块对齐**时与全前向等价，单测按 `sparse_chunk` 对齐喂）。
+- 回归锁：`test_short_prompt_also_uses_swa_path`（t=4、threshold=8 时环里有 4 行且
+  `prefill+decode == 全前向`）+ `test_prefill_plus_decode_matches_full_forward`（块对齐）。
+
+## 36. 共享 latent 缓冲扩容必须按**对象身份**去重，否则借用层读到旧副本
+
+**现象**：`SessionCache.ensure_room` 逐层"容量不够就新建一个更大的缓冲、拷旧有效区"。
+CSA2 的 Reindex/Reuse 层与生产者的 `buf_c`/`buf_kr` 是**同一个张量对象**（共享缓存）。
+逐层各建一份以后，生产者写进自己那份新的，借用层手里还是旧副本——**从扩容那一刻起，
+借用层看到的历史就冻结在扩容前**。不报错、不崩，只是回答慢慢变蠢；只有单轮长会话
+（首次分配之后还要扩容）才踩得到。
+
+**机制**：`ensure_room` 按"层"遍历、按"层"分配，而物理上缓存是**按对象**共享的。
+同源问题还有：`_decode` 里 `pos` 是各层自己的张量，值相等但对象不同——所以去重键必须
+是**张量对象身份**（`id(tensor)`），不是"层号"或"位置值"。
+
+**教训**：
+- 扩容分三遍：① 按 `id(t)` 汇总每块旧张量的目标容量（共享缓冲取各请求的**最大**）；
+  ② 每块旧张量只新建一次；③ 回填时用 `fresh.get(id(p[0]))`，未扩容的层保持原对象。
+- SWA 环是**定长**的，扩容时原样续接（`tuple(p[3:])`），绝不重建、绝不按 `pos` 改形状。
+- 回归锁：`test_ensure_room_keeps_shared_buffer_identity`（扩容后借用层与生产者仍是
+  **同一个** `id`，且环容量不变）。
+
+## 37. 部分接受的投机解码与定长环不兼容：影子 token 的环行会被后来者读到
+
+**现象**：投机解码一次并行验证 `t` 个草稿 token，主干前向会把 `t` 个 token 的 SWA K/V
+**全部**写进环（`index_copy_` 按 `pos+i` 落位）；部分接受时只确认前 `j` 个，`pos` 回退到
+`pos+j`。全局主 KV 没事（读位置由 `pos` 决定，超出的行不会被 gather），但**环的行号是
+`位置 % cap`**：被拒草稿写下的行，其绝对位置落在窗口内、又 `< 之后某步的查询位置`，
+后续解码会把它们当作真实历史读走。
+
+**机制**：全局主 KV 是"按位置 gather"的稀疏读；环是"覆盖写 + 按位置取模"的密集结构，
+两者对"写了但没确认"的容忍度不同。环没有版本号/掩码来表达"这几行是草稿"。
+
+**教训**：
+- `swa_window>0` 时 `_spec_eligible` 直接返回 `False`（先保正确性；正常生成仍走
+  `_decode_step`，不受影响）。要恢复这条组合，需要给环加"有效到哪一位"的游标
+  （或接受后重放被拒段），别靠"反正会被覆盖"的侥幸。
+- 同样的思路适用于任何"多 token 一步写缓存 + 部分提交"的组合（块稀疏 kernel、连续批）。
+- 回归锁：`test_speculative_decoding_disabled_under_swa`（开 SWA 时 `_spec_eligible` 恒 False）。
+
+## 38. 借用层不能照抄生产者的整份 `past`：SWA 环会**别名**，两层互相覆盖
+
+**现象**：CSA2 借用层（Reindex/Reuse）预填充后直接 `return self._out_proj(out), reuse`
+——"缓存反正是共享的，原样返回最省事"。开了层内 SWA 后，`past` 元组尾部多了三个环，
+于是两层拿到的是**同一份环对象**；解码时两层各自 `index_copy_` 写自己的 SWA K/V 到同一个环，
+后写覆盖先写，下一层再读到的就是别人的 K/V。全前向（预填充）一切正常，
+**只有增量解码**分叉——而且差得不多，不写回归测试根本看不出来。
+
+**机制**：CSA2 共享的是**全局主 KV**（`buf_c`/`buf_kr`，以及 Reindex 的 indexer K），
+而 SWA 是**每层自带**（V4.1：each layer retains its own ... SWA KV）。共享边界画错，
+就把"每层自带的局部记忆"也共享了。
+
+**教训**：
+- 借用层只照抄前三个元素：`packed = (reuse[0], reuse[1], reuse[2])`，环由本层
+  `_pack_swa(自己的 swa 投影)` 现建；解码路径同理（环来自 `past[3:]`，各层各的）。
+- 判断"该不该共享"的口径：**这东西是生产者算出来的表示**（共享）还是**本层 hidden 的产物**（不共享）。
+- 回归锁：`test_reuse_layers_carry_their_own_swa`（借用层环非空且与生产者**不是**同一对象）
+  + `test_reuse_swa_decode_matches_full_forward`（回退这行修复后该测试必失败——已验证）。
+## 39. 重放时线性注意力状态要**清零重建**，不能沿用缓存末态（那是重复计入）
+
+**现象**：SWA Bounded Replay 第一版对线性注意力层（hybrid 里的
+Gated-DeltaNet-lite）想"状态不可回退，那就沿用缓存里的末态"，省事且看起来
+只影响"重放段"这一小段。实测（base 规模 / 64 token 会话 / `n_win=128`）：
+重放后下一步 hidden 与真值差 **2.99e-1**，环差 **2.18**；而把线性状态清零后
+是 **4.2e-6 / 1.3e-5**——差了四个数量级，且"无环冷启动"是 3.47。也就是说
+"沿用末态"几乎和"不重建"一样糟。
+
+**机制**：末态是**已经含过**重放段（乃至整段）贡献的递推状态。重放时逐 token
+再喂一遍 = 同一批 token 被计入两次；更糟的是 `start=0` 的整段重放里，末态
+还含着重放段之后的"未来"信息——这是与因果性直接矛盾的输入，不只是精度问题。
+清零则恰好是论文口径："把 SWA（以及本仓的线性记忆）截断到重放段"——从段首
+以零状态重新累积；`n_win ≥ 已缓长度` 时它本来就从零重建，故逐位精确。
+
+**教训**：
+- 重建"段内状态"一律从**段首的初始状态**开始（清零），然后把权威缓存当只读
+  输入；`n_win < 已缓长度` 时丢掉的是段首之前的长程递推记忆——那是**有意的**
+  截断，和 SWA 截断同一语义，不是 bug。
+- 判断口径：重放**只允许从权威缓存里读**（全局主 KV、位置），**绝不允许写；
+  也绝不允许把"末态"当起点**——两者都会把重放变成自证。
+- 回归锁：`test_bounded_replay_rebuilds_hybrid_state_from_segment`（hybrid 下
+  整段重放 `1e-5` 内精确）**外加对照**：手写"沿用末态"的版本误差必须大 100 倍
+  ——防止有人图省事改回去。

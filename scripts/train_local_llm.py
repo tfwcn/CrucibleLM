@@ -139,6 +139,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
                         "读不到 checkpoint 架构则保守按 1）")
+    p.add_argument("--swa-window", type=int, default=None,
+                   help="层内 SWA 窗口（V4.1：每层自带滑动窗口注意力，窗口定长、"
+                        "缓存与序列长度无关）；0=关（默认）。改键（新增 swa.*），旧 ckpt 需重训")
     p.add_argument("--compress-ratios", type=str, default=None,
                    help="CSA2 逐层主 KV 压缩比（V4.1，如 '2' 或 '1,2'，按全注意力层序号"
                         "循环）：m=每条目聚合的连续 token 数（不重叠），远端按 m 块池化、"
@@ -869,6 +872,10 @@ def main(argv=None) -> int:
         _srcs = sorted(config.kv_source_set())
         print(f"CSA2 非均匀 KV 源层已开：生产者层 {_srcs}（其余全注意力层复用最近"
               f"生产者的 main KV；间距可任意非均匀）", flush=True)
+    if config.swa_window > 0:
+        print(f"层内 SWA 已开（V4.1）：窗口 {config.swa_window} token/层，"
+              f"缓存为定长环（与序列长度无关）；全局主 KV 只出选中条目",
+              flush=True)
     if arch_src.get("compress_ratios") == "checkpoint":
         print("CSA2：沿用 checkpoint 的压缩比表 "
               f"compress_ratios={config.compress_ratios!r}", flush=True)

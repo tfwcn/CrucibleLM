@@ -146,6 +146,16 @@ class SmallLLMConfig:
     # 注意：压缩开启后该层恒走分块路径（短序列也不再走 dense），否则同一模型在
     # 短/长序列会看到两种 KV 表示；且借用层（reuse/reindex）沿用生产者的压缩比。
     compress_ratios: str = ""
+    # 层内 SWA 窗口（V4.1：**每层**自带滑动窗口注意力，与全局主 KV 完全独立）：
+    # 0 = 关（默认，无新增参数/键，逐位兼容旧 ckpt）；n>0 时每层多一条
+    # `swa.w_k`/`swa.w_kr`/`swa.w_v` 分支（**改键** → opt-in），窗口 n 个 token，
+    # 缓存为定长环（`(2*n_heads*head_dim + qk_rope_dim)*n` 个元素/层，**与序列长度
+    # 无关**；落盘默认丢环，读回用最近 n 个 token 重放重建）。
+    # 全局主 KV 只出"选中条目"（论文：selected entries + layer-local SWA KV），
+    # 本地近端完全由 SWA 承担；`sparse_window` 仅在 SWA 关闭时才有意义。
+    # 窗口别照搬 `sparse_window`：环是逐 token 的满维 K/V，n 大时环比主 KV 还贵
+    # （base 规模 n=4096 时 3 层共 38.6MB，比 32K 全局主 KV 的 21MB 还多），建议 ≤512。
+    swa_window: int = 0
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
@@ -556,6 +566,8 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "kv_source_layer_ids": ("", _norm_layer_ids),
     # 逐层主 KV 压缩比（V4.1）；改 state_dict 键（m>1 的层新增 z_cmp），旧 ckpt 回退空=全 1
     "compress_ratios": ("", _norm_compress_ratios),
+    # 层内 SWA（V4.1）；改 state_dict 键（新增 swa.*），旧 ckpt 回退 0=关
+    "swa_window": (0, _norm_nonneg_int),
 }
 
 

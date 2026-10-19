@@ -14,6 +14,7 @@
 - [CSA2 跨层 KV 复用：相邻层共享 latent](./csa-kv-reuse.md)
 - [CSA2 三模式：复用 KV，但不必交出选择权](./csa-modes.md)
 - [主 KV 压缩比：一个条目代表 m 个 token](./kv-compression-ratio.md)
+- [层内 SWA：每层自己的"近处记忆" + 有界重放](./per-layer-swa.md)
 - [RoPE 与 YaRN：位置和外推](./rope-yarn.md)
 
 ## 前馈与目标

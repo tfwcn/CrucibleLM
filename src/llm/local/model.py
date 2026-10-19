@@ -77,6 +77,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         vocab_size=config.vocab_size,
         csa_mode=csa_mode,
         compress_ratio=config.compress_ratio_of(layer_idx),
+        swa_window=config.swa_window,
     )
     if full:
         # 层序号：CSA2 选择通道按层号键控，生产者写、借用者读（见 CsaChannel）
@@ -577,10 +578,14 @@ class TinyLLM(nn.Module):
         self, nxt: torch.Tensor, pasts: list,
         retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
         engram_ids: torch.Tensor | None = None,
+        write_cache: bool = True,
+        swa_floor: int = 0,
     ) -> tuple[torch.Tensor, list]:
         """单 token 步进各层：返回 (新 hidden, 新缓存），供流式/批量生成共用.
 
         engram_ids: Engram 上下文 id（(b, L≥max_order)，右对齐到本步 token）。
+        write_cache=False / swa_floor：只读重放（SWA Bounded Replay），见
+        `SparseMLAModule.forward` 与 `TinyLLM.replay_swa_from_ids`。
         """
         hh = self.embed(nxt)
         hyper_n = self.config.hyper_streams if self.config.hyper_streams >= 2 else 0
@@ -599,7 +604,9 @@ class TinyLLM(nn.Module):
                 hh = layer.engram(hh, engram_ids)
             hh_norm = layer.norm1(hh)
             if layer.full_attn:
-                a_out, p2 = layer.attn(hh_norm, p, csa_sel=csa_sel)  # type: ignore[call-arg]
+                a_out, p2 = layer.attn(hh_norm, p, csa_sel=csa_sel,
+                                       write_cache=write_cache,
+                                       swa_floor=swa_floor)  # type: ignore[call-arg]
             else:
                 a_out, p2 = layer.attn(hh_norm, p)  # type: ignore[arg-type]
             hh = hh + a_out
@@ -684,13 +691,23 @@ class TinyLLM(nn.Module):
                     if li in lin_steps:
                         plist.append(lin_steps[li][i])
                     else:
-                        buf_c, buf_kr, pos = old_p
-                        plist.append((buf_c, buf_kr, pos + i + 1))
+                        # 兼容三元组（无 SWA）与五元组（层内 SWA 环，定长不随步长变）
+                        buf_c, buf_kr, pos = old_p[0], old_p[1], old_p[2]
+                        plist.append((buf_c, buf_kr, pos + i + 1)
+                                     + tuple(old_p[3:]))
                 step_pasts.append(plist)
         return self.final_norm(hh), new_pasts, step_pasts
 
     def _spec_eligible(self, input_ids: torch.Tensor, temperature: float) -> bool:
-        """是否走投机解码：需开关开、batch=1、纯贪心（temperature=0）."""
+        """是否走投机解码：需开关开、batch=1、纯贪心（temperature=0）.
+
+        层内 SWA 开启时**禁用**：并行验证一次喂 `t` 个 token，部分接受时
+        缓存里已写进了未接受 token 的 SWA 环行（位置却落在窗口内），后续
+        解码会把"影子 token"的 K/V 当真实历史读走（pitfall 37）。
+        先保证正确性，再谈这条组合的收益（正常生成仍走 `_decode_step`）。
+        """
+        if int(getattr(self.config, "swa_window", 0)) > 0:
+            return False
         return bool(self.config.draft_enabled) and input_ids.shape[0] == 1 \
             and temperature == 0.0
 
@@ -897,6 +914,79 @@ class TinyLLM(nn.Module):
         return self.final_norm(h)
 
     @torch.no_grad()
+    def replay_swa_from_ids(
+        self, ids: torch.Tensor, pasts: list,
+        retro_mem: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+    ) -> list:
+        """SWA Bounded Replay：只重放最近 `n_win` 个 token 重建各层 SWA 环.
+
+        V4.1 §3.2.2 的部署口径：持久化缓存只存**全局主 KV**（无法重建），
+        SWA 环定长、可重建，故不必落盘；恢复时重放最近 `n_win` 个 token
+        近似重建（精确重建要 `L × n_win`，有效感受野 << `n_win`）。
+
+        实现严格对着论文那段话：
+        - "replay the last n_win tokens ... **reusing the cached global KV
+          without recomputation or overwriting**"——重放走只读解码
+          （`write_cache=False`），全局主 KV 只读不写，权威值一个字节都不动；
+        - "for a replay starting at position s, a query at position i attends to
+          SWA keys in `[max(s, i-W+1), i]`"——环从空开始（`empty_swa_rings`）
+          且读时带 `floor=s`，重放段之前的 SWA 键根本不存在，也就读不到；
+        - 逐层各自重放：SWA 的 K/V 来自**本层输入 hidden**，所以必须真跑前向。
+
+        近似来源（写进文档，不粉饰）：
+        1. 重放段各层的输入 hidden 由"全局读权威 + SWA 截断到 s"共同决定，
+           与真值只在 SWA 局部键上有偏差；
+        2. **线性注意力层的递推状态不回退，而是清零点**（`start=0` 整段重放时它
+           本来就从零重建，故逐位精确；`start>0` 时等价于"在重放起点放弃更早的
+           递推记忆"，与 SWA 截断同一语义）。**不能沿用缓存末态**：末态已经含
+           重放段的贡献，再喂一遍就是重复计入，实测下一步 hidden 误差 3e-1
+           （清零 4e-6，无环冷启动 3.5）——比"近似"更糟，是矛盾状态（pitfall 39）。
+
+        返回新的 `pasts`：全局主 KV 与 pos 用**权威原值**，SWA 环换成重放结果。
+        """
+        n_win = self.config.swa_window
+        if n_win <= 0 or not pasts:
+            return pasts
+        p0 = pasts[0]
+        if not (isinstance(p0, tuple) and len(p0) >= 3
+                and isinstance(p0[2], torch.Tensor) and p0[2].numel() == 1):
+            return pasts
+        total = int(p0[2].item())
+        start = max(0, total - n_win)
+        # ids 只是记账用、可常驻 CPU（长会话省显存）；这里按模型设备临时搬一份
+        ids = ids.to(p0[0].device)
+        ctx = ids[:, :total] if ids.shape[1] >= total else ids
+        tail = ctx[:, start:]
+        t_tail = int(tail.shape[1])
+        # 重放用缓存：pos 回退到 start；SWA 环清空；线性层状态清零（见 docstring 第 2 条）
+        replay: list = []
+        for layer, p in zip(self.layers, pasts):
+            if not (isinstance(p, tuple) and len(p) >= 3
+                    and isinstance(p[2], torch.Tensor) and p[2].numel() == 1):
+                replay.append(tuple(
+                    torch.zeros_like(x) if isinstance(x, torch.Tensor) else x
+                    for x in p))
+                continue
+            rings: tuple = ()
+            if (bool(getattr(layer, "full_attn", False))
+                    and getattr(layer.attn, "swa", None) is not None):
+                cap0 = p[0]
+                rings = layer.attn.empty_swa_rings(
+                    1, batch=cap0.shape[0], device=cap0.device,
+                    dtype=cap0.dtype)
+            replay.append((p[0], p[1], p[2] - t_tail) + rings)
+        for i in range(t_tail):
+            _, replay = self._decode_step(
+                tail[:, i:i + 1], replay, retro_mem=retro_mem,
+                engram_ids=ctx[:, :start + i + 1], write_cache=False,
+                swa_floor=start)
+        # 取重放出的 SWA 环 + 权威的全局主 KV / pos
+        out: list = []
+        for p, r in zip(pasts, replay):
+            out.append(tuple(p[:3]) + tuple(r[3:]) if len(r) > 3 else p)
+        return out
+
+    @torch.no_grad()
     def encode_last_hidden(self, input_ids: torch.Tensor) -> torch.Tensor:
         """取末位置 hidden（输入定长/单条时用；变长 batch 请用 full+gather）.
 
@@ -990,8 +1080,17 @@ class TinyLLM(nn.Module):
         CSA2 跨层复用时，Reuse 层不新增 KV 缓存（借最近 Full 层），故只计 Full 层。
         """
         c = self.config
+        # 主 KV：逐 token 增长（CSA2 压缩比 m 只改"条目表示"，缓存布局仍逐 token）
         mla_per_layer = (c.kv_lora_rank + c.qk_rope_dim) * seq_len * dtype_bytes
         lin_per_layer = c.n_heads * (c.d_model // c.n_heads) ** 2 * dtype_bytes
+        # 层内 SWA：定长环（k/v 各 n_heads*head_dim + 共享 rope 键 n_win*qk_rope_dim）
+        # ——**与序列长度无关**，故这里是加法项而不是乘 seq_len 项
+        # （V4.1 的"SWA 存储有界，与 L 无关"）；SWA 是**每层自带**，不随 Reuse 减少
+        swa_per_layer = 0
+        if c.swa_window > 0:
+            head_dim = c.d_model // c.n_heads
+            swa_per_layer = (2 * c.n_heads * head_dim + c.qk_rope_dim) \
+                * c.swa_window * dtype_bytes
         n_full = c.n_full_layers
         n_lin = c.n_layers - n_full
         # 统计真正存 KV 的全注意力层（非 Reuse）
@@ -1001,4 +1100,5 @@ class TinyLLM(nn.Module):
             and not getattr(layer.attn, "csa_reuse", False))
         if n_store == 0:
             n_store = n_full
-        return n_store * mla_per_layer + n_lin * lin_per_layer
+        return (n_store * mla_per_layer + n_lin * lin_per_layer
+                + n_full * swa_per_layer)

@@ -24,10 +24,10 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 1 | SwiGLU 限幅 `swiglu_limit` | ✅ | `moe.py` |
 | 2 | 免辅助损失路由（sqrtsoftplus + noaux_tc + routed_scaling） | ✅ | `moe.py` |
 | 3 | CSA2 三模式 Full/Reindex/Reuse | ✅ `csa_modes`（空=旧 Full/Reuse 交替；Reindex 无 indexer 时数学上=Reuse） | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
-| 4 | 逐层压缩比 `compress_ratios` + KV 源层（非均匀） | ✅ 压缩比 `compress_ratios`（远端 m 块池化 + 学习权重 `z_cmp`、本地窗口不压缩；KV **显存**布局重构待随 #7）+ KV 源层非均匀（`kv_source_layer_ids`，任意间距） | `config.py`/`sparse_attn.py`/`model.py` |
+| 4 | 逐层压缩比 `compress_ratios` + KV 源层（非均匀） | 🔶 压缩比 `compress_ratios`（远端 m 块池化 + 学习权重 `z_cmp`、本地窗口不压缩）；KV 源层非均匀（`kv_source_layer_ids`，任意间距）；**KV 显存未降**（池化在读取时做，缓存仍逐 token 存 latent——`L/m` 的块主序布局重构待做，未压缩窗口半边已由 #7 的定长环补上） | `config.py`/`sparse_attn.py`/`model.py` |
 | 5 | 分层稀疏 indexer（学习式 top-K + 块级候选池） | ✅ 开关 `sparse_indexer`（默认关，改键）+ 蒸馏损失 `indexer_loss_coef` | `sparse_attn.py` |
 | 6 | CED 编码器-解码器（上半层全局 KV 由 L/2 层投影，省近半预填充） | ❌ | `model.py`/`block.py` |
-| 7 | 每层 SWA + SWA Bounded Replay | 🔶 hybrid 骨架 | `sparse_attn.py` |
+| 7 | 每层 SWA + SWA Bounded Replay | ✅ 开关 `swa_window`（每层自带独立投影分支，与全局条目同一次 softmax；定长环缓存与序列长度无关；落盘只存全局 KV，读回有界重放重建；SWA 下禁用投机解码） | `config.py`/`sparse_attn.py`/`model.py`/`session_cache.py` |
 | 8 | FP4 主 KV（MXFP4 + QAT）+ FP8 SWA KV | ❌ | `mla.py`/`optim.py` |
 | 9 | MLA 分组输出投影 `o_lora_rank` + `o_groups` | ✅ | `mla.py` |
 | 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | 🔶 mHC-lite | `hyperconn.py` |

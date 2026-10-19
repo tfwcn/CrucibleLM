@@ -192,6 +192,15 @@ GPU 利用率低时先看 CPU 是否被 parquet 解码/分词占满。
   indexer Q 重选 Top-K）/ **Reuse**（直接用最新 Top-K）。Reindex 让"复用 KV"不必
   连"选择权"一起交出；无 indexer 时 Reindex 数学上退化为 Reuse。选择经前向内通道
   按**层号**键控传递（梯度检查点重算安全）。详见 `docs/details/csa-modes.md`。
+- 层内 SWA（可选，`swa_window`，0=关）：**每层自带**一条滑动窗口分支（`SwaBranch`：
+  `w_k`/`w_kr`/`w_v` 独立投影 + 自己的 `k_norm`），与全局稀疏条目拼进**同一次 softmax**
+  （V4.1：`selected entries together with the layer-local SWA KV`）；开启后近端（窗口 +
+  当前块）**全交给 SWA**，全局分支只出 sink/stride 远端条目（`sparse_window` 失效）。
+  缓存是三个**定长环**（行号 = 位置 % 容量，容量 `n_win + max(0,t-1)`）→ 存储与序列长度
+  无关；落盘默认 `drop_swa=True` 只存全局 KV，读回用**有界重放**（最近 `n_win` 个 token
+  只读解码重建环，全局 KV 一字节不动）近似恢复。`swa_window>0` 恒走分块路径（dense 兜底
+  不带层内 SWA）且**禁用投机解码**（部分接受的影子行会被读到）。
+  详见 `docs/details/per-layer-swa.md`、pitfalls 34/35/37/38。
 - 线性层超 `linear_chunk`（默认 2048）切块递推：前向精确，反向块间截断
   （Transformer-XL 式）；另修了两处训推不一致：跨块项补 `×scale`、
   解码补卷积状态缓存（否则每步 k/v 与全前向对不上，Mamba 系同理）。
@@ -352,6 +361,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `kv_source_layer_ids`("") | CSA2 **非均匀** KV 源层（V4.1，如 `"2,8,14,20"`）：只决定"谁生产"（表内全注意力层为 Full 生产者，其余复用最近生产者），间距任意；**不改 `state_dict` 键**，续训/迁移沿用 checkpoint。详见 `docs/details/csa-modes.md` | `config.py`/`model.py` |
 | `compress_ratios`("") | CSA2 **逐层主 KV 压缩比**（V4.1 `CSA2(ratio, mode)` 的 ratio）：整数表按全注意力层序号循环（`"2"` / `"2,1"`），m = 每个 main KV 条目聚合的**连续 token 数**（不重叠）。m>1 时远端按 m 块池化（块内逐位置可学习权重 `z_cmp`，初值 1=算术平均），本地窗口/当前块保持未压缩，块尾作 rope 代表位置；同样列数预算下远端表示的 token 数 ×m。**默认关**（m>1 新增 `z_cmp`、改键，旧 ckpt 需重训；续训从 hparams 沿用）；压缩开启后该层恒走分块路径（`sparse_threshold` 失效）；借用层沿用生产者的 m 与 `z_cmp`。KV **显存**尚未下降（池化在读取时做，缓存仍逐 token 存 latent，布局重构随 #7）。详见 `docs/details/kv-compression-ratio.md` | `config.py`/`sparse_attn.py`/`model.py` |
 | `csa_modes`("") | CSA2 三模式静态分配（V4.1）：`full,reindex,reuse` 逗号分隔、按全注意力层序号循环（别名 `f`/`ri`/`re`）；非空时**覆盖** `csa_reuse_every`。**改语义但不改 `state_dict` 键**（旧 Full/Reuse 权重可直接互载，装载需 `sync_arch_from_checkpoint` 对齐来源）；Reindex 只在 `sparse_indexer` 开启时才与 Reuse 有区别。详见 `docs/details/csa-modes.md` | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
+| `swa_window`(0) | 层内 SWA（V4.1：**每层**自带滑动窗口分支，与全局 KV 独立）：窗口 token 数，n>0 时每层新增 `swa.w_k`/`swa.w_kr`/`swa.w_v` + 自己的 `k_norm`，与全局稀疏条目拼进**同一次 softmax**；开启后近端（窗口+当前块）全交给 SWA（`sparse_window` 失效），全局分支只出 sink/stride 远端条目。缓存是**定长环**（`n_win+max(0,t-1)` 行，`kv_cache_bytes` 里是不含 `seq_len` 的加法项）；落盘默认 `drop_swa=True` 只存全局 KV，`SessionCache.load` 用**有界重放**（最近 `n_win` 个 token 只读解码重建环）近似恢复（`drop_swa=False` 则逐位精确）。**默认关**（改 `state_dict` 键，旧 ckpt 需重训；续训从 hparams 沿用）；开启后恒走分块路径（dense 兜底不带层内 SWA）且**禁用投机解码**。窗口建议 ≤512（环比主 KV 还贵）。详见 `docs/details/per-layer-swa.md` | `config.py`/`block.py`/`sparse_attn.py`/`model.py`/`session_cache.py` |
 | `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 | `o_groups`(1) / `o_lora_rank`(0) | MLA 分组低秩输出投影（V4.1：8/1024）：按头分组、每组压到 `o_lora_rank` 再拼接升维。**默认关**（改 `state_dict` 键，旧 ckpt 无法直接载入）；开启需重训或 `scripts/migrate_model.py --o-groups G --o-lora-rank r`（SVD 迁移，近似）。详见 `docs/details/mla-grouped-output.md` | `mla.py`/`migrate.py` |
 | `sparse_indexer`(False) / `indexer_heads`(4) / `indexer_head_dim`(64) / `indexer_topk`(64) / `indexer_block`(8) / `indexer_pool_blocks`(32) / `indexer_loss_coef`(0.01) | 分层稀疏 indexer（V4.1：32 头/128 维/top-k 512/2048 块×8）：学习式 top-K 主 KV + 块级候选池，打分器用蒸馏损失训练（DSA：拟合主注意力分布，目标 detach；系数只缩放 indexer 学习步长，**0=不训**）。**默认关**（新增 `w_iq`/`w_ik` 改 `state_dict` 键，旧 ckpt 无法直接载入，需重训）；只影响长序列（`t > sparse_threshold`），短序列 dense 逐位不变。详见 `docs/details/sparse-indexer.md` | `sparse_attn.py` |
