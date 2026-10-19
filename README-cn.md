@@ -164,7 +164,9 @@ EMA 影子评测 + 冠军快照兜底——分阶段的手工课程已被这三�
 ## 进阶开关（默认全关，详见 docs/ARCHITECTURE.md）
 
 - 长上下文：`longctx_config()` 200K 推理（YaRN×8 + 稀疏 MLA），训练走"短训 + 外推 + 分阶段微调"；
-- 优化器：`--optimizer muon`（约 2x 效率，优化器显存减半）；
+- 优化器：`--optimizer muon`（约 2x 效率，优化器显存减半）；再叠 `--muon-head-wise`
+  （Q/K 按头分块正交化）与 `--sinkhorn`（embedding/头/Engram 表改动量+Sinkhorn，
+  优化器状态再 −50%）；
 - 学习效率：`--rho-keep`（RHO 选择）、`--curriculum`（课程）、`--ema-*`（EMA 影子）、`--replay-*`（回放池）；
 - 跨词表蒸馏：`--kd-teacher`（MiniCPM 0.5B，锚点 KL）；
 - 架构迁移：`scripts/migrate_model.py`（加深/加宽/裁剪 + `--init-checkpoint` 续训）；

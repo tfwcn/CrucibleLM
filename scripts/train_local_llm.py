@@ -75,6 +75,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
                    help="优化器：adamw（默认，稳妥）或 muon（约 2x 效率，2D 隐藏权重走 Muon 其余走 AdamW）")
     p.add_argument("--muon-lr", type=float, default=0.02, help="Muon 部分峰值学习率")
+    p.add_argument("--muon-head-wise", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="head-wise Muon（V4.1）：Q/K 的上投影按**头**分块后各自正交化，"
+                        "每头一个预条件器（默认关，需 A/B）")
+    p.add_argument("--sinkhorn", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Sinkhorn 更新（V4.1）：embedding/lm_head/Engram 表用"
+                        "动量+Sinkhorn 平衡替代 Adam（只存一份动量，默认关，需 A/B）")
+    p.add_argument("--sinkhorn-lr-scale", type=float, default=0.18,
+                   help="Sinkhorn 组的有效学习率系数 γ（论文 0.18，对齐 Adam 更新幅度）")
+    p.add_argument("--sinkhorn-steps", type=int, default=11,
+                   help="Sinkhorn 行/列交替归一化步数 K（论文 11，须为奇数）")
     p.add_argument("--kd-teacher", default="",
                    help="蒸馏老师权重目录（空=关闭；如 data/teacher-0.5b，跨词表锚点 KL）")
     p.add_argument("--kd-alpha", type=float, default=0.5, help="蒸馏 loss 权重")
@@ -1039,8 +1051,20 @@ def main(argv=None) -> int:
     if args.optimizer == "muon":
         from src.llm.local.optim import build_hybrid_optimizer
 
-        optim = build_hybrid_optimizer(model, muon_lr=args.muon_lr, adam_lr=args.lr)
-        print(f"优化器：Muon+AdamW（muon_lr={args.muon_lr}，adam_lr={args.lr}）", flush=True)
+        optim = build_hybrid_optimizer(
+            model, muon_lr=args.muon_lr, adam_lr=args.lr,
+            head_wise=args.muon_head_wise, n_heads=model.config.n_heads,
+            sinkhorn=args.sinkhorn, sinkhorn_lr_scale=args.sinkhorn_lr_scale,
+            sinkhorn_steps=args.sinkhorn_steps)
+        _gs = getattr(optim, "group_sizes", {})
+        print(f"优化器：Muon+AdamW（muon_lr={args.muon_lr}，adam_lr={args.lr}）"
+              f"分组 {_gs}"
+              + ("｜head-wise Muon 已开（Q/K 按头分块）" if args.muon_head_wise else "")
+              + (f"｜Sinkhorn 已开（γ={args.sinkhorn_lr_scale}，K={args.sinkhorn_steps}）"
+                 if args.sinkhorn else ""), flush=True)
+    elif args.sinkhorn or args.muon_head_wise:
+        raise SystemExit(
+            "--sinkhorn / --muon-head-wise 需要 --optimizer muon（AdamW 只有一组，无从分组）")
     else:
         optim = build_optimizer(model, lr=args.lr)
     ckpt_dir = Path(args.ckpt_dir)

@@ -34,8 +34,8 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | 🔶 小表 + 短卷积 | `engram.py` |
 | 12 | MTP 深度 3 | ✅ | `model.py` |
 | 13 | DSpark 独立训练草稿模块（3 层 + Markov 头 + 置信头 + 吞吐调度） | 🔶 仅解码启发式 | `spec_decode.py` |
-| 14 | head-wise Muon（Q/K 按头分块） | 🔶 整块 Muon | `optim.py` |
-| 15 | Sinkhorn 更新（embedding/head 用 momentum+Sinkhorn 替 Adam） | ❌ | `optim.py` |
+| 14 | head-wise Muon（Q/K 按头分块） | ✅ 开关 `--muon-head-wise`（w_uq/w_qr/w_uk 按头切块逐头 NS5，bmm 批量、与逐头循环逐位一致） | `optim.py` |
+| 15 | Sinkhorn 更新（embedding/head 用 momentum+Sinkhorn 替 Adam） | ✅ 开关 `--sinkhorn`（Algorithm 1：Nesterov + 近零行屏蔽 + K=11 行/列交替归一化 + γ=0.18；只存一份动量，实测优化器状态 −50%） | `optim.py` |
 | 16 | 视觉：patch14 + 3×3 downsample | 🔶 downsample 对齐 | `vision_compress.py` |
 | 17 | 1M 上下文（64K 稀疏起训 + YaRN 外推） | 🔶 默认 8K / 长上下文 200K | `config.py` + 训练 |
 | 18 | 可控推理努力（1–100 整数档） | ❌ | 推理 / 后训练 |

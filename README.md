@@ -170,7 +170,9 @@ replace manual staged curriculum. Starting fully loaded from step 0 works too
 
 - Long context: `longctx_config()` for 200K inference (YaRN×8 + sparse MLA); train short,
   extrapolate, then staged long-context finetuning;
-- Optimizer: `--optimizer muon` (~2x efficiency, half optimizer memory);
+- Optimizer: `--optimizer muon` (~2x efficiency, half optimizer memory); stack
+  `--muon-head-wise` (Q/K split per head) and `--sinkhorn` (momentum + Sinkhorn
+  balancing for embedding/head/Engram tables; another -50% optimizer state);
 - Learning efficiency: `--rho-keep` (RHO selection), `--curriculum`, `--ema-*` (EMA shadow),
   `--replay-*` (replay buffer);
 - Cross-tokenizer distillation: `--kd-teacher` (MiniCPM 0.5B, anchor KL);

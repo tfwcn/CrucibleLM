@@ -29,7 +29,8 @@
 
 ## 优化器与学习效率
 
-- [Muon](./muon.md)
+- [Muon（含 head-wise）](./muon.md)
+- [Sinkhorn 更新：token×特征大矩阵的公平步长](./sinkhorn-update.md)
 - [RHO：只学不会的](./rho.md)
 - [EMA：影子冠军](./ema.md)
 - [回放与课程](./replay.md)

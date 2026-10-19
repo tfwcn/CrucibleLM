@@ -223,13 +223,24 @@ from src.llm.local.model import TinyLLM
 model = TinyLLM(longctx_config())  # 推理：generate() 支持 200K（含稀疏解码）
 ```
 
-## 优化器：Muon（`--optimizer muon`）
+## 优化器：Muon（`--optimizer muon`）+ head-wise + Sinkhorn
 
 2D 隐藏权重走 Muon（Newton-Schulz 正交化动量，`optim.py`），embedding/norm 等
 走 AdamW。约 2x 计算效率（Moonshot/Kimi 路线），优化器状态减半。
 `--muon-lr` 默认 0.02（与 `--lr` 分开调度，同形状余弦）。注意：
 Muon 存盘与 AdamW 不互通，切换优化器删 `optim.pt` 重开动量即可（权重不受影响）；
 Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
+
+两个 V4.1 §2.5 的可选升级（默认都关，需 A/B）：
+
+| 开关（默认） | 作用 | 文件 |
+|---|---|---|
+| `--muon-head-wise`(False) | **head-wise Muon**：Q/K 的上投影（`w_uq`/`w_qr`/`w_uk`）按**头**切成 `(H, per, in)` 后逐头正交化——每头一个预条件器，处理注意力头异质性。`(H,per,in)` 用 `bmm` 批量 NS5，与逐头循环逐位一致。详见 `docs/details/muon.md` | `optim.py` |
+| `--sinkhorn`(False) / `--sinkhorn-lr-scale`(0.18) / `--sinkhorn-steps`(11) | **Sinkhorn 更新**：embedding / `lm_head` / Engram 表（token×特征大矩阵）改用"动量 + Nesterov + 行/列交替 L2 归一化"，`Δ=√n·Uᴷ`、有效 lr `γη`、**不做 wd**；只存一份动量（Adam 两份）。近零行按 `ρ_i≤τ·ρ̄` 屏蔽（τ=1e-3，**不可省**，否则噪声被放大成信号）。详见 `docs/details/sinkhorn-update.md` | `optim.py` |
+
+分组后优化器的 `state_dict()` 带 `kind` 标记（`muon+headwise+sinkhorn+adamw`）：
+**开关组合变了就早失败**（分组→状态的映射变了，静默错配不报错但曲线全变），
+提示删 `optim.pt`——权重照常复用，只丢动量（pitfall 44）。
 
 ## 记忆层与 RETRO（`engram.py` / `memory.py` / `retro.py`，可选，默认关）
 

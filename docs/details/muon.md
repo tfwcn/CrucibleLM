@@ -1,6 +1,8 @@
 # Muon：2D 权重的正交化动量优化器
 
-> 一句话：隐藏层矩阵用"正交化梯度"更新，又快又省显存；embedding/norm 还是 AdamW，各干各的。
+> 一句话：隐藏层矩阵用"正交化梯度"更新，又快又省显存；**Q/K 上投影按头分块**
+> （head-wise，每头一个预条件器）；embedding/norm 还是 AdamW（或 Sinkhorn，见
+> [sinkhorn-update](./sinkhorn-update.md)），各干各的。
 
 ## 痛点
 
@@ -36,14 +38,33 @@ router 这些向量/特殊参数继续 AdamW——不同形状不同脾气，硬
 - 注意：Muon 存盘和 AdamW **不互通**——切换优化器要删 `optim.pt` 重开动量
   （权重不受影响，只丢动量，warmup 几天就回来）
 
+### head-wise Muon（V4.1 §2.5，`--muon-head-wise`）
+
+把 Muon 看成**预条件梯度下降**：原版给所有头共用**一个**预条件器，而注意力头
+之间是异质的（不同头学不同模式），共用一个预条件器等于强行把它们的更新形状
+拉齐。head-wise 的做法是：Q/K 的上投影按**头**切块（每头一段连续行
+`head_dim × in`），**每个块各自**做 Newton-Schulz——每头一个预条件器。
+论文实测优于原版 Muon（GLM5 / Kimi-K3 同样验证）。
+
+- 实现：`head_split_columns()` 把 `(n_heads*per, in)` 切成 `(H, per, in)`，
+  `zeropower_batched_newtonschulz5()` 用 `bmm` 一次处理所有头（与逐头循环的普通
+  NS5 **逐位一致**，单测锁定）；
+- 作用于 `w_uq`（Q 内容上投影）、`w_qr`（Q 的 rope 部分）、`w_uk`（K 上投影）；
+  `w_uv`/下投影**不切**（论文口径是"Q and K weights"）；
+- 行数必须能被头数整除，否则早失败（说明不是按头堆叠的权重）。
+
 ## 从想法到代码
 
-队列操就是"正交化动量"，2D 才用（向量继续 AdamW）：
+队列操就是"正交化动量"，2D 才用（向量继续 AdamW）；Q/K 再按头切一层：
 
 ```python
 # 2D 隐藏权重走 Muon，其余走 AdamW（build_hybrid_optimizer 按形状分流）
 M = newton_schulz(momentum)   # 正交化：方向留下，大小抹平
 W -= muon_lr * M              # muon_lr 与 AdamW 的 lr 分开调度
+
+# head-wise（V4.1）：Q/K 上投影按行切成 H 块，逐头正交化
+heads = W.view(H, rows // H, cols)          # 每头一段连续行
+W -= muon_lr * batched_ns5(heads).reshape_as(W)
 ```
 
 ## 代价与坑
@@ -51,6 +72,10 @@ W -= muon_lr * M              # muon_lr 与 AdamW 的 lr 分开调度
 - Muon 偏好大 batch：小 batch 下噪声把正交化带偏，反而不如 AdamW 稳。
   batch×accum 太小就别开。
 - 混合优化器意味着两套 lr 调度，看曲线时确认看的是哪条（日志都记了）。
+- **head-wise 的批量 NS5 要按头 reshape**：`(H, per, in)` 的 `bmm` 与逐头循环等价，
+  但**不能**把整行视作一个矩阵（那就退化成原版 Muon 了）。
+- 优化器分组变了（head_wise/sinkhorn 开关切换）→ 旧 `optim.pt` 的分组对不上，
+  装载时**早失败**并提示删 `optim.pt`（权重照常复用，只丢动量）。
 
 ## 一句话总结
 
