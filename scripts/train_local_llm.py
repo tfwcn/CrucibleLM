@@ -954,7 +954,7 @@ def main(argv=None) -> int:
     if config.hyper_streams >= 2:
         print(f"mHC：Single-Pass={config.hc_single_pass}"
               f"（{arch_src.get('hc_single_pass', 'default')}，"
-              f"输入混合用上一层的 A_{l-1}）、"
+              f"输入混合用上一层的 A[l-1]）、"
               f"Mega={config.hc_mega}（{arch_src.get('hc_mega', 'default')}）、"
               f"Sinkhorn {config.hc_sinkhorn_iters} 轮", flush=True)
     if arch_src.get("engram_fp8") == "checkpoint":
