@@ -83,6 +83,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         swa_window=config.swa_window,
         ced=is_ced_dec,
         kv_quant=config.kv_quant,
+        block_cache=bool(getattr(config, "kv_block_cache", False)),
     )
     if full:
         # 层序号：CSA2 选择通道按层号键控，生产者写、借用者读（见 CsaChannel）
@@ -153,6 +154,8 @@ class TinyLLM(nn.Module):
     def __init__(self, config: SmallLLMConfig):
         super().__init__()
         self.config = config
+        # 块主序缓存的前提校验（压缩比>1 + 层内 SWA 且窗口 ≥ m）：早失败
+        self.block_cache = config.block_cache_validated()
         self.embed = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = nn.ModuleList([
             build_block(config, i)
@@ -1166,17 +1169,18 @@ class TinyLLM(nn.Module):
         CSA2 跨层复用时，Reuse 层不新增 KV 缓存（借最近 Full 层），故只计 Full 层。
         """
         c = self.config
-        # 主 KV：逐 token 增长（CSA2 压缩比 m 只改"条目表示"，缓存布局仍逐 token）；
-        # `kv_quant` 非空时按量化格式计（fp4 4.5 bit/通道、fp8 8.5 bit/通道）
+        # 主 KV：逐 token 增长；块主序缓存（#4）下每层只存 `ceil(L/m)` 行（行值 =
+        # m 个 token 的块均值），`kv_quant` 非空时按量化格式计（fp4 4.5 bit/通道、
+        # fp8 8.5 bit/通道）。**逐层算**：混合压缩比时各层行数不同。
         if c.kv_quant:
             from src.llm.local.kv_quant import kv_bytes_per_token
 
-            mla_per_layer = (
+            row_bytes = (
                 kv_bytes_per_token(c.kv_lora_rank, c.kv_quant)
                 + kv_bytes_per_token(c.qk_rope_dim, c.kv_quant, block=16)
-            ) * seq_len
+            )
         else:
-            mla_per_layer = (c.kv_lora_rank + c.qk_rope_dim) * seq_len * dtype_bytes
+            row_bytes = (c.kv_lora_rank + c.qk_rope_dim) * dtype_bytes
         lin_per_layer = c.n_heads * (c.d_model // c.n_heads) ** 2 * dtype_bytes
         # 层内 SWA：定长环（k/v 各 n_heads*head_dim + 共享 rope 键 n_win*qk_rope_dim）
         # ——**与序列长度无关**，故这里是加法项而不是乘 seq_len 项
@@ -1196,12 +1200,23 @@ class TinyLLM(nn.Module):
                     * c.swa_window * dtype_bytes
         n_full = c.n_full_layers
         n_lin = c.n_layers - n_full
-        # 统计真正存 KV 的全注意力层（非 Reuse）
-        n_store = sum(
-            1 for layer in self.layers
-            if getattr(layer, "full_attn", False)
-            and not getattr(layer.attn, "csa_reuse", False))
+        # 统计真正存 KV 的全注意力层（非 Reuse），并按该层自己的行数计费
+        n_store = 0
+        mla_bytes = 0
+        for layer in self.layers:
+            if not getattr(layer, "full_attn", False):
+                continue
+            if getattr(layer.attn, "csa_reuse", False):
+                continue
+            n_store += 1
+            if getattr(layer.attn, "block_cache", False):
+                m = max(1, int(getattr(layer.attn, "compress_ratio", 1)))
+                # 块行 ceil(L/m) + 定长 m 行暂存前缀（残块里逐 token 暂存）
+                rows = m + (seq_len + m - 1) // m
+            else:
+                rows = seq_len
+            mla_bytes += row_bytes * rows
         if n_store == 0:
             n_store = n_full
-        return (n_store * mla_per_layer + n_lin * lin_per_layer
-                + n_full * swa_per_layer)
+            mla_bytes = row_bytes * seq_len
+        return (mla_bytes + n_lin * lin_per_layer + n_full * swa_per_layer)

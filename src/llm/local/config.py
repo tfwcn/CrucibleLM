@@ -184,6 +184,12 @@ class SmallLLMConfig:
     # **默认关**：改缓存数值（精度损失）且改缓存布局（扩容器走 QuantBuffer）。
     # 真省存储：FP4 相对 bf16 约 3.4x（latent+rope 一起算），相对 FP8 约 1.9x。
     kv_quant: str = ""
+    # 块主序缓存（V4.1 #4 的显存半边）：`compress_ratio>1` 时**缓存只存池化后的块行**
+    # （每 m 个 token 折成一行，凑满即一次池化+量化），于是主 KV 行数 `L → m+ceil(L/m)`。
+    # 代价与前提：近端不再由主 KV 的逐 token 窗口提供——**必须开层内 SWA**
+    # （`swa_window>=m`，论文里近端正是由 SWA 环承担的），否则当前块的 token 无处可读。
+    # 默认关（改缓存布局 + 依赖 SWA 组合；不改 state_dict 键，续训从 hparams 沿用）。
+    kv_block_cache: bool = False
     # 线性注意力分块阈值：超长时切块递推（前向精确，反向块内截断），线性层 O(N^2) 的解药
     linear_chunk: int = 2048
     # RETRO 融合：False=模块不存在（state_dict 兼容）；True=末层后加 cross-attention
@@ -373,6 +379,32 @@ class SmallLLMConfig:
                 f"（full_attn_every={self.full_attn_every}）：线性层的递推状态"
                 "无法从编码器输出投影，预填充跳算会静默算错")
         return split
+
+    def block_cache_validated(self) -> bool:
+        """校验块主序缓存的前提（压缩比>1 且开了层内 SWA），返回是否启用.
+
+        为什么必须开 SWA：块主序把"每 m 个 token"折成一行后，当前块里那不足 m 个
+        token 的原始 K/V 就不在缓存里了——论文的解法是让**层内 SWA** 承担近端。
+        没有 SWA 时这些 token 无处可读（会静默丢掉最近 m-1 个 token），故构建期拒绝。
+        还要求 `swa_window >= max(m)`：否则块边界左侧那 `start % m` 个 token
+        落在 SWA 窗口之外，查询根本看不到它们（静默丢上下文）。
+        """
+        if not bool(self.kv_block_cache):
+            return False
+        ratios = self.compress_ratio_list()
+        if max(ratios) <= 1:
+            raise ValueError(
+                "kv_block_cache=True 需要 compress_ratios 里有 m>1（无压缩时块行=token 行，没意义）")
+        if int(self.swa_window) <= 0:
+            raise ValueError(
+                "kv_block_cache=True 需要 swa_window>0：块主序缓存不再逐 token 保存近端，"
+                "近端必须由层内 SWA 环承担（否则当前块的 token 读不到）")
+        if int(self.swa_window) < max(ratios):
+            raise ValueError(
+                f"kv_block_cache=True 需要 swa_window >= max(compress_ratios)"
+                f"（当前 {self.swa_window} < {max(ratios)}）：块边界左侧剩余的"
+                f" `位置 % m` 个 token 只能从 SWA 读，窗口不够就会静默丢上下文")
+        return True
 
     def is_ced_decoder(self, layer_idx: int) -> bool:
         """该层是否为 CED 解码器层（全局 KV 由编码器输出投影）."""
@@ -644,6 +676,8 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "ced_prefill_skip": (True, _norm_bool),
     # KV 缓存量化格式（V4.1）；不改 state_dict 键（只改缓存数值/布局），旧 ckpt 回退空=不量化
     "kv_quant": ("", _norm_kv_quant),
+    # 块主序 KV 缓存（#4 显存半边，依赖层内 SWA）；不改键，旧 ckpt 回退关
+    "kv_block_cache": (False, _norm_bool),
 }
 
 

@@ -225,6 +225,7 @@ class SparseMLAModule(MLAModule):
         swa_window: int = 0,
         ced: bool = False,
         kv_fmt: str = "",
+        block_cache: bool = False,
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
@@ -263,6 +264,13 @@ class SparseMLAModule(MLAModule):
             SwaBranch(d_model, n_heads, qk_rope_dim, self.swa_window, dropout)
             if self.swa_window > 0 else None
         )
+        # 块主序主 KV 缓存（V4.1 #4 的显存半边）：m>1 的层把每 m 个 token 折成一行
+        # 存（缓存行数 `L -> ceil(L/m)`）。m=1 的层没有块可折，退回逐 token。
+        # **依赖层内 SWA**：当前块那不足 m 个 token 的近端由 SWA 环承担，否则
+        # 它们根本不在缓存里（构建期已由 `config.block_cache_validated()` 拒绝）。
+        self.block_cache = bool(block_cache) and self.compress_ratio > 1
+        assert not self.block_cache or self.swa is not None, \
+            "kv_block_cache 需要 swa_window>0（近端由层内 SWA 承担）"
         # 最近一次前向的 indexer 辅助损失（已缩放/未缩放；赋值语义，重算幂等）
         self._last_indexer_aux: torch.Tensor | None = None
         self._last_indexer_kl: torch.Tensor | None = None
@@ -345,6 +353,28 @@ class SparseMLAModule(MLAModule):
         n_far = min(n_valid, max(0, (start - win + m - 1) // m))
         return select_block_keys(n_far, self.sparse_sink, self.sparse_stride, m)
 
+    def _project_block_kv(
+        self, c_blk: torch.Tensor, kr_blk: torch.Tensor,
+        blk_end: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """块行 latent → 块列 K/V（rope 用**块尾**位置）.
+
+        "逐 token 池化"（`_compressed_columns`，压缩比模式）与"读池化行"
+        （`_block_columns`，块主序缓存）共用这一段：两条路径的 c_blk 必须是
+        同一个量（块均值），否则同权重下预填充/解码会静默分叉。
+        """
+        b = c_blk.shape[0]
+        _rc = self.rope_cos.shape[0]
+        _bi = blk_end.clamp(max=_rc - 1)
+        kr_rot = apply_rope_wrap(kr_blk, self.rope_cos[_bi], self.rope_sin[_bi])
+        k = self.k_norm(self.w_uk(c_blk).view(b, -1, self.n_heads,
+                                             self.head_dim))
+        v = self.w_uv(c_blk).view(b, -1, self.n_heads, self.head_dim)
+        k = torch.cat(
+            [k, kr_rot.unsqueeze(2).expand(-1, -1, self.n_heads, -1)],
+            dim=-1).transpose(1, 2)
+        return c_blk, k, v.transpose(1, 2), blk_end
+
     def _compressed_columns(
         self, c_src: torch.Tensor, kr_src: torch.Tensor, blk_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -358,16 +388,170 @@ class SparseMLAModule(MLAModule):
                + torch.arange(m, device=c_src.device)[None, :])   # (B, m)
         members = c_src[:, pos]                                    # (b, B, m, r)
         c_blk = (members * self.z_cmp).sum(dim=2) / m
+        if self.block_cache and self.kv_fmt:
+            # 块主序 + 量化：缓存里**存的是块均值再量化一次**的码字，故预填充这条
+            # 现池化路径必须打同一个 fake-quant，否则预填充看未量化均值、解码看
+            # 量化后的行 → 同权重下静默分叉（pitfall 47）。量化-反量化幂等，
+            # 打完后与解码读到的行逐位相同。
+            from src.llm.local.kv_quant import fake_quant
+
+            c_blk = fake_quant(c_blk, self.kv_fmt)
         blk_end = (blk_ids + 1) * m - 1
-        kr_blk = apply_rope_wrap(
-            kr_src[:, pos[:, -1]], self.rope_cos[blk_end], self.rope_sin[blk_end])
-        b = c_src.shape[0]
-        k = self.k_norm(self.w_uk(c_blk).view(b, -1, self.n_heads, self.head_dim))
-        v = self.w_uv(c_blk).view(b, -1, self.n_heads, self.head_dim)
-        k = torch.cat(
-            [k, kr_blk.unsqueeze(2).expand(-1, -1, self.n_heads, -1)],
-            dim=-1).transpose(1, 2)
-        return c_blk, k, v.transpose(1, 2), blk_end
+        return self._project_block_kv(c_blk, kr_src[:, pos[:, -1]], blk_end)
+
+    def _block_columns(
+        self, c_buf: torch.Tensor, kr_buf: torch.Tensor, blk_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """块主序缓存读：直接按块行取（行里存的就是块均值，无需再池化）.
+
+        与 `_compressed_columns` 的区别只在**数据来源**：这里读缓存里已经折好的
+        行（行数 `ceil(L/m)`），那边从逐 token latent 现池化。两者数值同源
+        （写入时用的就是同一个算式），所以同权重下逐位一致。
+        """
+        from src.llm.local.kv_quant import QuantBuffer
+
+        c_src = c_buf.dequant() if isinstance(c_buf, QuantBuffer) else c_buf
+        kr_src = kr_buf.dequant() if isinstance(kr_buf, QuantBuffer) else kr_buf
+        m = self.compress_ratio
+        # 布局：行 `[0, m)` 是暂存前缀（残块里逐 token），块行从第 m 行起
+        rows = m + blk_ids
+        return self._project_block_kv(
+            c_src[:, rows], kr_src[:, rows], (blk_ids + 1) * m - 1)
+
+    def _block_write(
+        self, c_buf, kr_buf, rows: torch.Tensor, vals: torch.Tensor,
+        kr_new: torch.Tensor,
+    ) -> None:
+        """块主序缓存的底层写：把 `vals (b,t,r)` **赋值**到行 `rows (t,)`.
+
+        只做赋值（不做读-改-写）：残块的累加语义由"暂存前缀 + 凑满一次池化"承担，
+        见 `_block_add`。理由：量化缓存上每一步读-改-写都要重新舍入，m 步累积漂移
+        可达数倍量化步长，且与预填充的"一次池化"不是同一个数（pitfall 48）。
+        rope 行取**该行最后一个** token 的未旋转键（`rows` 单调不减时就是组内末次）。
+        """
+        from src.llm.local.kv_quant import QuantBuffer
+
+        if isinstance(c_buf, QuantBuffer):
+            uniq = torch.unique(rows)                      # 升序去重（rows 非降）
+            agg = torch.zeros(c_buf.logical_shape[0], uniq.numel(),
+                              c_buf.logical_shape[-1],
+                              device=vals.device, dtype=vals.dtype)
+            agg.index_copy_(1, torch.searchsorted(uniq, rows), vals.to(agg.dtype))
+            c_buf.write_rows_(uniq, agg)
+        else:
+            c_buf.index_copy_(1, rows, vals.to(c_buf.dtype))
+        # rope 行：每行取最后一个 token（rows 单调不减 → 组内末次出现）
+        last = torch.ones_like(rows, dtype=torch.bool)
+        last[:-1] = rows[1:] != rows[:-1]
+        if isinstance(kr_buf, QuantBuffer):
+            kr_buf.write_rows_(rows[last], kr_new[:, last])
+        else:
+            kr_buf.index_copy_(1, rows[last], kr_new[:, last].to(kr_buf.dtype))
+
+    def _block_scratch(self, c_buf) -> torch.Tensor:
+        """暂存前缀（前 `m` 行）的反量化视图 `(b, m, r)`：一行装一个未凑满块的 token."""
+        from src.llm.local.kv_quant import QuantBuffer
+
+        m = self.compress_ratio
+        if isinstance(c_buf, QuantBuffer):
+            return c_buf.gather_rows(
+                torch.arange(m, device=c_buf.device)).dequant()
+        return c_buf[:, :m]
+
+    def _flush_block(self, c_buf, kr_buf, blk: int) -> None:
+        """残块凑满 m 个 token → 池化成块行（块号 blk，行号 `m + blk`）.
+
+        池化算式与 `_compressed_columns` 完全相同（`Σ z_i⊙c_i/m`），量化缓存下
+        再 `fake_quant` 一次——**块均值只被量化这一次**，预填充与解码因此逐位一致
+        （"边解码边量化"会让每步重新舍入，m 步漂移可达数倍量化步长，见 pitfalls 48）。
+        """
+        from src.llm.local.kv_quant import QuantBuffer, fake_quant
+
+        m = self.compress_ratio
+        pooled = (self._block_scratch(c_buf) * self.z_cmp).sum(dim=1) / m
+        if self.kv_fmt:
+            pooled = fake_quant(pooled, self.kv_fmt)
+        last = torch.tensor([m - 1], device=c_buf.device)
+        kr_last = (kr_buf.gather_rows(last).dequant()
+                   if isinstance(kr_buf, QuantBuffer) else kr_buf[:, last])
+        self._block_write(
+            c_buf, kr_buf, torch.tensor([m + blk], device=c_buf.device),
+            pooled[:, None], kr_last)
+
+    def _block_add(
+        self, c_buf, kr_buf, pos: int,
+        c_new: torch.Tensor, kr_new: torch.Tensor,
+    ) -> None:
+        """把 t 个新 token 写进块主序缓存（**预填充与解码唯一的写路径**）.
+
+        布局（行）：`[0, m)` 暂存前缀，一行一个还没凑满块的 token；
+        `[m, m + n_blk)` 块行，行值 = `Σ_{i<m} z_i ⊙ c_i / m`（块均值）。
+        暂存前缀放在**头部**，`ensure_room` 扩容只动尾部 → 残块不会被搬走。
+
+        三段：① 本步落进"当前残块"的 token 先写暂存（凑满 m 即 `_flush_block`）；
+        ② 中间的完整块直接从本步 latent 池化（不必过暂存）；③ 尾部残块写暂存。
+        这样预填充（一次长 prompt）与解码（逐步）走的是同一段代码、同一个算式，
+        `z_cmp` 的加权、量化的舍入次数都完全一致。
+        """
+        from src.llm.local.kv_quant import fake_quant
+
+        m = self.compress_ratio
+        b, t = c_new.shape[0], c_new.shape[1]
+        # ① 当前残块剩余槽位：`n_a` 个 token 写进暂存前缀的 `pos%m ...` 行
+        n_a = min(t, (pos // m + 1) * m - pos)
+        slots = pos % m + torch.arange(n_a, device=c_new.device)
+        self._block_write(c_buf, kr_buf, slots, c_new[:, :n_a],
+                          kr_new[:, :n_a])
+        if pos % m + n_a == m:                     # 凑满 → 池化成块行
+            self._flush_block(c_buf, kr_buf, pos // m)
+        # ② 中间的完整块：直接池化（块号 pos//m+1 起，接在刚 flush 的块后面）
+        rest = t - n_a
+        n_full = rest // m
+        if n_full:
+            base = n_a
+            members = c_new[:, base:base + n_full * m].view(b, n_full, m, -1)
+            pooled = (members * self.z_cmp).sum(dim=2) / m
+            if self.kv_fmt:
+                pooled = fake_quant(pooled, self.kv_fmt)
+            rows = (m + pos // m + 1
+                    + torch.arange(n_full, device=c_new.device))
+            self._block_write(
+                c_buf, kr_buf, rows, pooled,
+                kr_new[:, base + m - 1:base + n_full * m:m])
+        # ③ 尾部残块：写暂存前缀第 0.. 行，等后续步补齐
+        rem = rest - n_full * m
+        if rem:
+            self._block_write(
+                c_buf, kr_buf, torch.arange(rem, device=c_new.device),
+                c_new[:, -rem:], kr_new[:, -rem:])
+
+    def _pack_cache_block(
+        self, c_kv: torch.Tensor, k_rope_raw: torch.Tensor, reserve: int,
+    ) -> tuple:
+        """装箱**块主序**主 KV 缓存：每 m 个 token 一行（块行数 `ceil(reserve/m)`）.
+
+        总行数 = `m`（暂存前缀）+ `ceil(reserve/m)`（块行）。写入直接复用
+        `_block_add` ← 预填充与解码唯一写路径，保证同权重下两者逐位一致。
+        """
+        from src.llm.local.kv_quant import QuantBuffer
+
+        m = self.compress_ratio
+        b, t, r = c_kv.shape
+        n_rows = m + max(1, (max(int(reserve), t) + m - 1) // m)
+        if self.kv_fmt:
+            c_buf = QuantBuffer.zeros((b, n_rows, r), self.kv_fmt,
+                                      device=c_kv.device)
+            kr_buf = QuantBuffer.zeros(
+                (b, n_rows, k_rope_raw.shape[-1]), self.kv_fmt,
+                device=c_kv.device)
+        else:
+            c_buf = torch.zeros(b, n_rows, r, device=c_kv.device,
+                                dtype=c_kv.dtype)
+            kr_buf = torch.zeros(b, n_rows, k_rope_raw.shape[-1],
+                                 device=c_kv.device, dtype=k_rope_raw.dtype)
+        self._block_add(c_buf, kr_buf, 0, c_kv, k_rope_raw)
+        return (c_buf, kr_buf,
+                torch.tensor(t, device=c_kv.device, dtype=torch.long))
 
     def _sparse_scores(
         self,
@@ -382,6 +566,7 @@ class SparseMLAModule(MLAModule):
         shared: "IndexerSelect | None" = None,
         kr_raw: torch.Tensor | None = None,
         swa: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        block_src: bool = False,
     ) -> tuple[torch.Tensor, "IndexerSelect | None", torch.Tensor | None]:
         """对查询 [start, end) 做聚集 + 掩码 + 注意力（softmax 提 fp32 保精度）.
 
@@ -424,13 +609,19 @@ class SparseMLAModule(MLAModule):
             lo = max(0, start - win)
             local = (torch.arange(lo, end, device=k_full.device) if n_chunk
                      else torch.zeros(0, dtype=torch.long, device=k_full.device))
-            c_blk, k_blk, v_blk, blk_end = self._compressed_columns(
-                c_kv, kr_raw, blk_ids)
+            c_blk, k_blk, v_blk, blk_end = (
+                self._block_columns(c_kv, kr_raw, blk_ids) if block_src
+                else self._compressed_columns(c_kv, kr_raw, blk_ids))
+            # 块主序缓存里没有逐 token 行 → `n_chunk` 必为 0（近端由 SWA 承担），
+            # `local` 为空；保留下面的 cat 是为了两条路径共用同一段收尾代码
             k_cols = torch.cat([k_blk, k_full[:, :, local, :]], dim=2).contiguous()
             v_cols = torch.cat([v_blk, v_full[:, :, local, :]], dim=2).contiguous()
             # 静态列 = 压缩块列 + 窗口列（窗口全 < start，对块内所有查询可见）
             n_near = local.numel() - n_chunk
-            cols_c = torch.cat([c_blk, c_kv[:, local[:n_near]]], dim=1)
+            # 块主序缓存下 n_near 恒为 0（没有逐 token 行），此时不碰 c_kv——
+            # 它可能是 QuantBuffer（不支持 `[:, 空索引]`）
+            c_near = c_kv[:, local[:n_near]] if n_near else c_blk[:, :0]
+            cols_c = torch.cat([c_blk, c_near], dim=1)
             cols_pos = torch.cat([blk_end, local[:n_near]])
             n_static = blk_ids.numel() + n_near
         else:
@@ -576,7 +767,7 @@ class SparseMLAModule(MLAModule):
             swa_kv = self._swa_project(h) if self.swa is not None else None
             out = self._run_blocks(
                 q_full, k_full, v_full, h, t, c_kv=c_cols, csa_sel=csa_sel,
-                kr_raw=kr_cols, swa_kv=swa_kv)
+                kr_raw=kr_cols, swa_kv=swa_kv, block_src=self.block_cache)
             if not return_state:
                 return self._out_proj(out), None
             # 只借生产者的全局主 KV（buf/pos），**SWA 环必须各建各的**：层内
@@ -611,7 +802,9 @@ class SparseMLAModule(MLAModule):
         # 缓存仍存 latent（与 MLA 一致，200K 上下文每 token 仅 ~320B/层），
         # 静态装箱（reserve 由 _prefill 按 prompt+max_new 精确给出）；
         # CED 解码器层的 latent 来自编码器输出 → 长度就是全序列，`pos` 为 `total`
-        packed = self._pack_cache(c_kv, k_rope_raw, max(reserve, total))
+        packed = (self._pack_cache_block(c_kv, k_rope_raw, max(reserve, total))
+                  if self.block_cache
+                  else self._pack_cache(c_kv, k_rope_raw, max(reserve, total)))
         if swa_kv is not None:
             # 环只服务**之后**的单 token 解码 → 容量 `window`（多 token 解码时
             # `_grow_swa_rings` 再按需扩），绝不按 prompt 长度建环
@@ -793,6 +986,7 @@ class SparseMLAModule(MLAModule):
         kr_raw: torch.Tensor | None = None,
         swa_kv: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         q_off: int = 0,
+        block_src: bool = False,
     ) -> torch.Tensor:
         """分块聚集注意力并返回 `(b, t, n_heads*head_dim)`（头维已并回特征维）.
 
@@ -804,6 +998,8 @@ class SparseMLAModule(MLAModule):
         最近生产者写下的值）。
         `q_off > 0` 时 `q_full`/`h` 只覆盖查询尾段 `[q_off, t)`（CED 跳算预填充），
         KV 仍覆盖全序列——块循环从 `q_off` 起，局部下标统一减 `q_off`。
+        `block_src=True` 表示 `c_kv`/`kr_raw` 是**块主序缓存**（行=块），远端列直接
+        按块行取（`_block_columns`），而不是从逐 token latent 现池化。
         """
         outs = []
         auxs: list[torch.Tensor] = []
@@ -826,7 +1022,7 @@ class SparseMLAModule(MLAModule):
             o, sel, kl = self._sparse_scores(
                 q_full[:, :, qs:qe, :].contiguous(), k_full, v_full, s, e, t,
                 c_kv=c_kv, h_c=h[:, qs:qe], shared=shared, kr_raw=kr_raw,
-                swa=swa_cols)
+                swa=swa_cols, block_src=block_src)
             if (sel is not None and csa_sel is not None
                     and self.csa_mode in ("full", "reindex")
                     and self.csa_index is not None):
@@ -871,7 +1067,12 @@ class SparseMLAModule(MLAModule):
             # （共享缓冲已由生产者写好，两者都借 main KV）
             from src.llm.local.kv_quant import QuantBuffer
 
-            if isinstance(buf_c, QuantBuffer):
+            if self.block_cache:
+                # 块主序缓存：按块行累加（凑满 m 个 token 才成为可读的完整块）
+                self._block_add(buf_c, buf_kr, int(pos.item()),
+                                self._kv_latent(h, ced_src),
+                                self._rope_key(h, ced_src))
+            elif isinstance(buf_c, QuantBuffer):
                 # 量化缓存：按格式就地量化写（QAT 数值与训练一致）
                 buf_c.write_(int(pos.item()), self._kv_latent(h, ced_src))
                 buf_kr.write_(int(pos.item()), self._rope_key(h, ced_src))
@@ -905,20 +1106,30 @@ class SparseMLAModule(MLAModule):
 
         c_use = buf_c.dequant() if isinstance(buf_c, QuantBuffer) else buf_c
         kr_use = buf_kr.dequant() if isinstance(buf_kr, QuantBuffer) else buf_kr
-        k = self.k_norm(self.w_uk(c_use).view(b, -1, self.n_heads,
-                                             self.head_dim))
-        v = self.w_uv(c_use).view(b, -1, self.n_heads, self.head_dim)
-        _rlen = self.rope_cos.shape[0]
-        _ridx = torch.arange(kr_use.shape[1], device=h.device).clamp(
-            max=_rlen - 1)
-        k_rope_hist = apply_rope_wrap(
-            kr_use,
-            self.rope_cos[_ridx],
-            self.rope_sin[_ridx],
-        ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)
         q_full = torch.cat([q, q_rope], dim=-1).transpose(1, 2)
-        k_full = torch.cat([k, k_rope_hist], dim=-1).transpose(1, 2)
-        v_full = v.transpose(1, 2)
+        if self.block_cache:
+            # 块主序缓存：远端列在 `_sparse_scores` 里**按块行**取（`_block_columns`），
+            # 逐 token 的 K/V 展开在这里没有消费者（当前块/近端由 SWA 承担，
+            # `n_chunk=0`）→ 直接给空张量，省掉每步一次整缓冲上投影
+            k_full = torch.zeros(b, self.n_heads, 0,
+                                 self.head_dim + self.qk_rope_dim,
+                                 device=h.device, dtype=q_full.dtype)
+            v_full = torch.zeros(b, self.n_heads, 0, self.head_dim,
+                                 device=h.device, dtype=q_full.dtype)
+        else:
+            k = self.k_norm(self.w_uk(c_use).view(b, -1, self.n_heads,
+                                                 self.head_dim))
+            v = self.w_uv(c_use).view(b, -1, self.n_heads, self.head_dim)
+            _rlen = self.rope_cos.shape[0]
+            _ridx = torch.arange(kr_use.shape[1], device=h.device).clamp(
+                max=_rlen - 1)
+            k_rope_hist = apply_rope_wrap(
+                kr_use,
+                self.rope_cos[_ridx],
+                self.rope_sin[_ridx],
+            ).unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+            k_full = torch.cat([k, k_rope_hist], dim=-1).transpose(1, 2)
+            v_full = v.transpose(1, 2)
         # 查询即最后 t 个位置：select_keys(total, total-t, total)，t==1 时与旧式一致；
         # t>1 为投机解码并行验证服务（块内因果由 chunk_causal_mask 保证）
         swa_cols = None
@@ -950,7 +1161,7 @@ class SparseMLAModule(MLAModule):
             q_full, k_full, v_full, total - t, total, total, c_kv=c_use,
             h_c=h,
             shared=(csa_sel.get(self.csa_src, 0) if csa_sel is not None else None),
-            kr_raw=kr_use, swa=swa_cols)
+            kr_raw=kr_use, swa=swa_cols, block_src=self.block_cache)
         if (sel is not None and csa_sel is not None
                 and self.csa_mode in ("full", "reindex")
                 and self.csa_index is not None):

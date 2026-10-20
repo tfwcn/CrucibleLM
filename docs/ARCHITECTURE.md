@@ -383,6 +383,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `csa_modes`("") | CSA2 三模式静态分配（V4.1）：`full,reindex,reuse` 逗号分隔、按全注意力层序号循环（别名 `f`/`ri`/`re`）；非空时**覆盖** `csa_reuse_every`。**改语义但不改 `state_dict` 键**（旧 Full/Reuse 权重可直接互载，装载需 `sync_arch_from_checkpoint` 对齐来源）；Reindex 只在 `sparse_indexer` 开启时才与 Reuse 有区别。详见 `docs/details/csa-modes.md` | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | `swa_window`(0) | 层内 SWA（V4.1：**每层**自带滑动窗口分支，与全局 KV 独立）：窗口 token 数，n>0 时每层新增 `swa.w_k`/`swa.w_kr`/`swa.w_v` + 自己的 `k_norm`，与全局稀疏条目拼进**同一次 softmax**；开启后近端（窗口+当前块）全交给 SWA（`sparse_window` 失效），全局分支只出 sink/stride 远端条目。缓存是**定长环**（`n_win+max(0,t-1)` 行，`kv_cache_bytes` 里是不含 `seq_len` 的加法项）；落盘默认 `drop_swa=True` 只存全局 KV，`SessionCache.load` 用**有界重放**（最近 `n_win` 个 token 只读解码重建环）近似恢复（`drop_swa=False` 则逐位精确）。**默认关**（改 `state_dict` 键，旧 ckpt 需重训；续训从 hparams 沿用）；开启后恒走分块路径（dense 兜底不带层内 SWA）且**禁用投机解码**。窗口建议 ≤512（环比主 KV 还贵）。详见 `docs/details/per-layer-swa.md` | `config.py`/`block.py`/`sparse_attn.py`/`model.py`/`session_cache.py` |
 | `ced_split`(0) / `ced_prefill_skip`(True) | CED 因果编码器-解码器（V4.1 §2.2）：前 N 层当编码器，其后层的全局 KV 不再由自己 hidden 产生，而由第 N 层输出 `H_enc` 用**逐层投影权重**投影（`C_l = H_enc W_l^KV`，rope 键同理）→ 推理预填充只需在前缀上算完编码器层，解码器层只跑最后 `2*swa_window` 个 token（`swa_window=0` 时只跑末位置，**逐位等价**）。**默认关**（解码器层 `w_dkv`/`w_kr` → `w_ced_*`，改键需重训；续训从 hparams 沿用）；要求解码器区间**全是全注意力层**（线性层递推状态不可投影，构建期早失败——base 的 1:3 hybrid 不满足）。解码器层恒 Full → `kv_cache_bytes` 会升（8192 ctx 实测 +38%，是换算力的代价）。详见 `docs/details/ced.md`、pitfalls 40/41/42 | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
+| `kv_block_cache`(False) | 块主序主 KV 缓存（V4.1 #4 的显存半边）：`compress_ratios` 的 m>1 层把每 m 个 token 折成**一行**存（行数 `L→m+ceil(L/m)`，行值 = `Σ z_i⊙c_i/m`，rope 行 = 块尾未旋转键），近端（当前不足 m 个 token 的残块）由层内 SWA 承担 → 构建期强制 `swa_window>0` 且 `swa_window>=max(m)`。预填充与解码共用 `_block_add`（残块进**头部**暂存前缀、凑满一次池化+量化）→ 同权重下与逐 token 布局**逐位一致**（预填充/解码都是 0.0），跨残块单 token 解码 == 全前向（<1e-5）。与 `kv_quant` 叠加时量化作用在块均值上（预填充池化出口同步 `fake_quant`）。**默认关**（改缓存布局 + 依赖 SWA 组合；不改 `state_dict` 键，续训从 hparams 沿用）。注意**多 token 解码跨压缩块边界**会与全前向有差（列集合按步首位置定，pitfall 49）。详见 `docs/details/kv-block-cache.md`、pitfalls 47/48/49/50 | `config.py`/`block.py`/`sparse_attn.py`/`model.py`/`session_cache.py` |
 | `kv_quant`("") | KV 缓存量化（V4.1 §2.4.4）：`"fp4"` = 主 KV 用 **MXFP4**（E2M1 + 每 16 通道一个 E4M3 scale，4.5 bit/通道，**无**全局二级 scale）；`"fp8"` = E4M3（8.5 bit）。训练期在 `_kv_latent`/`_rope_key` 出口与 SWA 投影处做 fake-quant（STE）＝QAT，推理期同一数值，差别只在存储：`QuantBuffer` 打包（uint8 + E4M3 scale），读时反量化再算注意力（不需要 FP4 矩阵乘）。SWA 环联动用 **FP8**（对量化更敏感）。**默认关**（精度损失 + 改缓存布局；不改 state_dict 键，续训从 hparams 沿用）；实测 12 层/`swa_window=128`：8192 ctx 6.99→2.86 MiB（0.41x）、32768 ctx 21.99→7.08 MiB（0.32x）。同长度/同分块路径逐位一致；量化不连续，跨长度比较会跨码字边界（不是 bug）。详见 `docs/details/kv-cache-fp4.md`、pitfalls 45/46 | `config.py`/`kv_quant.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 | `o_groups`(1) / `o_lora_rank`(0) | MLA 分组低秩输出投影（V4.1：8/1024）：按头分组、每组压到 `o_lora_rank` 再拼接升维。**默认关**（改 `state_dict` 键，旧 ckpt 无法直接载入）；开启需重训或 `scripts/migrate_model.py --o-groups G --o-lora-rank r`（SVD 迁移，近似）。详见 `docs/details/mla-grouped-output.md` | `mla.py`/`migrate.py` |
@@ -446,9 +447,19 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   远端表示的 token 数 ×m；远端块必须"完整且块尾 < 查询块起点"（因果 + 不越出真实数据区）。
   借用层（Reindex/Reuse）沿用生产者的 m 与 `z_cmp`（同一对象），生产者 m=1 时借用层删掉自己
   多余的 `z_cmp`（无死参数）。压缩比 >1 的层**恒走分块路径**（`sparse_threshold` 失效），
-  否则短序列 dense 与长序列压缩表示不一致。**KV 显存尚未下降**——池化在读取时做、
-  缓存仍逐 token 存原始 latent；真正的显存收益要等"压缩条目落盘 + 未压缩窗口定长环"的
-  缓存布局重构（与 #7 每层 SWA 环形缓存同工）。见 `docs/details/kv-compression-ratio.md`、pitfalls 32。
+  否则短序列 dense 与长序列压缩表示不一致。**压缩比本身只管"看到多少"**（列数），
+  真正的**显存**收益来自下面的块主序缓存（`kv_block_cache`，行数 `L→ceil(L/m)`）。
+  见 `docs/details/kv-compression-ratio.md`、pitfalls 32。
+- **块主序主 KV 缓存（`kv_block_cache`，默认关，依赖层内 SWA）**：把压缩提前到**写入时**——
+  每层主 KV 只存 `m + ceil(L/m)` 行（`m` 行定长暂存前缀 + 块行，行值 = `Σ z_i⊙c_i/m`，
+  rope 行 = 块尾未旋转键），行数从 `L` 降到 `ceil(L/m)`。预填充与解码走**同一条写路径**
+  （`_block_add`：残块先进暂存、凑满 m 个一次池化+量化），所以同权重下与"逐 token 缓存"
+  **逐位一致**、跨残块的单 token 解码仍 == 全前向。残块在凑满前对任何查询不可读 →
+  近端必须由层内 SWA 承担（构建期强制 `swa_window>0` 且 `swa_window>=max(m)`）。
+  暂存前缀钉在**头部**（`ensure_room` 只扩尾部，残块不丢）；`kv_cache_bytes` 逐层按各自
+  行数计费。与 `kv_quant` 叠加时量化作用在**块均值**上（论文口径：压缩条目才是缓存单元），
+  预填充池化出口同步 `fake_quant` 保证自洽。见 `docs/details/kv-block-cache.md`、
+  pitfalls 47/48/49/50。
 
 ## 直觉头/RAG（`heads.py` + `retrieval.py`，SFT 后启用）
 

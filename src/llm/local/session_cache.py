@@ -75,16 +75,18 @@ class SessionCache:
         """
         if self.pasts is None:
             return
-        # 第 1 遍：按旧张量身份汇总目标容量（共享缓冲取各请求的最大值）
+        # 第 1 遍：按旧张量身份汇总目标容量（共享缓冲取各请求的最大值）。
+        # **块主序缓存**下一行装 m 个 token → 目标行数用 `ceil((cur+need)/m)`。
         plans: dict[int, tuple[torch.Tensor, int]] = {}
-        for p in self.pasts:
+        for li, p in enumerate(self.pasts):
             if not self._is_static_triple(p):
                 continue
             cur = int(p[2].item())
+            need_rows = self._rows_needed(li, cur + need)
             for t in (p[0], p[1]):
-                if cur + need <= t.shape[1]:
+                if need_rows <= t.shape[1]:
                     continue
-                nlen = max(t.shape[1] * 2, cur + need)
+                nlen = max(t.shape[1] * 2, need_rows)
                 old = plans.get(id(t))
                 if old is None or nlen > old[1]:
                     plans[id(t)] = (t, nlen)
@@ -112,6 +114,26 @@ class SessionCache:
             self.pasts[li] = (nc if nc is not None else p[0],
                               nkr if nkr is not None else p[1], p[2]) \
                 + tuple(p[3:])
+
+    def _block_m(self, li: int) -> int:
+        """该层主 KV 缓存的压缩比 m（块主序），非块主序层返回 0.
+
+        扩容按**行**算（块主序下 `m + ceil((cur+need)/m)` 行），拿 token 数直接比
+        行数会多扩 m 倍——不致命但白占内存，且会掩盖"块主序真的省了 L/m"。
+        暂存前缀在**头部**（行 `[0, m)`），尾部扩容天然不搬动它（残块不会丢）。
+        """
+        try:
+            attn = self.model.layers[li].attn
+        except (AttributeError, IndexError, TypeError):
+            return 0
+        if not getattr(attn, "block_cache", False):
+            return 0
+        return max(0, int(getattr(attn, "compress_ratio", 1)))
+
+    def _rows_needed(self, li: int, tokens: int) -> int:
+        """该层在 `tokens` 个 token 下需要的行数（块主序：m 行暂存 + ceil(tokens/m)）."""
+        m = self._block_m(li)
+        return (m + (tokens + m - 1) // m) if m else tokens
 
     def _device(self) -> torch.device:
         """模型所在设备."""

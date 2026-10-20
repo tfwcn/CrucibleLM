@@ -167,6 +167,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--swa-window", type=int, default=None,
                    help="层内 SWA 窗口（V4.1：每层自带滑动窗口注意力，窗口定长、"
                         "缓存与序列长度无关）；0=关（默认）。改键（新增 swa.*），旧 ckpt 需重训")
+    p.add_argument("--kv-block-cache", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="块主序主 KV 缓存（V4.1 #4 显存半边，默认关）：compress_ratio>1 "
+                        "的层只存池化后的块行（行数 L→ceil(L/m)，行值=m 个 token 的加权均值），"
+                        "当前块那不足 m 个近端 token 由层内 SWA 承担——故要求 swa_window>=m。"
+                        "不改 state_dict 键（只改缓存布局/数值），可与 --kv-quant 叠加")
     p.add_argument("--compress-ratios", type=str, default=None,
                    help="CSA2 逐层主 KV 压缩比（V4.1，如 '2' 或 '1,2'，按全注意力层序号"
                         "循环）：m=每条目聚合的连续 token 数（不重叠），远端按 m 块池化、"
@@ -917,6 +923,11 @@ def main(argv=None) -> int:
     if arch_src.get("compress_ratios") == "checkpoint":
         print("CSA2：沿用 checkpoint 的压缩比表 "
               f"compress_ratios={config.compress_ratios!r}", flush=True)
+    if config.kv_block_cache:
+        _rs = {i: config.compress_ratio_of(i) for i in range(config.n_layers)
+               if config.is_full_attn_layer(i) and config.compress_ratio_of(i) > 1}
+        print(f"块主序主 KV 缓存已开（V4.1 #4）：层→m {_rs}，主 KV 行数 L→ceil(L/m)"
+              f"（当前块近端由层内 SWA 窗口 {config.swa_window} 承担）", flush=True)
     if any(r > 1 for r in config.compress_ratio_list()):
         _rs = {i: config.compress_ratio_of(i) for i in range(config.n_layers)
                if config.is_full_attn_layer(i) and config.compress_ratio_of(i) > 1}
