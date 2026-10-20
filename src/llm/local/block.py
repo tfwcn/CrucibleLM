@@ -61,6 +61,9 @@ class HybridBlock(nn.Module):
         use_retro: bool = False,
         retro_heads: int = 8,
         hyper_streams: int = 0,
+        hc_single_pass: bool = True,
+        hc_mega: bool = True,
+        hc_sinkhorn_iters: int = 20,
         use_engram: bool = False,
         engram_orders: tuple[int, ...] | list[int] = (2, 3, 4),
         engram_heads: int = 8,
@@ -124,7 +127,9 @@ class HybridBlock(nn.Module):
         assert hyper_streams == 0 or hyper_streams >= 2, \
             "hyper_streams 须为 0（关）或 ≥2（n=1 退化恒等，无意义）"
         self.hyper: HyperConnRes | None = (
-            HyperConnRes(d_model, hyper_streams)
+            HyperConnRes(d_model, hyper_streams,
+                         sinkhorn_iters=hc_sinkhorn_iters,
+                         single_pass=hc_single_pass, mega=hc_mega)
             if hyper_streams >= 2 else None
         )
         # Engram 条件记忆（默认 None；开后在注意力之前残差并联，恒等起点）
@@ -146,7 +151,9 @@ class HybridBlock(nn.Module):
         csa_sel: object | None = None,
         ced_src: torch.Tensor | None = None,
         q_off: int = 0,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor]]:
+        hc_pre: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor | None, torch.Tensor],
+               torch.Tensor | None]:
         """前向：past 为解码缓存（MLA 传 latent 元组，线性层传状态矩阵）.
 
         return_state=False 时注意力层不返回缓存（训练路径）。
@@ -159,10 +166,16 @@ class HybridBlock(nn.Module):
         csa_sel: CSA2 层间选择通道（`sparse_indexer` 开启时由 TinyLLM 建，逐层共享）。
         ced_src: CED 解码器层的编码器输出 `H_enc`（KV/rope 键由它投影；None=本层自算）。
         q_off: 查询首 token 的绝对位置（CED 跳算预填充时 `h` 只覆盖尾部）。
+        hc_pre: Single-Pass mHC 的输入混合系数 `A_{l-1}`（(b,t,n)，上一层给的；
+        第 0 层 None → 均匀系数）。返回第三个值 = 本层产出给下一层的 `A_l`。
         h: 无超连接时 (b, t, d)；有超连接时 (b, t, n, d) n 路流。
         """
         xs = h
-        h_in = self.hyper.pre_mix(h) if self.hyper is not None else h
+        hc_aux = None
+        if self.hyper is not None:
+            h_in, hc_aux = self.hyper.enter(xs, hc_pre)
+        else:
+            h_in = h
         h = h_in
         if self.engram is not None and engram_ids is not None:
             # Engram 在注意力之前：先把静态模式"查"出来（论文：早期注入最优，
@@ -190,7 +203,9 @@ class HybridBlock(nn.Module):
         if self.retro is not None and retro_mem is not None:
             mh, mm = retro_mem
             h = self.retro(h, mh, mm)
+        hc_next = None
         if self.hyper is not None:
             # 超连接写回：F 为本块在均值流上的总增量，流混合后按 post 写回各路
-            h = self.hyper.combine(xs, h - h_in)
-        return h, (new_past, aux)
+            h = self.hyper.combine(xs, h - h_in, hc_aux)
+            hc_next = hc_aux[0] if hc_aux is not None else None
+        return h, (new_past, aux), hc_next

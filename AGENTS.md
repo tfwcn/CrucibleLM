@@ -30,7 +30,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 7 | 每层 SWA + SWA Bounded Replay | ✅ 开关 `swa_window`（每层自带独立投影分支，与全局条目同一次 softmax；定长环缓存与序列长度无关；落盘只存全局 KV，读回有界重放重建；SWA 下禁用投机解码） | `config.py`/`sparse_attn.py`/`model.py`/`session_cache.py` |
 | 8 | FP4 主 KV（MXFP4 + QAT）+ FP8 SWA KV | ✅ 开关 `kv_quant`（MXFP4：E2M1 + 每 16 通道 E4M3 scale，4.5 bit/通道；SWA 环联动 FP8。QAT 走 fake-quant/STE，读时反量化再算注意力；缓存打包成 `QuantBuffer`，实测 8192 ctx 0.41x、32768 ctx 0.32x） | `config.py`/`kv_quant.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | 9 | MLA 分组输出投影 `o_lora_rank` + `o_groups` | ✅ | `mla.py` |
-| 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | 🔶 mHC-lite | `hyperconn.py` |
+| 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | ✅ 开关 `hyper_streams`（A/B/C 全动态：输入凸组合 + 双随机流混合（Sinkhorn 20 轮）+ 动态写回）+ `hc_single_pass`（默认开，A 错后一层 = eq.6，混合与系数预测同趟完成）+ `hc_mega`（默认开，分块单趟数据流，激活读写 (4n+4)d→(2n+2)d，与整块 GEMM 等价 3e-5）；老 ckpt 两项回退关 = eq.2 多趟；恒等起点 delta 形式逐位；最后一层 A 空转已钉死 | `config.py`/`hyperconn.py`/`block.py`/`model.py` |
 | 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | ✅ 开关 `engram_layers`/`engram_every`（阶 2/3/4 × 8 头、每阶 `d_mem` 维；**无短卷积** → `lookback = max_order-1`；表 + K/V 投影 FP8（QAT，`engram_fp8` 默认开，老 ckpt 回退关），`pack()` 打包成真 FP8 存储 0.53x/bf16 且查表逐位一致；表自动进 Sinkhorn 组；显式层号优先；解码 vs 全前向 1e-5） | `config.py`/`engram.py`/`block.py`/`model.py`/`optim.py` |
 | 12 | MTP 深度 3 | ✅ | `model.py` |
 | 13 | DSpark 独立训练草稿模块（3 层 + Markov 头 + 置信头 + 吞吐调度） | 🔶 仅解码启发式 | `spec_decode.py` |

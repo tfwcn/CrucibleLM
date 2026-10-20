@@ -132,7 +132,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--enable-memory", action="store_true",
                    help="开启 Product-Key 记忆层（每 memory_every 层一个）")
     p.add_argument("--hyper-streams", type=int, default=0,
-                   help="超连接残差流数（mHC-lite；0=关闭，≥2 开启，建议先 2）")
+                   help="超连接残差流数（mHC；0=关闭，≥2 开启，建议先 2）")
+    p.add_argument("--hc-single-pass", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Single-Pass mHC（V4.1 §2.4.1）：输入混合用上一层的 A"
+                        "（默认开；--no-hc-single-pass = eq.2 原始语义）")
+    p.add_argument("--hc-mega", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Mega-mHC：沿 hidden 维分块的单趟数据流（默认开；"
+                        "--no-hc-mega = 整块 GEMM 的多趟写法）")
+    p.add_argument("--hc-sinkhorn-iters", type=int, default=20,
+                   help="mHC 的 Sinkhorn 迭代数（B 双随机投影；论文 20）")
     p.add_argument("--memory-every", type=int, default=4, help="记忆层插入间隔（N 层一个）")
     p.add_argument("--memory-slots", type=int, default=4096, help="记忆槽位数")
     p.add_argument("--memory-topk", type=int, default=8, help="每 token 激活槽数")
@@ -854,7 +864,8 @@ def main(argv=None) -> int:
         if args.hyper_streams < 2:
             raise SystemExit("--hyper-streams 须为 0（关）或 ≥2（n=1 退化恒等）")
         config.hyper_streams = args.hyper_streams
-        print(f"超连接残差已开：{config.hyper_streams} 路流（mHC-lite，恒等起点）",
+        config.hc_sinkhorn_iters = max(1, args.hc_sinkhorn_iters)
+        print(f"超连接残差已开：{config.hyper_streams} 路流（mHC，恒等起点）",
               flush=True)
     if args.engram_every or args.engram_layers:
         from src.llm.local.engram import is_prime
@@ -920,6 +931,12 @@ def main(argv=None) -> int:
               f" {config.n_layers - config.ced_split} 层为解码器；解码器全局 KV 由"
               f"编码器输出逐层投影，预填充跳算="
               f"{'开' if config.ced_prefill_skip else '关'}", flush=True)
+    if config.hyper_streams >= 2:
+        print(f"mHC：Single-Pass={config.hc_single_pass}"
+              f"（{arch_src.get('hc_single_pass', 'default')}，"
+              f"输入混合用上一层的 A_{l-1}）、"
+              f"Mega={config.hc_mega}（{arch_src.get('hc_mega', 'default')}）、"
+              f"Sinkhorn {config.hc_sinkhorn_iters} 轮", flush=True)
     if arch_src.get("engram_fp8") == "checkpoint":
         print(f"Engram：沿用 checkpoint 架构 engram_fp8={config.engram_fp8}",
               flush=True)

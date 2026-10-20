@@ -203,8 +203,17 @@ class SmallLLMConfig:
     memory_every: int = 0
     memory_slots: int = 4096  # 槽位数（64×64 子码本）
     memory_topk: int = 8  # 每 token 激活槽数
-    # 超连接残差：0=关闭（标准单流残差）；≥2=n 路流混合（mHC-lite，见 hyperconn.py）
+    # 超连接残差：0=关闭（标准单流残差）；≥2=n 路流混合（mHC，见 hyperconn.py）
     hyper_streams: int = 0
+    # Single-Pass mHC（V4.1 §2.4.1）：输入混合改用**上一层**预测的 A_{l-1}，
+    # 让"混合 + 系数预测"能在同一趟里完成；默认开（V4.1 部署口径，
+    # 论文实测性能损失可忽略）。旧 ckpt 由 hparams 回退 False（= eq.2 语义）。
+    hc_single_pass: bool = True
+    # Mega-mHC（V4.1）：沿 hidden 维分块的单趟数据流（同一趟算混合 + 三个系数预测）。
+    # 实现细节、数值等价；关 = 整块 GEMM 的多趟写法（旧路径，逐位不变）
+    hc_mega: bool = True
+    # mHC 的 Sinkhorn 迭代数（B 投影到双随机矩阵；论文 20）
+    hc_sinkhorn_iters: int = 20
 
     # ===== Engram 条件记忆（n-gram 哈希查表，默认关；见 engram.py / docs/details/engram.md）=====
     # 每 N 层插一个 Engram（V4.1：只放少数早期层）；0=关闭（无参数，旧 checkpoint 兼容）
@@ -696,6 +705,10 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "kv_block_cache": (False, _norm_bool),
     # Engram 的表 + K/V 投影 FP8（V4.1 §2.4.2）；不改键，旧 ckpt 回退关（= 特性前不量化）
     "engram_fp8": (False, _norm_bool),
+    # Single-Pass mHC / Mega-mHC 数据流（V4.1 §2.4.1）：不改键，旧 ckpt 回退关
+    # （= eq.2 多趟语义，训练结果逐位可复现）
+    "hc_single_pass": (False, _norm_bool),
+    "hc_mega": (False, _norm_bool),
 }
 
 

@@ -42,7 +42,7 @@ def _enc_hidden(m: TinyLLM, ids: torch.Tensor) -> torch.Tensor:
     """手算 `H_enc`：前 `ced_split` 层串行后的残差流 hidden（全序列）."""
     h = m.embed(ids)
     for layer in m.layers[:m.ced_split]:
-        h, _ = layer(h, None, False)
+        h, _, _ = layer(h, None, False)
     return h
 
 

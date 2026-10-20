@@ -741,8 +741,8 @@ def test_return_state_flag():
                             expert_hidden=32, n_shared=1)
         layer.eval()
         h = torch.randn(1, 16, 128)
-        o1, (p1, a1) = layer(h, None, True)
-        o2, (p2, a2) = layer(h, None, False)
+        o1, (p1, a1), _ = layer(h, None, True)
+        o2, (p2, a2), _ = layer(h, None, False)
         assert p2 is None
         assert p1 is not None
         assert torch.equal(o1, o2) and torch.equal(a1, a2)

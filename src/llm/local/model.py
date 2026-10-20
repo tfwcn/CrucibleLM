@@ -72,6 +72,9 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         use_retro=use_retro,
         retro_heads=config.retro_heads,
         hyper_streams=config.hyper_streams if use_hyper else 0,
+        hc_single_pass=bool(getattr(config, "hc_single_pass", False)),
+        hc_mega=bool(getattr(config, "hc_mega", False)),
+        hc_sinkhorn_iters=int(getattr(config, "hc_sinkhorn_iters", 20)),
         use_engram=use_engram,
         engram_orders=config.engram_order_list,
         engram_heads=config.engram_heads,
@@ -328,6 +331,7 @@ class TinyLLM(nn.Module):
         idx_n = 0  # 贡献蒸馏损失的层数（日志取层间均值）
         ced_split = self.ced_split
         h_ced: torch.Tensor | None = None  # 编码器输出 H_enc（CED 解码器层的 KV 源）
+        hc_pre: torch.Tensor | None = None  # Single-Pass mHC：上一层给的 A_{l-1}
         for li, layer in enumerate(self.layers):
             if ced_split and li == ced_split:
                 # 第 ced_split 层**之前**的 hidden（即编码器最后一层输出）就是 H_enc；
@@ -342,13 +346,14 @@ class TinyLLM(nn.Module):
             # CSA2 开启时全注意力层需返回缓存（reserve=0，不补零、数值不变）供借用
             rs = bool(self._csa_active and is_full)
             if self.config.grad_ckpt and self.training:
-                h, aux_total, p = self._layer_ckpt(
+                h, aux_total, p, hc_pre = self._layer_ckpt(
                     layer, h, aux_total, retro_mem, engram_ids, reuse, rs,
-                    csa_sel, ced_src=ced_src)
+                    csa_sel, ced_src=ced_src, hc_pre=hc_pre)
             else:
-                h, (p, aux) = layer(h, None, rs, retro_mem,
-                                    engram_ids=engram_ids, reuse=reuse,
-                                    csa_sel=csa_sel, ced_src=ced_src)
+                h, (p, aux), hc_pre = layer(
+                    h, None, rs, retro_mem,
+                    engram_ids=engram_ids, reuse=reuse,
+                    csa_sel=csa_sel, ced_src=ced_src, hc_pre=hc_pre)
                 aux_total = aux_total + aux
             kl = getattr(layer.attn, "_last_indexer_kl", None)
             if kl is not None:
@@ -483,7 +488,9 @@ class TinyLLM(nn.Module):
         return_state: bool = False,
         csa_sel: CsaChannel | None = None,
         ced_src: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple | None]:
+        hc_pre: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple | None,
+               torch.Tensor | None]:
         """单层梯度检查点：重算换显存（训练 past=None，不用解码缓存）.
 
         `ced_src`（CED 解码器层的编码器输出）**必须作为 checkpoint 的显式输入**：
@@ -492,17 +499,19 @@ class TinyLLM(nn.Module):
         """
         from torch.utils.checkpoint import checkpoint
 
-        def fn(hh: torch.Tensor, src: torch.Tensor | None):
-            out, (p, aux) = layer(hh, None, return_state, retro_mem,
-                                  engram_ids=engram_ids, reuse=reuse,
-                                  csa_sel=csa_sel, ced_src=src)
-            return out, aux, p
+        def fn(hh: torch.Tensor, src: torch.Tensor | None,
+               pre: torch.Tensor | None):
+            out, (p, aux), nxt = layer(hh, None, return_state, retro_mem,
+                                       engram_ids=engram_ids, reuse=reuse,
+                                       csa_sel=csa_sel, ced_src=src,
+                                       hc_pre=pre)
+            return out, aux, p, nxt
 
-        if ced_src is None:
-            h_new, aux, p = checkpoint(fn, h, None, use_reentrant=False)
-        else:
-            h_new, aux, p = checkpoint(fn, h, ced_src, use_reentrant=False)
-        return h_new, aux_total + aux, p
+        # `hc_pre` 与 `ced_src` 同理必须显式传入：它来自上一层、需要梯度，
+        # 被闭包捕获会在重算时当成常量，梯度不回传到上一层的系数预测器
+        h_new, aux, p, nxt = checkpoint(fn, h, ced_src, hc_pre,
+                                        use_reentrant=False)
+        return h_new, aux_total + aux, p, nxt
 
     @torch.no_grad()
     def generate(
@@ -560,6 +569,7 @@ class TinyLLM(nn.Module):
         # 解码器段从哪个绝对位置开始（块对齐；关掉跳算时 = 0，即全序列）
         ced_q_off = self._ced_prefill_q_off(n_tok)
         h_ced: torch.Tensor | None = None
+        hc_pre: torch.Tensor | None = None  # Single-Pass mHC：上一层给的 A_{l-1}
         pasts: list = []
         for li, layer in enumerate(self.layers):
             is_full = bool(getattr(layer, "full_attn", False))
@@ -570,14 +580,15 @@ class TinyLLM(nn.Module):
             if ced_split and li >= ced_split:
                 if li == ced_split:
                     h = h_ced[:, ced_q_off:]  # 只保留查询尾段
-                h, (p, _) = layer(
+                h, (p, _), hc_pre = layer(
                     h, retro_mem=retro_mem, reserve=reserve,
                     engram_ids=input_ids, reuse=reuse, csa_sel=csa_sel,
-                    ced_src=h_ced, q_off=ced_q_off)
+                    ced_src=h_ced, q_off=ced_q_off, hc_pre=hc_pre)
             else:
-                h, (p, _) = layer(
+                h, (p, _), hc_pre = layer(
                     h, retro_mem=retro_mem, reserve=reserve,
-                    engram_ids=input_ids, reuse=reuse, csa_sel=csa_sel)
+                    engram_ids=input_ids, reuse=reuse, csa_sel=csa_sel,
+                    hc_pre=hc_pre)
             pasts.append(p)
             if self._csa_active and is_full and not is_reuse:
                 shared = p
@@ -668,6 +679,7 @@ class TinyLLM(nn.Module):
         csa_sel = self._csa_channel()  # 每步一个：生产者本步写、借用者同步读
         ced_split = self.ced_split
         h_ced: torch.Tensor | None = None  # 当步编码器输出（CED 解码器层的 KV 源）
+        hc_pre: torch.Tensor | None = None  # Single-Pass mHC：上一层给的 A_{l-1}
         for li, (layer, p) in enumerate(zip(self.layers, pasts)):
             if ced_split and li == ced_split:
                 h_ced = hh.mean(dim=2) if hyper_n else hh
@@ -675,7 +687,12 @@ class TinyLLM(nn.Module):
             # 每层 norm 由 block 内部处理，这里直接走 attn+moe 等价路径：
             # 为复用逻辑，重新拼 block 前向（单 token 开销可忽略）
             xxs = hh
-            hh_in = layer.hyper.pre_mix(hh) if hyper_n and layer.hyper is not None else hh
+            hc_aux = None
+            if hyper_n and layer.hyper is not None:
+                hh_in, hc_aux = layer.hyper.enter(hh, hc_pre)
+                hc_pre = hc_aux[0]
+            else:
+                hh_in = hh
             hh = hh_in
             if layer.engram is not None and engram_ids is not None:
                 # Engram 与 block.forward 同序（注意力之前残差并联）
@@ -701,7 +718,7 @@ class TinyLLM(nn.Module):
                 hh = layer.retro(hh, mh, mm)
             if hyper_n and layer.hyper is not None:
                 # 超连接写回与 block.forward 同式（均值流增量 + 流混合）
-                hh = layer.hyper.combine(xxs, hh - hh_in)
+                hh = layer.hyper.combine(xxs, hh - hh_in, hc_aux)
             new_pasts.append(p2)
         if hyper_n:
             hh = hh.mean(dim=2)
@@ -733,12 +750,18 @@ class TinyLLM(nn.Module):
         csa_sel = self._csa_channel()  # 并行验证同一批 token：单块选择通道
         ced_split = self.ced_split
         h_ced: torch.Tensor | None = None
+        hc_pre: torch.Tensor | None = None  # Single-Pass mHC：上一层给的 A_{l-1}
         for li, (layer, p) in enumerate(zip(self.layers, pasts)):
             if ced_split and li == ced_split:
                 h_ced = hh.mean(dim=2) if hyper_n else hh
             ced_src = h_ced if (ced_split and li >= ced_split) else None
             xxs = hh
-            hh_in = layer.hyper.pre_mix(hh) if hyper_n and layer.hyper is not None else hh
+            hc_aux = None
+            if hyper_n and layer.hyper is not None:
+                hh_in, hc_aux = layer.hyper.enter(hh, hc_pre)
+                hc_pre = hc_aux[0]
+            else:
+                hh_in = hh
             hh = hh_in
             if layer.engram is not None and engram_ids is not None:
                 # Engram 与 block.forward 同序（并行验证的算术也必须一致）
@@ -759,7 +782,7 @@ class TinyLLM(nn.Module):
                 mh, mm = retro_mem
                 hh = layer.retro(hh, mh, mm)
             if hyper_n and layer.hyper is not None:
-                hh = layer.hyper.combine(xxs, hh - hh_in)
+                hh = layer.hyper.combine(xxs, hh - hh_in, hc_aux)
             new_pasts.append(p2)
         if hyper_n:
             hh = hh.mean(dim=2)
@@ -987,6 +1010,7 @@ class TinyLLM(nn.Module):
         csa_sel = self._csa_channel()  # CSA2 选择通道（indexer 关时为 None）
         ced_split = self.ced_split
         h_ced: torch.Tensor | None = None
+        hc_pre: torch.Tensor | None = None  # Single-Pass mHC：上一层给的 A_{l-1}
         for li, layer in enumerate(self.layers):
             if ced_split and li == ced_split:
                 h_ced = h.mean(dim=2) if hyper_n else h
@@ -995,8 +1019,9 @@ class TinyLLM(nn.Module):
             is_reuse = is_full and bool(getattr(layer.attn, "csa_reuse", False))
             reuse = shared if is_reuse else None
             rs = bool(self._csa_active and is_full)
-            h, (p, _) = layer(h, None, rs, engram_ids=input_ids, reuse=reuse,
-                              csa_sel=csa_sel, ced_src=ced_src)
+            h, (p, _), hc_pre = layer(
+                h, None, rs, engram_ids=input_ids, reuse=reuse,
+                csa_sel=csa_sel, ced_src=ced_src, hc_pre=hc_pre)
             if self._csa_active and is_full and not is_reuse:
                 shared = p
         if hyper_n:
