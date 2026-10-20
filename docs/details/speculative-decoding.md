@@ -31,11 +31,15 @@ GPU 算得飞快却大部分时间在等启动。
 
 ## 我们的实现
 
-- 文件：`spec_decode.py`（起草器：`ngram` / `mtp` / `hybrid`）、
-  `model.py`（`_spec_stream` 主循环 + `_decode_multi` 并行验证）；
+- 文件：`spec_decode.py`（起草器：`ngram` / `mtp` / `hybrid` / **`dspark`**）、
+  `model.py`（`_spec_stream` 主循环 + `_decode_multi` 并行验证）、
+  `dspark.py`（独立训练的草稿器 + 吞吐调度，见 `docs/details/dspark.md`）；
 - 配置：`draft_enabled`（默认关）、`draft_window`、`draft_source`、`draft_ngram_min`；
-  以及 DSpark 置信调度：`dspark_enabled`（默认关）、`dspark_conf_threshold`、
-  `dspark_min_verify`；
+  以及 DSpark 调度：`dspark_enabled`（默认关）、`dspark_schedule`
+  （`confidence` 阈值 / `throughput` 吞吐最优）、`dspark_conf_threshold`、
+  `dspark_min_verify`、`dspark_target_base`/`dspark_target_per_token`/`dspark_draft_cost`；
+  草稿器结构：`dspark_draft`（默认关，独立训练）、`dspark_layers`/`dspark_window`/
+  `dspark_depth`/`dspark_markov_rank`；
 - 为支撑并行验证，三处解码路径补了多 token 能力（均带回归单测）：
   - `mla.py:_valid_mask`：`t>1` 时补块内因果掩码（原来只掩空位，会偷看同批未来）；
   - `sparse_attn.py:_decode`：查询改用最后 t 个位置（`total-t`）；
@@ -109,9 +113,12 @@ Generation*（arXiv 2607.05147）指出投机解码的隐性浪费：**固定窗
 只是下一轮再猜，输出始终逐位等于逐 token 贪心（单测锁定）。
 
 与论文的差距（诚实说明）：论文还有**半自回归起草**（并行 backbone + 轻量顺序
-"Markov"头，缓解后缀衰减）与**引擎负载感知调度**。前者需要独立的草稿模型（本项目
-没有，用 MTP + ngram 的 hybrid 代偿），后者是多请求服务端才有的问题（本模型单请求）。
-故我们只取"置信调度"，并在 `_spec_stats` 里记 `proposed`/`verified` 供对照。
+"Markov"头，缓解后缀衰减）与**引擎负载感知调度**这两部分后来都补上了（见
+`docs/details/dspark.md`）：`dspark_draft=True` 挂 3 层滑窗草稿器（并行 5 槽位 +
+低秩 Markov 头 + 置信头，`scripts/train_dspark.py` 独立训练、主干冻结），
+`dspark_schedule="throughput"` 用 `1+ΣS_i` 与 `draft+base+per_token·n` 取吞吐最优。
+两条口径**都只改"验多长"**，输出永远逐位等于贪心；`_spec_stats` 记
+`proposed`/`verified`/`schedule` 供对照。
 
 | 场景（合成低置信长草稿） | proposed | verified | 说明 |
 |---|---|---|---|
@@ -125,8 +132,10 @@ Generation*（arXiv 2607.05147）指出投机解码的隐性浪费：**固定窗
 # 起草 → 并行验证 → 接受最长前缀 → 零重放跳位
 if dspark:
     drafts, confs = scored_propose(provider, ctx, h[:, -1:], window - 1)
-    v = schedule_verify_length(confs, threshold, min_verify, window - 1)
-    drafts = drafts[:v]                                  # 置信调度：截断必被拒后缀
+    v = (scheduler.choose_length(confs, window - 1)       # 吞吐口径（论文）
+         if scheduler is not None else
+         schedule_verify_length(confs, threshold, min_verify, window - 1))
+    drafts = drafts[:v]                                  # 调度：截断必被拒后缀
 else:
     drafts = provider.propose(ctx, h[:, -1:], window - 1)
 feed = [t0] + drafts                                     # t0 为主头权威下一位

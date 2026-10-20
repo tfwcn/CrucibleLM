@@ -175,6 +175,12 @@ class TinyLLM(nn.Module):
             # 权重绑定：省一块词表矩阵（约 6M 参数）
             self.lm_head.weight = self.embed.weight
         self.mtp = MTPHead(config) if config.mtp_depth > 0 else None
+        # DSpark 独立草稿器（默认 None：无参数、state_dict 兼容；独立训练，不参与主损失）
+        self.dspark: nn.Module | None = None
+        if bool(getattr(config, "dspark_draft", False)):
+            from src.llm.local.dspark import build_dspark_drafter
+
+            self.dspark = build_dspark_drafter(config)
         # RETRO 融合（默认 None：无参数，state_dict 兼容；开后处理 mem 输入）
         self.retro: nn.Module | None = None
         if config.retro_enabled and config.retro_every <= 0:
@@ -840,10 +846,22 @@ class TinyLLM(nn.Module):
         cfg = self.config
         provider = build_draft_provider(self, cfg.draft_source, cfg.draft_ngram_min)
         window = max(1, int(cfg.draft_window))
-        # DSpark 置信调度（默认关）：按草稿存活置信度动态定本轮验证长度
+        # DSpark 调度（默认关）：按草稿存活置信度动态定本轮验证长度。
+        # 两种口径：confidence（累计存活概率 ≥ 阈值）/ throughput（期望吞吐最优，
+        # 用置信头概率 × 引擎成本曲线，见 dspark.DSparkScheduler）。
         dspark = bool(getattr(cfg, "dspark_enabled", False))
         thr = float(getattr(cfg, "dspark_conf_threshold", 0.5))
         min_v = int(getattr(cfg, "dspark_min_verify", 1))
+        sched_mode = str(getattr(cfg, "dspark_schedule", "confidence")).lower()
+        scheduler = None
+        if dspark and sched_mode == "throughput":
+            from src.llm.local.dspark import DSparkScheduler
+
+            scheduler = DSparkScheduler(
+                target_base=float(getattr(cfg, "dspark_target_base", 1.0)),
+                target_per_token=float(getattr(cfg, "dspark_target_per_token", 0.15)),
+                draft_cost=float(getattr(cfg, "dspark_draft_cost", 0.6)),
+                min_verify=int(min_v))
         n_proposed = 0
         n_verified = 0
         dev = input_ids.device
@@ -864,7 +882,11 @@ class TinyLLM(nn.Module):
                 # DSpark：取带置信度的草稿，按累计存活概率截断验证长度
                 drafts, confs = scored_propose(provider, ctx, h[:, -1:], k)
                 n_proposed += len(drafts)
-                drafts = list(drafts[:schedule_verify_length(confs, thr, min_v, k)])
+                if scheduler is not None:
+                    keep = scheduler.choose_length(confs, k)
+                else:
+                    keep = schedule_verify_length(confs, thr, min_v, k)
+                drafts = list(drafts[:keep])
                 n_verified += len(drafts)
             else:
                 drafts = provider.propose(ctx, h[:, -1:], k) if k > 0 else []
@@ -908,6 +930,11 @@ class TinyLLM(nn.Module):
         if dspark:
             self._spec_stats["proposed"] = n_proposed
             self._spec_stats["verified"] = n_verified
+            self._spec_stats["schedule"] = sched_mode
+            if scheduler is not None:
+                # 吞吐口径：记录"每轮平均验证长度"，便于和 confidence 口径对比
+                self._spec_stats["avg_verify"] = (
+                    n_verified / rounds if rounds else 0.0)
 
     def compile_decode(self, mode: str = "default") -> "TinyLLM":
         """编译单步解码（推理专用）.

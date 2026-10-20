@@ -33,7 +33,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | ✅ 开关 `hyper_streams`（A/B/C 全动态：输入凸组合 + 双随机流混合（Sinkhorn 20 轮）+ 动态写回）+ `hc_single_pass`（默认开，A 错后一层 = eq.6，混合与系数预测同趟完成）+ `hc_mega`（默认开，分块单趟数据流，激活读写 (4n+4)d→(2n+2)d，与整块 GEMM 等价 3e-5）；老 ckpt 两项回退关 = eq.2 多趟；恒等起点 delta 形式逐位；最后一层 A 空转已钉死 | `config.py`/`hyperconn.py`/`block.py`/`model.py` |
 | 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | ✅ 开关 `engram_layers`/`engram_every`（阶 2/3/4 × 8 头、每阶 `d_mem` 维；**无短卷积** → `lookback = max_order-1`；表 + K/V 投影 FP8（QAT，`engram_fp8` 默认开，老 ckpt 回退关），`pack()` 打包成真 FP8 存储 0.53x/bf16 且查表逐位一致；表自动进 Sinkhorn 组；显式层号优先；解码 vs 全前向 1e-5） | `config.py`/`engram.py`/`block.py`/`model.py`/`optim.py` |
 | 12 | MTP 深度 3 | ✅ | `model.py` |
-| 13 | DSpark 独立训练草稿模块（3 层 + Markov 头 + 置信头 + 吞吐调度） | 🔶 仅解码启发式 | `spec_decode.py` |
+| 13 | DSpark 独立训练草稿模块（3 层 + Markov 头 + 置信头 + 吞吐调度） | ✅ 开关 `dspark_draft`（3 层滑窗 128 + 并行 5 槽位（互不可见）+ Markov 头 `U·E(t_{i-1})` 秩 32 + 置信头（条件接受率→前缀存活 `S_i`）；`DSparkScheduler` 按 `1+ΣS_i` / `draft+base+per_token·n` 取吞吐最优（`dspark_schedule=throughput`），另有 `confidence` 阈值口径；独立训练脚本主干冻结、梯度不回传；未训练也不破坏正确性（验证精确 = 贪心）；实测 162.7M 主干 + 18.2M 草稿器，草稿一步 = 验证一步的 0.04） | `config.py`/`dspark.py`/`spec_decode.py`/`model.py`/`scripts/train_dspark.py` |
 | 14 | head-wise Muon（Q/K 按头分块） | ✅ 开关 `--muon-head-wise`（w_uq/w_qr/w_uk 按头切块逐头 NS5，bmm 批量、与逐头循环逐位一致） | `optim.py` |
 | 15 | Sinkhorn 更新（embedding/head 用 momentum+Sinkhorn 替 Adam） | ✅ 开关 `--sinkhorn`（Algorithm 1：Nesterov + 近零行屏蔽 + K=11 行/列交替归一化 + γ=0.18；只存一份动量，实测优化器状态 −50%） | `optim.py` |
 | 16 | 视觉：patch14 + 3×3 downsample | 🔶 downsample 对齐 | `vision_compress.py` |

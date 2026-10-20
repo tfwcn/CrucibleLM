@@ -8,7 +8,9 @@
 三种来源：
 - `ngram`：前缀查表（prompt-lookup），重复文本命中率极高且零成本；
 - `mtp`：复用已训好的 MTP 头猜 t+2（只多看一步，故只给 1 个候选）；
-- `hybrid`：MTP 起头 + ngram 补足（默认）。
+- `hybrid`：MTP 起头 + ngram 补足（默认）；
+- `dspark`：独立训练的 DSpark 草稿器（3 层滑窗 + Markov 头 + 置信头，
+  见 `dspark.py`；需要 `dspark_draft=True` 且跑过 `scripts/train_dspark.py`）。
 
 **DSpark 置信调度**（`dspark_enabled`）：在起草之上，按每个草稿 token 的存活置信度
 动态决定"这轮验多长"（`schedule_verify_length`），提前截断看起来必被拒的后缀，
@@ -184,6 +186,51 @@ class HybridDraftProvider(DraftProvider):
         return ng[:k], nc[:k]     # 无 MTP 头或无首猜：退回 ngram
 
 
+class DSparkDraftProvider(DraftProvider):
+    """DSpark 独立草稿器：一次前向拿 `depth` 个 base logits，再用 Markov 头串起来.
+
+    半自回归：位置之间**并行**算 base logits（互不可见），依赖由低秩 Markov 头
+    `U·E(t_prev)` 补（一阶）。置信度取置信头的**条件**接受概率 `c_i`——
+    调度器把它们连乘成前缀存活概率 `S_i = ∏ c_j`。
+
+    草稿器没训过也**不会错**：主干的并行验证兜底，最差退化成普通贪心。
+    """
+
+    def __init__(self, model):
+        self.model = model
+
+    def propose_scored(self, context: list[int], h_last, k: int):
+        """返回 (草稿 token, 条件接受概率)；无草稿器/无上下文时返回空."""
+        import torch
+
+        dr = getattr(self.model, "dspark", None)
+        if dr is None or k <= 0 or not context:
+            return [], []
+        cfg = self.model.config
+        win = max(2, int(getattr(cfg, "dspark_window", 128)))
+        depth = int(getattr(cfg, "dspark_depth", 5))
+        n = max(0, min(int(k), depth))
+        if n <= 0:
+            return [], []
+        dev = next(dr.parameters()).device
+        ids = torch.tensor([context[-win:]], dtype=torch.long, device=dev)
+        prev = int(context[-1])
+        toks: list[int] = []
+        confs: list[float] = []
+        with torch.no_grad():
+            hq, conf = dr(h_last.to(dev), ids, self.model.embed)
+            for i in range(n):
+                # 逐位加 Markov 修正：第 i 位依赖第 i-1 位（i=0 依赖上下文末位）
+                logits = self.model.lm_head(hq[:, i:i + 1])[:, -1, :]
+                prev_t = torch.tensor([prev], dtype=torch.long, device=dev)
+                logits = logits + dr.markov_bias(prev_t).to(logits.dtype)
+                tok = int(logits.argmax(-1)[0])
+                toks.append(tok)
+                confs.append(float(conf[0, i]))
+                prev = tok
+        return toks, confs
+
+
 def build_draft_provider(model, source: str, min_match: int = 2) -> DraftProvider:
     """按 `draft_source` 配置构建起草器（未知来源回落 ngram，不报错崩生成）."""
     src = (source or "ngram").lower()
@@ -191,4 +238,6 @@ def build_draft_provider(model, source: str, min_match: int = 2) -> DraftProvide
         return MtpDraftProvider(model)
     if src == "hybrid":
         return HybridDraftProvider(model, min_match)
+    if src == "dspark" and getattr(model, "dspark", None) is not None:
+        return DSparkDraftProvider(model)
     return NgramDraftProvider(min_match)

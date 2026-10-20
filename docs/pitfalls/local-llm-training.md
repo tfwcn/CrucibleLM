@@ -996,3 +996,48 @@ shape/键错。
 - 比较两条**数值等价**的实现时，先把所有**不连续算子**（量化、top-k、哈希、桶化）
   关掉；否则测出来的是"码字翻转率"，不是实现等价性。这条与 #4 的
   "跨压缩块边界"结论同源。
+
+## 56. 独立训练草稿器：冻结主干时**别把草稿器一起冻了**；零初始化 Markov 头要等一步才动
+
+**现象**：
+1. `scripts/train_dspark.py` 一启动就 `ValueError: optimizer got an empty parameter list`；
+2. 训练日志里 `ce_base == ce_markov` 三步不动，看起来"Markov 头没接上"。
+
+**机制**：
+1. "冻结主干"最省事的写法是 `for p in model.parameters(): p.requires_grad_(False)`——
+   草稿器也是 `model.parameters()` 的一部分，于是优化器拿到空表。必须**再打开**
+   草稿器那一份（`for p in dr.parameters(): p.requires_grad_(True)`）。
+2. Markov 头是 `U·E(t)`，`U` 零初始化（为了"开局退化为纯并行"）。第一步
+   `∂L/∂E = Uᵀ·∂L/∂logits = 0`，只有 `U` 吃到梯度；第二步 `U≠0` 后 `E` 才开始动。
+   所以 `ce_markov` 在前 1~2 步**必然**等于 `ce_base`——不是没接上。
+
+**教训**：
+- "冻结 X" 要先问"X 是 `model.parameters()` 的子集吗"；模块级冻结与参数级冻结的
+  作用域不一样，后者最容易顺手冻过头。写完加一句断言：优化器的参数数 > 0。
+- 零初始化残差分支（Markov 头、LoRA 的 B、超连接的 α）都有"第一步只训一侧"的现象；
+  用"两侧是否都不动"区分"死参数"和"延迟一步"。
+
+## 57. DSpark 的三个工程细节：ckpt 布局、`dspark.*` 键、槽位占窗
+
+**现象**：
+1. `--model data/llm-sft7/best` 报"缺少 hparams.json"，但文件明明在 `data/llm-sft7/`；
+2. 给带草稿器的模型叠主干权重，刷了四十多行"`dspark.*` 缺失，保留初始化"；
+3. 窗口设 128、`depth=5`，但"最老的几个 token 好像没被看到"。
+
+**机制/做法**：
+1. 训练脚本把 `hparams.json`/`vocab.json` 放在 **run 根**，权重放 `best/`（或根）：
+   解析路径时要把"run 根 + 它自己"两级都试一遍，权重试 `model.pt` 与 `best/model.pt`。
+2. 草稿器是**新训**的，主干 ckpt 里本来就没有 `dspark.*`：叠权重前先把
+   `model.dspark = None`（模块属性置 None 即从 `named_parameters` 里消失），叠完再挂回来。
+3. 槽位追加在 ctx 之后，**占窗口宽度**：槽位 `i` 与最老 ctx 的距离是 `depth - i`。
+   所以 `window` 必须 ≥ "想看的上下文 + depth"，否则最老的几个 token 会被挤出滑窗
+   （单测 `test_draft_mask_blocks_slot_crosstalk` 把可见集合写成 `idx > qi - window`
+   钉住了这条）。
+
+**教训**：
+- 训练产物有**两种布局**（run 根放元信息、`best/` 放权重）时，任何"从路径推结构"的脚本
+  都要显式列候选、并在找不到时**报出试过的路径**，而不是默认加个 `/hparams.json`。
+- 结构性新增子模块（草稿器/视觉塔/记忆）都会遇到"叠老权重刷警告"：先摘子模块再叠，
+  比给加载器加白名单更不容易漏。
+- "并行槽位"这类**追加在序列末尾**的设计，其可看范围受"自己在序列里的位置"影响；
+  窗口类超参要按"槽位在末尾"来算，不能按"最后一个真实 token"来算。

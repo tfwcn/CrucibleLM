@@ -249,6 +249,21 @@ class SmallLLMConfig:
     dspark_conf_threshold: float = 0.5  # 累计存活概率下限（越小越激进；<=0=全验证）
     dspark_min_verify: int = 1  # 每轮至少验证的草稿数（保底每轮有推进）
 
+    # ===== DSpark 独立草稿器（V4.1 §2.4.3；结构性开关，默认关）=====
+    # 开 = 额外挂一个 DSparkDrafter（3 层滑窗 + Markov 头 + 置信头，≈5M 参数），
+    # 训练走 scripts/train_dspark.py（主干冻结、只训草稿器）；state_dict 多 `dspark.*` 键
+    dspark_draft: bool = False
+    dspark_layers: int = 3        # 草稿器层数（论文 3）
+    dspark_heads: int = 4         # 草稿器注意力头数（小模型 4 足够）
+    dspark_window: int = 128      # 滑窗注意力窗口（论文 128）
+    dspark_depth: int = 5         # 一次并行产出的草稿位置数（论文 5）
+    dspark_markov_rank: int = 32  # Markov 头低秩维（U·E(t_prev)，一阶转移）
+    # 调度口径：confidence（累计存活概率阈值）/ throughput（期望吞吐最优，论文口径）
+    dspark_schedule: str = "confidence"
+    dspark_target_base: float = 1.0      # 验证一次前向的固定成本（相对单位）
+    dspark_target_per_token: float = 0.15  # 每多验一个位置的边际成本
+    dspark_draft_cost: float = 0.6       # 每轮起草一次的成本
+
     # ===== 跨设备专家 offload（默认关；见 offload.py / docs/details/cross-device-offload.md）=====
     offload_enabled: bool = False
     # offload 目标设备的专家冷副本落点：cpu（内存）或 disk（磁盘，更省内存）
