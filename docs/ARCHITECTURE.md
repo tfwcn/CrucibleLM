@@ -18,7 +18,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek-V4.1 | Single-Pass mHC 超连接残差 + Mega-mHC | `hyperconn.py`：n 路残差流（A 输入聚合 / B 双随机流混合 / C 写回，逐 token 从 X_l 预测，Sinkhorn 20 轮）；**Single-Pass** 把 A 错后一层（block 消费上一层的 A_{l-1}），使"混合 + 系数预测"能在**一趟** tile 里完成（激活读写 (4n+4)d→(2n+2)d）；`hc_mega` 用分块单趟数据流实现该口径（PyTorch 版，数值与整块 GEMM 等价 3e-5）。默认 `--hyper-streams 0`（关闭），开启后 `hc_single_pass`/`hc_mega` 默认开、老 ckpt 回退关；恒等起点（A 均匀 / H≈I / post=1）单测锁定 | `config.py`/`hyperconn.py`/`block.py`/`model.py` |
 | DeepSeek-V4.1 | CSA2 三模式（Full/Reindex/Reuse） | `mla.py`/`sparse_attn.py`：逐全注意力层静态分配——Full 自算自存 KV + 自选 Top-K；Reindex 借 main KV/indexer K、**自带 indexer Q 重选**；Reuse 直接复用最新 Top-K（`csa_modes`，空=旧 Full/Reuse 交替） |
 | DeepSeek-V4.1 | 分层稀疏 indexer | `sparse_attn.py`：学习式打分器选 Top-K 主 KV，先块级粗选候选池再池内 token 级 Top-K，并用蒸馏损失（`indexer_loss_coef`）训练打分器（`sparse_indexer`，**默认关**：新增 `w_iq`/`w_ik` 改键） |
-| DeepSeek-V4.1 | 3×3 pixel-unshuffle 视觉压缩 | `vision_compress.py`：`vision_unshuffle=3` 先按 3×3 重排降采样，视觉 token /9（默认 1=关） |
+| DeepSeek-V4.1 | DeepSeek-ViT 视觉入路（patch14 + 2D-RoPE + 3×3 unshuffle + MLP projector） | `vision_compress.py`：**线性 patch embedding**（Muon 兼容）→ **2D-RoPE**（行/列各占一半维度，无绝对位置表 → 原生分辨率）→ ViT×L（**双向**注意力 + RMSNorm + SwiGLU）→ **3×3 特征 unshuffle**（token ÷9，通道 ×9）→ **2 层 MLP projector**（`vision_projector_hidden`→`d_model`）；`vision_grid()` 可离线算 token 数（1344²/patch14/r3 → 96×96 → **1024**）；`vision_enabled` 默认关（结构性、多 `vision.*` 键），`vision_tokens=0` 表示按论文不二次压缩 | `vision_compress.py` |
 | DeepSeek DSpark | 置信调度验证（spec decoding） | `spec_decode.py`：按草稿存活置信度动态定验证长度，截断必被拒后缀（`dspark_enabled`，默认关） |
 | DeepSeek-V4.1 | DSpark 独立草稿器（半自回归 + 置信调度） | `dspark.py`：**3 层滑窗 Transformer**（窗 128）一次前向并行出 `depth=5` 个 base logits（槽位互不可见），**Markov 头** `base_i + U·E(t_{i-1})`（秩 32，一阶、零初始化）补位置依赖，**置信头** `σ(w·h_i)` 给条件接受概率 → 前缀存活 `S_i=∏c_j`；`DSparkScheduler` 用 `tokens(n)=1+ΣS_i` 与 `cost(n)=draft+base+per_token·n` 选吞吐最优验证长度（`dspark_schedule=throughput`，另有 `confidence` 阈值口径）。**独立训练**（`scripts/train_dspark.py`：主干冻结、只训草稿器，梯度不回传）；`dspark_draft` 默认关（结构性、多 `dspark.*` 键），未训练也不影响正确性（验证精确 = 贪心）。实测 162.7M 主干 + 18.2M 草稿器，草稿一步 = 验证一步的 0.04 | `config.py`/`dspark.py`/`spec_decode.py`/`model.py`/`scripts/train_dspark.py` |
 | Qwen3-Next | Hybrid 注意力（全/线性交替） | `block.py`：每 4 层 1 层 MLA，其余 `GatedDeltaLite` 线性层 |
@@ -382,7 +382,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `draft_enabled`(False) / `draft_window`(5) / `draft_source`(hybrid) / `draft_ngram_min`(2) / `dspark_enabled`(False) / `dspark_conf_threshold`(0.5) / `dspark_min_verify`(1) | 投机解码：MTP+n-gram 起草 + 主干并行验证（DSpark 置信调度验证），输出=逐 token 贪心 | `spec_decode.py` |
 | `offload_enabled`(False) / `offload_target`(cpu) / `offload_dir`("") / `offload_capacity`(0) / `offload_prefetch`(False) | 专家 offload 到 CPU/磁盘 + LRU 淘汰（capacity≤0 时全驻留→分组快路径） | `offload.py` |
 | `les_enabled`(False) / `les_history`(8) / `les_topn`(4) | LES 专家命中预测，供 offload 异步预取（cpu target 走 side stream） | `les.py` |
-| `vision_enabled`(False) / `vision_tokens`(64) / `vision_patch`(16) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_unshuffle`(1) | 视觉 token 压缩（结构预留，推理前缀 + 训练 loss 已接线；`vision_unshuffle=3` 走 3×3 pixel-unshuffle，token /9） | `vision_compress.py` |
+| `vision_enabled`(False) / `vision_patch`(14) / `vision_unshuffle`(3) / `vision_tokens`(0) / `vision_compress`(avgpool) / `vision_d_in`(3) / `vision_d_vit`(256) / `vision_vit_layers`(12) / `vision_vit_heads`(4) / `vision_projector_hidden`(512) | **DeepSeek-ViT 视觉入路**：patch14 → 线性 embed → 2D-RoPE → 双向 ViT（RMSNorm+SwiGLU）→ 3×3 特征 unshuffle（token ÷9）→ 2 层 MLP projector → `d_model`；`vision_tokens=0` = 论文口径不二次压缩（>0 才池化/查询压到固定长度）。推理前缀与训练 loss 均已接线（视觉段不进 CE）。`vision_enabled=False` 时无该模块、state_dict 逐位兼容。**未实现**论文的多模态 aux-free 路由偏置（视觉/文本各自一套 `expert_bias`），见 pitfalls 58 | `vision_compress.py` |
 | `csa_reuse_every`(2) | CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full，其余 Reuse 借共享 latent；缓存降幅依全注意力层数而定（12 层/full_attn_every=4 → 3 层里 2 Full 1 Reuse，实测 8192 ctx KV −30%、32768 −32%）。**默认 2=开**（实测有代价的净收益），1=关 | `mla.py`/`sparse_attn.py`/`model.py` |
 | `kv_source_layer_ids`("") | CSA2 **非均匀** KV 源层（V4.1，如 `"2,8,14,20"`）：只决定"谁生产"（表内全注意力层为 Full 生产者，其余复用最近生产者），间距任意；**不改 `state_dict` 键**，续训/迁移沿用 checkpoint。详见 `docs/details/csa-modes.md` | `config.py`/`model.py` |
 | `compress_ratios`("") | CSA2 **逐层主 KV 压缩比**（V4.1 `CSA2(ratio, mode)` 的 ratio）：整数表按全注意力层序号循环（`"2"` / `"2,1"`），m = 每个 main KV 条目聚合的**连续 token 数**（不重叠）。m>1 时远端按 m 块池化（块内逐位置可学习权重 `z_cmp`，初值 1=算术平均），本地窗口/当前块保持未压缩，块尾作 rope 代表位置；同样列数预算下远端表示的 token 数 ×m。**默认关**（m>1 新增 `z_cmp`、改键，旧 ckpt 需重训；续训从 hparams 沿用）；压缩开启后该层恒走分块路径（`sparse_threshold` 失效）；借用层沿用生产者的 m 与 `z_cmp`。KV **显存**尚未下降（池化在读取时做，缓存仍逐 token 存 latent，布局重构随 #7）。详见 `docs/details/kv-compression-ratio.md` | `config.py`/`sparse_attn.py`/`model.py` |
@@ -421,7 +421,9 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
   会 churn），容量按驻留集 `_resident` 计。实测真实 128M 上中性偏负（0.05–0.11x 慢；
   瓶颈是逐专家 dispatch 而非搬运），默认关；要变净收益需 offload 是"省显存才能跑"
   的刚需 + 路由可预测（见 `docs/details/les-expert-scheduling.md`）。
-- **视觉压缩**：默认关时模型无该模块、`state_dict` 兼容；**推理前缀 + 训练 loss 均已接线**
+- **视觉入路（DeepSeek-ViT）**：patch14 + 2D-RoPE（无位置表、分辨率可变）+ 双向 ViT
+  + 3×3 特征 unshuffle（token ÷9）+ 2 层 MLP projector；默认关时模型无该模块、
+  `state_dict` 兼容；**推理前缀 + 训练 loss 均已接线**
   （`forward(targets=..., vision_embeds=...)` 只算文本段错位一位；`train_step(vision_images=...)`
   经带梯度的 `model.vision` 编码），视觉段不进 CE。
 - **CSA2 跨层 KV 复用**：`csa_reuse_every=N`（默认 **2=开**；1=全 Full=关）时，每 N 个全注意力层
@@ -516,5 +518,6 @@ python -m pytest tests/ -q  # 需要 torch，无 torch 自动跳过
 
 新增能力各有独立单测：`test_speculative.py`（起草器 + "等于贪心"契约 + 部分接受跳位）、
 `test_offload.py`（CPU/磁盘数值等价 + LRU）、`test_les.py`（预测确定性 + 数值不变）、
-`test_vision_compress.py`（patch 往返 + 压缩形状 + 默认关兼容）、
+`test_vision_compress.py`（21 项：patch 往返、token 数口径（1344²→1024）、
+2D-RoPE 相对性、双向注意力、无卷积、SwiGLU/RMSNorm、2 层 projector、默认关兼容）、
 `test_multi_token_decode.py`（多 token 增量解码回归）。

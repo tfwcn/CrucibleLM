@@ -282,18 +282,25 @@ class SmallLLMConfig:
     # 每步预测搬上算力设备的专家数
     les_topn: int = 4
 
-    # ===== 视觉 token 压缩（默认关；见 vision_compress.py / docs/details/vision-token-compression.md）=====
+    # ===== 多模态视觉入路（DeepSeek-ViT，默认关；见 vision_compress.py / docs/details/vision-token-compression.md）=====
     vision_enabled: bool = False
-    # 压缩后送进主干的视觉 token 数
-    vision_tokens: int = 64
-    # patch 边长（图像 H/W 需为其整数倍）
-    vision_patch: int = 16
-    # 压缩方式：avgpool（自适应平均池化，无参数查询）/ perceiver（可学习查询 cross-attention）
+    # 二次压缩后的视觉 token 数；**0 = 不压**（论文口径：unshuffle 后保留整个网格，
+    # 1344×1344/patch14/3×3 → 1024 token）。>0 时再池化/查询聚合到固定长度
+    vision_tokens: int = 0
+    # patch 边长（论文 14；H/W 须为 patch×unshuffle 的整数倍）
+    vision_patch: int = 14
+    # 二次压缩方式：avgpool（无参数池化）/ perceiver（可学习查询 cross-attention）
     vision_compress: str = "avgpool"
     vision_d_in: int = 3  # 输入通道（RGB=3）
-    # 3×3 pixel-unshuffle（DeepSeek-V4.1）：r>1 时先按 r×r 重排降采样，patch 数除以 r²
-    # （r=3 → 视觉 token 省 9x）；1 表示不做（默认，逐位兼容）
-    vision_unshuffle: int = 1
+    # 3×3 特征 unshuffle（论文口径）：ViT 之后把相邻 r×r 个 patch 特征沿通道拼接，
+    # token 数 ÷ r²；1 表示不做
+    vision_unshuffle: int = 3
+    # ViT 宽度 / 层数 / 头数（论文 1024 / 32 / 16；本仓库按小模型缩到 256 / 12 / 4）
+    vision_d_vit: int = 256
+    vision_vit_layers: int = 12
+    vision_vit_heads: int = 4
+    # 2 层 MLP projector 的隐层宽度（论文 5120）
+    vision_projector_hidden: int = 512
 
     @property
     def head_dim(self) -> int:

@@ -188,7 +188,7 @@ class TinyLLM(nn.Module):
 
             self.retro = RetroFusion(
                 config.d_model, config.retro_heads, config.dropout)
-        # 视觉 token 压缩（默认 None：无参数，state_dict 兼容；开后多一段视觉前缀）
+        # 多模态视觉入路（DeepSeek-ViT；默认 None：无参数，state_dict 兼容）
         self.vision: nn.Module | None = None
         if config.vision_enabled:
             from src.llm.local.vision_compress import VisionCompressor
@@ -196,7 +196,9 @@ class TinyLLM(nn.Module):
             self.vision = VisionCompressor(
                 config.d_model, config.vision_d_in, config.vision_patch,
                 config.vision_tokens, config.vision_compress, config.n_heads,
-                config.dropout, config.vision_unshuffle)
+                config.dropout, config.vision_unshuffle, config.vision_d_vit,
+                config.vision_vit_layers, config.vision_vit_heads,
+                config.vision_projector_hidden)
         self._init_weights()
 
     def _csa_channel(self) -> CsaChannel | None:

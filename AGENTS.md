@@ -36,7 +36,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 13 | DSpark 独立训练草稿模块（3 层 + Markov 头 + 置信头 + 吞吐调度） | ✅ 开关 `dspark_draft`（3 层滑窗 128 + 并行 5 槽位（互不可见）+ Markov 头 `U·E(t_{i-1})` 秩 32 + 置信头（条件接受率→前缀存活 `S_i`）；`DSparkScheduler` 按 `1+ΣS_i` / `draft+base+per_token·n` 取吞吐最优（`dspark_schedule=throughput`），另有 `confidence` 阈值口径；独立训练脚本主干冻结、梯度不回传；未训练也不破坏正确性（验证精确 = 贪心）；实测 162.7M 主干 + 18.2M 草稿器，草稿一步 = 验证一步的 0.04） | `config.py`/`dspark.py`/`spec_decode.py`/`model.py`/`scripts/train_dspark.py` |
 | 14 | head-wise Muon（Q/K 按头分块） | ✅ 开关 `--muon-head-wise`（w_uq/w_qr/w_uk 按头切块逐头 NS5，bmm 批量、与逐头循环逐位一致） | `optim.py` |
 | 15 | Sinkhorn 更新（embedding/head 用 momentum+Sinkhorn 替 Adam） | ✅ 开关 `--sinkhorn`（Algorithm 1：Nesterov + 近零行屏蔽 + K=11 行/列交替归一化 + γ=0.18；只存一份动量，实测优化器状态 −50%） | `optim.py` |
-| 16 | 视觉：patch14 + 3×3 downsample | 🔶 downsample 对齐 | `vision_compress.py` |
+| 16 | 视觉：patch14 + 3×3 downsample | ✅ 开关 `vision_enabled`（DeepSeek-ViT：线性 patch embed（Muon 兼容）+ **2D-RoPE**（无位置表 → 原生分辨率）+ 双向 ViT（RMSNorm+SwiGLU）+ **3×3 特征 unshuffle**（token ÷9）+ 2 层 MLP projector；1344²/patch14/r3 → 96×96 → **1024** token；`vision_grid()` 离线算 token 数；视觉塔 588.7M（论文口径）/14.3M（默认 12L·256）；**未做**多模态 aux-free 路由偏置） | `vision_compress.py` |
 | 17 | 1M 上下文（64K 稀疏起训 + YaRN 外推） | 🔶 默认 8K / 长上下文 200K | `config.py` + 训练 |
 | 18 | 可控推理努力（1–100 整数档） | ❌ | 推理 / 后训练 |
 
