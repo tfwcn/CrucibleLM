@@ -226,12 +226,17 @@ class SparseMLAModule(MLAModule):
         ced: bool = False,
         kv_fmt: str = "",
         block_cache: bool = False,
+        yarn_beta_fast: float = 32.0,
+        yarn_beta_slow: float = 1.0,
+        yarn_original_len: int = 8192,
     ):
         super().__init__(
             d_model, n_heads, q_lora_rank, kv_lora_rank, qk_rope_dim,
             max_seq_len, rope_theta, yarn_scale, dropout,
             o_groups=o_groups, o_lora_rank=o_lora_rank, ced=ced,
-            kv_fmt=kv_fmt,
+            kv_fmt=kv_fmt, yarn_beta_fast=yarn_beta_fast,
+            yarn_beta_slow=yarn_beta_slow,
+            yarn_original_len=yarn_original_len,
         )
         # 纯超参，不注册为 Parameter/Buffer（state_dict 与 MLA 一致，checkpoint 通用）
         self.sparse_threshold = sparse_threshold

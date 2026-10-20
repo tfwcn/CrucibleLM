@@ -37,7 +37,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 14 | head-wise Muon（Q/K 按头分块） | ✅ 开关 `--muon-head-wise`（w_uq/w_qr/w_uk 按头切块逐头 NS5，bmm 批量、与逐头循环逐位一致） | `optim.py` |
 | 15 | Sinkhorn 更新（embedding/head 用 momentum+Sinkhorn 替 Adam） | ✅ 开关 `--sinkhorn`（Algorithm 1：Nesterov + 近零行屏蔽 + K=11 行/列交替归一化 + γ=0.18；只存一份动量，实测优化器状态 −50%） | `optim.py` |
 | 16 | 视觉：patch14 + 3×3 downsample | ✅ 开关 `vision_enabled`（DeepSeek-ViT：线性 patch embed（Muon 兼容）+ **2D-RoPE**（无位置表 → 原生分辨率）+ 双向 ViT（RMSNorm+SwiGLU）+ **3×3 特征 unshuffle**（token ÷9）+ 2 层 MLP projector；1344²/patch14/r3 → 96×96 → **1024** token；`vision_grid()` 离线算 token 数；视觉塔 588.7M（论文口径）/14.3M（默认 12L·256）；**未做**多模态 aux-free 路由偏置） | `vision_compress.py` |
-| 17 | 1M 上下文（64K 稀疏起训 + YaRN 外推） | 🔶 默认 8K / 长上下文 200K | `config.py` + 训练 |
+| 17 | 1M 上下文（64K 稀疏起训 + YaRN 外推） | ✅ **真实 YaRN NTK-by-parts**（高频不动/低频 ÷s/中间斜坡 + mscale 折进 cos/sin；`scale=1` 逐位等于标准 RoPE，旧上限 8→512）+ `longctx_1m_config()`（8K→1M = scale 128）+ 启动自检（64K 必须稀疏、违规报错；YaRN 比例/缓存/无 SWA 警告）+ `--ctx-ramp` 阶段表；实测 1M 处位置仍可分辨、RoPE 缓存 512MB；解码 FLOPs 近常数需开 `kv_block_cache`/SWA（pitfalls 60） | `rope.py`/`longctx.py` |
 | 18 | 可控推理努力（1–100 整数档） | ❌ | 推理 / 后训练 |
 
 **每项交付模板**：`docs/details/<技术>.md`（含"从想法到代码"）+ 单测（数学/因果/Finite）+ `docs/ARCHITECTURE.md` 开关行；踩坑进 `docs/pitfalls/`。默认开按约定 5；**前向数学变更**（1/3/4/5/6/7/8/9/10/11）必须重跑冒烟，并给出"旧 checkpoint 来源对齐或显式关闭"路径（沿用 `hparams.json`）。

@@ -23,7 +23,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek-V4.1 | DSpark 独立草稿器（半自回归 + 置信调度） | `dspark.py`：**3 层滑窗 Transformer**（窗 128）一次前向并行出 `depth=5` 个 base logits（槽位互不可见），**Markov 头** `base_i + U·E(t_{i-1})`（秩 32，一阶、零初始化）补位置依赖，**置信头** `σ(w·h_i)` 给条件接受概率 → 前缀存活 `S_i=∏c_j`；`DSparkScheduler` 用 `tokens(n)=1+ΣS_i` 与 `cost(n)=draft+base+per_token·n` 选吞吐最优验证长度（`dspark_schedule=throughput`，另有 `confidence` 阈值口径）。**独立训练**（`scripts/train_dspark.py`：主干冻结、只训草稿器，梯度不回传）；`dspark_draft` 默认关（结构性、多 `dspark.*` 键），未训练也不影响正确性（验证精确 = 贪心）。实测 162.7M 主干 + 18.2M 草稿器，草稿一步 = 验证一步的 0.04 | `config.py`/`dspark.py`/`spec_decode.py`/`model.py`/`scripts/train_dspark.py` |
 | Qwen3-Next | Hybrid 注意力（全/线性交替） | `block.py`：每 4 层 1 层 MLA，其余 `GatedDeltaLite` 线性层 |
 | Qwen3 系 | QK-Norm、短卷积 | MLA/线性层均有 RMSNorm；线性层 K/V 加 depthwise 短卷积 |
-| Qwen/DeepSeek 通用 | RoPE + YaRN 外推 | `rope.py`：`yarn_scale` 稀释高频，8k 上下文 |
+| DeepSeek-V4.1 | **YaRN NTK-by-parts + 1M 上下文路线** | `rope.py`：按波长分三段——高频维度**不动**（短距离分辨率）、低频维度 **÷s**（插值）、中间线性斜坡；`mscale=0.1·ln s+1` 折进 cos/sin（= q、k 各 ×√mscale）；`yarn_scale=1` **逐位等于**标准 RoPE。1M 预设 `longctx_1m_config()`（8K→1M = `yarn_scale=128`，`yarn_scaling_factor` 上界放宽到 512）；`longctx.py` 启动自检：**64K 起训必须有稀疏注意力**（V4.1 不做 dense 预热，违规直接报错）、长于训练长度要配 YaRN、`yarn_scale` 与比例对不上要警告、≥256K 无 SWA 要警告 | `rope.py`/`longctx.py` |
 
 ## 默认配置（`config.py:SmallLLMConfig`）
 
@@ -215,8 +215,11 @@ GPU 利用率低时先看 CPU 是否被 parquet 解码/分词占满。
 - 线性层超 `linear_chunk`（默认 2048）切块递推：前向精确，反向块间截断
   （Transformer-XL 式）；另修了两处训推不一致：跨块项补 `×scale`、
   解码补卷积状态缓存（否则每步 k/v 与全前向对不上，Mamba 系同理）。
-- `longctx_config()`：200K 预设（YaRN×8）。200K 推理 KV 仅约 0.2GB（latent 缓存），
-  线性层常数状态；**训练按"短训 + YaRN 外推 + 阶段性长文微调"走**，16G 实测
+- `longctx_config()`：200K 预设（YaRN×8）；`longctx_1m_config()`：**1M 预设**
+  （`max_seq_len=1048576`、`yarn_scale=128`、`yarn_original_len=8192`）。
+  200K 推理 KV 仅约 0.2GB（latent 缓存），线性层常数状态；
+  **训练按"64K 稀疏起训（不做 dense 预热）→ 到 token 预算再拉长 → YaRN 配套外推"走**
+  （`longctx.validate_longctx` 启动自检，见 `docs/details/long-context.md`）；16G 实测
   32K+ckpt 约 4GB，200K 直接训练又慢又贵，不推荐。
 
 ```python

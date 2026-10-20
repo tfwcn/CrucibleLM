@@ -68,6 +68,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--preset", choices=["tiny", "base"], default="base",
                    help="tiny=CPU 验证配置，base=100M 默认配置")
     p.add_argument("--seq-len", type=int, default=512, help="训练序列长度")
+    p.add_argument("--ctx-ramp", default="",
+                   help="长上下文阶段表，如 '0:65536,34000000000:1048576'"
+                        "（仅用于启动自检与阶段提示；真正切段请续训改 --seq-len 重打包）")
     p.add_argument("--batch", type=int, default=4, help="每步 batch（序列数）")
     p.add_argument("--accum", type=int, default=1, help="梯度累积步数")
     p.add_argument("--max-steps", type=int, default=1000, help="训练步数上限")
@@ -327,6 +330,13 @@ def _restore_arch_switch(args: argparse.Namespace, key: str) -> object | None:
         if key in cfg:
             return cfg[key]
     return None
+
+
+def _parse_ctx_ramp(spec: str) -> list[tuple[int, int]]:
+    """解析 `--ctx-ramp`（"已消费token:序列长度" 列表）；空串 = 不启用."""
+    from src.llm.local.longctx import parse_ctx_stages
+
+    return parse_ctx_stages(spec)
 
 
 def resolve_arch_switches(args: argparse.Namespace,
@@ -898,6 +908,16 @@ def main(argv=None) -> int:
     # indexer 超参（不是架构开关：键名不变但**改形状**，装错会大声报 shape 错，
     # 故允许 CLI 直接覆盖；显式传入才生效，None=沿用默认/checkpoint）
     apply_indexer_overrides(args, config)
+    # 长上下文自检（V4.1 #17）：64K 起训必须有稀疏注意力（不做 dense 预热），
+    # 长于训练长度要配 YaRN；致命配置直接抛错，警告照常打印但继续跑
+    from src.llm.local.longctx import format_report, seq_len_at
+
+    _stages = _parse_ctx_ramp(getattr(args, "ctx_ramp", "") or "")
+    _seq = seq_len_at(0, _stages, args.seq_len)
+    if _stages:
+        print(f"长上下文阶段：{_stages}（当前 {_seq}；按已消费 token 切换）",
+              flush=True)
+    print(format_report(config, _seq), flush=True)
     every = config.csa_reuse_every
     limit = config.swiglu_limit
     if arch_src.get("csa_reuse_every") == "checkpoint":

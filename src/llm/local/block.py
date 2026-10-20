@@ -29,6 +29,9 @@ class HybridBlock(nn.Module):
         max_seq_len: int = 8192,
         rope_theta: float = 10000.0,
         yarn_scale: float = 1.0,
+        yarn_beta_fast: float = 32.0,
+        yarn_beta_slow: float = 1.0,
+        yarn_original_len: int = 8192,
         n_experts: int = 16,
         top_k: int = 4,
         expert_hidden: int = 192,
@@ -99,6 +102,9 @@ class HybridBlock(nn.Module):
                 ced=ced,
                 kv_fmt=kv_quant,
                 block_cache=block_cache,
+                yarn_beta_fast=yarn_beta_fast,
+                yarn_beta_slow=yarn_beta_slow,
+                yarn_original_len=yarn_original_len,
             )
             # CSA2 三模式（V4.1）：full 自算自存；reindex/reuse 借生产者 main KV
             # （`csa_reuse=True` 时解码不写自己的缓冲），纯超参不进 state_dict

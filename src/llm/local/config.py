@@ -74,8 +74,13 @@ class SmallLLMConfig:
     max_seq_len: int = 8192
     # RoPE 基频
     rope_theta: float = 10000.0
-    # YaRN 外推缩放因子（>1 时扩展有效上下文）
+    # YaRN 外推缩放因子（>1 时扩展有效上下文；NTK-by-parts 混合，见 rope.py）
     yarn_scale: float = 2.0
+    # YaRN 分界（高频段外推 / 低频段插值）：β_fast=32 圈以内不动，β_slow=1 圈以上全插值
+    yarn_beta_fast: float = 32.0
+    yarn_beta_slow: float = 1.0
+    # 训练时的原始上下文长度（YaRN 算分界用；换了训练长度要跟着改）
+    yarn_original_len: int = 8192
     # dropout
     dropout: float = 0.0
     # embedding 与输出头是否共享权重（省约 6M 参数）
@@ -513,6 +518,26 @@ def longctx_config() -> "SmallLLMConfig":
     return SmallLLMConfig(
         max_seq_len=204800,
         yarn_scale=8.0,
+        sparse_threshold=4096,
+        sparse_window=4096,
+        sparse_sink=128,
+        sparse_stride=512,
+        sparse_chunk=2048,
+    )
+
+
+def longctx_1m_config() -> "SmallLLMConfig":
+    """1M 上下文预设（V4.1 的"4K→1M、256 倍"口径）.
+
+    训练长度 8K、目标 1M → `yarn_scale=128`（`yarn_scaling_factor` 上限已放宽到 512，
+    旧的 8 倍截断会让 1M 直接失效）。稀疏/滑动窗口按 `longctx_config` 同款配置；
+    层内 SWA（`swa_window`）仍是 opt-in（改键），这里不开——`longctx.validate_longctx`
+    会对"≥256K 且无 SWA"给出警告。
+    """
+    return SmallLLMConfig(
+        max_seq_len=1048576,
+        yarn_scale=128.0,
+        yarn_original_len=8192,
         sparse_threshold=4096,
         sparse_window=4096,
         sparse_sink=128,

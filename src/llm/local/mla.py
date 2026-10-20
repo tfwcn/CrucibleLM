@@ -49,6 +49,9 @@ class MLAModule(nn.Module):
         o_lora_rank: int = 0,
         ced: bool = False,
         kv_fmt: str = "",
+        yarn_beta_fast: float = 32.0,
+        yarn_beta_slow: float = 1.0,
+        yarn_original_len: int = 8192,
     ):
         super().__init__()
         self.n_heads = n_heads
@@ -132,7 +135,10 @@ class MLAModule(nn.Module):
         self.csa_mode = "full"
         self.csa_reuse = False
         # 预计算 RoPE 缓存（解耦部分维度小，可一次建好）
-        cos, sin = build_rope_cache(max_seq_len, qk_rope_dim, rope_theta, yarn_scale)
+        cos, sin = build_rope_cache(
+            max_seq_len, qk_rope_dim, rope_theta, yarn_scale,
+            yarn_original_len=yarn_original_len,
+            yarn_beta_fast=yarn_beta_fast, yarn_beta_slow=yarn_beta_slow)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
