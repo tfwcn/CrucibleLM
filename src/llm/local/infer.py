@@ -112,8 +112,19 @@ class LocalChatBackend:
         self.tokenizer = tokenizer
 
     def _prepare_ids(self, messages: list[dict], max_new_tokens: int,
+                     effort: object = None,
                      ) -> tuple["torch.Tensor", "torch.device"]:
-        """拼 prompt + 编码 + 截断 + 上设备（chat/stream 共用）."""
+        """拼 prompt + 编码 + 截断 + 上设备（chat/stream 共用）.
+
+        `effort`（1–100 或 low/high/max）非空时，先把
+        `Reasoning Effort: {b} ...` 前置进系统提示（V4.1 §5.1.4）。
+        None = 不改提示（与老行为逐位一致）。
+        """
+        from src.llm.local.effort import apply_effort_messages, resolve_effort
+
+        level = resolve_effort(effort)
+        if level is not None:
+            messages = apply_effort_messages(messages, level)
         # role 标签与 SFT 模板统一用中文（此前采样用英文 <user>/<assistant>，
         # 与 SFT_PROMPT 的 <用户>/<助手> 不一致，已统一）
         role_cn = {"system": "系统", "user": "用户", "assistant": "助手"}
@@ -140,9 +151,13 @@ class LocalChatBackend:
         temperature: float = 0.0,
         top_k: int = 0,
         repetition_penalty: float = 1.0,
+        effort: object = None,
     ) -> dict:
-        """对话生成，返回 {"content","reasoning","tool_calls","finish_reason"}."""
-        input_ids, _ = self._prepare_ids(messages, max_new_tokens)
+        """对话生成，返回 {"content","reasoning","tool_calls","finish_reason"}.
+
+        `effort`：推理努力档（1–100 / low / high / max）；None = 不注入指令。
+        """
+        input_ids, _ = self._prepare_ids(messages, max_new_tokens, effort)
         gen = self.model.generate(
             input_ids, max_new_tokens=max_new_tokens,
             temperature=temperature, top_k=top_k,
@@ -164,9 +179,13 @@ class LocalChatBackend:
         temperature: float = 0.0,
         top_k: int = 0,
         repetition_penalty: float = 1.0,
+        effort: object = None,
     ):
-        """流式生成，逐块 yield 文本（SSE 用；字符级分词保证增量解码精确）."""
-        input_ids, _ = self._prepare_ids(messages, max_new_tokens)
+        """流式生成，逐块 yield 文本（SSE 用；字符级分词保证增量解码精确）.
+
+        `effort` 语义同 `chat`。
+        """
+        input_ids, _ = self._prepare_ids(messages, max_new_tokens, effort)
         inv = {i + 4: ch for i, ch in enumerate(self.tokenizer._chars)}
         for tid in self.model.stream_tokens(
                 input_ids, max_new_tokens=max_new_tokens,

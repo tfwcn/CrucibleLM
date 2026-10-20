@@ -97,8 +97,9 @@ class OpenAIServer:
 
         return Handler
 
-    def _chat_params(self, req: dict) -> tuple[list[dict], int, float, int, float, list[str]]:
-        """解析通用参数（messages/max_tokens/temperature/top_k/repetition_penalty/stop）."""
+    def _chat_params(self, req: dict) -> tuple[list[dict], int, float, int, float,
+                                               list[str], object]:
+        """解析通用参数（messages/max_tokens/temperature/top_k/repetition_penalty/stop/effort）."""
         messages = req.get("messages") or []
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
@@ -109,7 +110,10 @@ class OpenAIServer:
         stop = req.get("stop") or []
         if isinstance(stop, str):
             stop = [stop]
-        return messages, max_tokens, temperature, top_k, repetition_penalty, stop
+        # 推理努力档（V4.1 §5.1.4）：`reasoning_effort` 与 `effort` 等价，
+        # 接受 1–100 整数或 low/high/max；缺省 None = 不注入指令（老客户端不变）
+        effort = req.get("reasoning_effort", req.get("effort"))
+        return messages, max_tokens, temperature, top_k, repetition_penalty, stop, effort
 
     @staticmethod
     def _apply_stop(text: str, stop: list[str]) -> tuple[str, str]:
@@ -122,14 +126,24 @@ class OpenAIServer:
     def handle_chat(self, handler: BaseHTTPRequestHandler, req: dict) -> None:
         """处理 chat 请求（stream=true 走 SSE 真增量）。"""
         (messages, max_tokens, temperature, top_k,
-         repetition_penalty, stop) = self._chat_params(req)
+         repetition_penalty, stop, effort) = self._chat_params(req)
+        # 努力档先校验（非法值给 400 而不是让 ValueError 冒成 500）
+        from src.llm.local.effort import resolve_effort
+
+        try:
+            effort = resolve_effort(effort)
+        except ValueError as exc:
+            handler._send_json(400, {"error": {  # noqa: SLF001 - 同类内部调用
+                "message": str(exc), "type": "invalid_request_error"}})
+            return
         stream = bool(req.get("stream", False))
         model_id = req.get("model") or self.model_name
         if not stream:
             with self._lock:
                 resp = self.backend.chat(messages, max_new_tokens=max_tokens,
                                          temperature=temperature, top_k=top_k,
-                                         repetition_penalty=repetition_penalty)
+                                         repetition_penalty=repetition_penalty,
+                                         effort=effort)
             content, finish = self._apply_stop(resp["content"] or "", stop)
             handler._send_json(200, {  # noqa: SLF001 - 同类内部调用
                 "id": f"chatcmpl-{int(time.time() * 1000)}",
@@ -156,7 +170,8 @@ class OpenAIServer:
             with self._lock:
                 for piece in self.backend.stream(messages, max_new_tokens=max_tokens,
                                                  temperature=temperature, top_k=top_k,
-                                                 repetition_penalty=repetition_penalty):
+                                                 repetition_penalty=repetition_penalty,
+                                                 effort=effort):
                     chunk = dict(prefix)
                     chunk["choices"] = [{"index": 0,
                                          "delta": {"content": piece},
