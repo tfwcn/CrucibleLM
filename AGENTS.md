@@ -31,7 +31,7 @@ CrucibleLM（坩埚）——**技术优先**的 LLM 架构试验场。对标 **D
 | 8 | FP4 主 KV（MXFP4 + QAT）+ FP8 SWA KV | ✅ 开关 `kv_quant`（MXFP4：E2M1 + 每 16 通道 E4M3 scale，4.5 bit/通道；SWA 环联动 FP8。QAT 走 fake-quant/STE，读时反量化再算注意力；缓存打包成 `QuantBuffer`，实测 8192 ctx 0.41x、32768 ctx 0.32x） | `config.py`/`kv_quant.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | 9 | MLA 分组输出投影 `o_lora_rank` + `o_groups` | ✅ | `mla.py` |
 | 10 | Single-Pass mHC（n 流 + Sinkhorn + Mega-mHC） | 🔶 mHC-lite | `hyperconn.py` |
-| 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | 🔶 小表 + 短卷积 | `engram.py` |
+| 11 | Engram（n=2/3/4、8 头、去短卷积、FP8、Sinkhorn 更新） | ✅ 开关 `engram_layers`/`engram_every`（阶 2/3/4 × 8 头、每阶 `d_mem` 维；**无短卷积** → `lookback = max_order-1`；表 + K/V 投影 FP8（QAT，`engram_fp8` 默认开，老 ckpt 回退关），`pack()` 打包成真 FP8 存储 0.53x/bf16 且查表逐位一致；表自动进 Sinkhorn 组；显式层号优先；解码 vs 全前向 1e-5） | `config.py`/`engram.py`/`block.py`/`model.py`/`optim.py` |
 | 12 | MTP 深度 3 | ✅ | `model.py` |
 | 13 | DSpark 独立训练草稿模块（3 层 + Markov 头 + 置信头 + 吞吐调度） | 🔶 仅解码启发式 | `spec_decode.py` |
 | 14 | head-wise Muon（Q/K 按头分块） | ✅ 开关 `--muon-head-wise`（w_uq/w_qr/w_uk 按头切块逐头 NS5，bmm 批量、与逐头循环逐位一致） | `optim.py` |

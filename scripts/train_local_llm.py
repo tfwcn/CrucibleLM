@@ -137,16 +137,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--memory-slots", type=int, default=4096, help="记忆槽位数")
     p.add_argument("--memory-topk", type=int, default=8, help="每 token 激活槽数")
     p.add_argument("--engram-every", type=int, default=0,
-                   help="Engram 条件记忆：每 N 层插一个（0=关闭；论文推荐只放少数早期层）")
-    p.add_argument("--engram-orders", default="2,3",
-                   help="Engram 的 N-gram 阶（逗号分隔，须 ≥2，如 2,3）")
-    p.add_argument("--engram-heads", type=int, default=2, help="每阶哈希头数")
-    p.add_argument("--engram-d-mem", type=int, default=64,
-                   help="拼接后记忆维（须被 阶数×头数 整除）")
+                   help="Engram 条件记忆：每 N 层插一个（0=关闭；V4.1 只放少数早期层）")
+    p.add_argument("--engram-layers", default="",
+                   help="Engram 显式层号（逗号分隔，如 1,13；非空时忽略 --engram-every）")
+    p.add_argument("--engram-orders", default="2,3,4",
+                   help="Engram 的 N-gram 阶（逗号分隔，须 ≥2；V4.1 用 2,3,4）")
+    p.add_argument("--engram-heads", type=int, default=8,
+                   help="每阶哈希头数（V4.1 用 8）")
+    p.add_argument("--engram-d-mem", type=int, default=256,
+                   help="每阶记忆维（须被头数整除；V4.1 每阶 2048）")
     p.add_argument("--engram-table-size", type=int, default=8191,
                    help="每头哈希表大小（须素数，抗碰撞）")
-    p.add_argument("--engram-conv", type=int, default=4,
-                   help="短因果卷积核（0=不做卷积；作用在 id 决定的 V 上，解码无状态）")
+    p.add_argument("--engram-fp8", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Engram 表 + K/V 投影走 FP8（QAT；默认开，--no-engram-fp8 关）")
     p.add_argument("--csa-reuse-every", type=int, default=None,
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
@@ -852,27 +856,27 @@ def main(argv=None) -> int:
         config.hyper_streams = args.hyper_streams
         print(f"超连接残差已开：{config.hyper_streams} 路流（mHC-lite，恒等起点）",
               flush=True)
-    if args.engram_every:
+    if args.engram_every or args.engram_layers:
         from src.llm.local.engram import is_prime
 
-        config.engram_every = max(args.engram_every, 1)
+        config.engram_every = max(args.engram_every, 0)
+        config.engram_layers = str(args.engram_layers or "").strip()
         config.engram_orders = args.engram_orders
         config.engram_heads = args.engram_heads
         config.engram_d_mem = args.engram_d_mem
         config.engram_table_size = args.engram_table_size
-        config.engram_conv = max(args.engram_conv, 0)
         if not is_prime(config.engram_table_size):
             raise SystemExit(
                 f"--engram-table-size 须为素数，当前 {config.engram_table_size}"
                 "（可取 8191/65537）")
-        groups = len(config.engram_order_list) * config.engram_heads
-        if groups <= 0 or config.engram_d_mem % groups:
+        if config.engram_heads <= 0 or config.engram_d_mem % config.engram_heads:
             raise SystemExit(
-                f"--engram-d-mem 须被 阶数×头数={groups} 整除，"
+                f"--engram-d-mem（每阶维度）须被头数={config.engram_heads} 整除，"
                 f"当前 {config.engram_d_mem}")
-        print(f"Engram 已开：每 {config.engram_every} 层一个，阶 {config.engram_orders}，"
-              f"{config.engram_heads} 头/阶，表 {config.engram_table_size}（素数），"
-              f"卷积核 {config.engram_conv}（恒等起点）", flush=True)
+        print(f"Engram 已开：层 {sorted(config.engram_layer_ids())}，"
+              f"阶 {config.engram_orders}，{config.engram_heads} 头/阶，"
+              f"每阶 {config.engram_d_mem} 维，表 {config.engram_table_size}（素数），"
+              f"无短卷积（恒等起点）", flush=True)
     # 架构开关统一来源对齐（清单唯一来源 config._ARCH_SWITCHES）：显式 CLI > config-json >
     # checkpoint 的 hparams.json 沿用 >（续训/迁移保守用特性前的值 / 新训练用架构默认）。
     # 新增开关只在 _ARCH_SWITCHES 登记一次即自动获得保护，避免逐开关手写漏掉。
@@ -916,6 +920,15 @@ def main(argv=None) -> int:
               f" {config.n_layers - config.ced_split} 层为解码器；解码器全局 KV 由"
               f"编码器输出逐层投影，预填充跳算="
               f"{'开' if config.ced_prefill_skip else '关'}", flush=True)
+    if arch_src.get("engram_fp8") == "checkpoint":
+        print(f"Engram：沿用 checkpoint 架构 engram_fp8={config.engram_fp8}",
+              flush=True)
+    elif arch_src.get("engram_fp8") == "conservative":
+        print("Engram：checkpoint 无架构记录，按关闭 FP8 处理，避免静默量化",
+              flush=True)
+    if config.engram_layer_ids() and config.engram_fp8:
+        print("Engram FP8 已开（V4.1）：哈希表 + K/V 投影走 fake-quant/STE（QAT），"
+              "推理可 pack() 成真 FP8 存储（约 1.06 B/通道）", flush=True)
     if config.swa_window > 0:
         print(f"层内 SWA 已开（V4.1）：窗口 {config.swa_window} token/层，"
               f"缓存为定长环（与序列长度无关）；全局主 KV 只出选中条目",

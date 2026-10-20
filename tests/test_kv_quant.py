@@ -258,3 +258,24 @@ def test_kv_quant_checkpoint_alignment_and_cli(tmp_path):
     c = _cfg()
     src = T.resolve_arch_switches(args, c)
     assert c.kv_quant == "fp8" and src["kv_quant"] == "explicit"
+
+
+def test_zero_rows_do_not_become_nan():
+    """全零行（如恒等起点的零权重 / 全零 latent）：scale 不能下溢成 0.
+
+    `amax/6` 或 `amax/448` 为 0 时，scale 的下界若取 1e-8，向下舍入到 E4M3 就是 **0**
+    → `0/0 = NaN`。下界必须取 E4M3 的最小正值（2^-9）。见 pitfalls 51。
+    """
+    z = torch.zeros(2, 3, 32)
+    for fmt in ("fp8", "fp4"):
+        q = fake_quant(z, fmt)
+        assert torch.isfinite(q).all(), fmt
+        assert float(q.abs().max()) == 0.0
+    # 极小值走同一路径：量化到 0（E4M3 次正规以下），但**不能**是 NaN/inf
+    tiny = torch.full((2, 32), 1e-9)
+    for fmt in ("fp8", "fp4"):
+        assert torch.isfinite(fake_quant(tiny, fmt)).all(), fmt
+    # QuantBuffer 的零填充槽读出来也必须是有限值
+    buf = QuantBuffer.zeros((1, 4, 32), "fp4")
+    assert torch.isfinite(buf.dequant()).all()
+    assert float(buf.dequant().abs().max()) == 0.0

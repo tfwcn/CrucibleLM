@@ -207,18 +207,20 @@ class SmallLLMConfig:
     hyper_streams: int = 0
 
     # ===== Engram 条件记忆（n-gram 哈希查表，默认关；见 engram.py / docs/details/engram.md）=====
-    # 每 N 层插一个 Engram（论文最优在少数早期层）；0=关闭（无参数，旧 checkpoint 兼容）
+    # 每 N 层插一个 Engram（V4.1：只放少数早期层）；0=关闭（无参数，旧 checkpoint 兼容）
     engram_every: int = 0
+    # 显式层号（逗号分隔，如 "1,13"）：非空时**忽略** `engram_every`（论文放第 1、14 层）
+    engram_layers: str = ""
     # N-gram 阶（逗号分隔，须 ≥2）：n 表示用"过去 n-1 个 token + 当前"查表
-    engram_orders: str = "2,3"
-    # 每阶哈希头数（各头不同 seed → 分散碰撞）
-    engram_heads: int = 2
-    # 拼接后记忆向量维度 d_mem（须被 阶数×头数 整除）
-    engram_d_mem: int = 64
-    # 每头哈希表大小（须为素数，抗碰撞）
+    engram_orders: str = "2,3,4"
+    # 每阶哈希头数（各头不同 seed → 分散碰撞）；论文 8 头
+    engram_heads: int = 8
+    # **每阶**记忆维 d_mem（论文每阶 2048 → 8 头 × 256；须被头数整除）
+    engram_d_mem: int = 256
+    # 每头哈希表大小（须为素数，抗碰撞）；论文约 16M 行/头，本地按规模缩
     engram_table_size: int = 8191
-    # 短因果卷积核（0=不做卷积；论文 kernel=4）
-    engram_conv: int = 4
+    # 表 + K/V 投影走 FP8（QAT：fake-quant + STE；推理可 pack() 成真 FP8 存储）
+    engram_fp8: bool = True
 
     # ===== 投机解码（推理加速，默认关；见 spec_decode.py / docs/details/speculative-decoding.md）=====
     # 关闭时生成路径逐位不变（单测锁定）
@@ -274,9 +276,23 @@ class SmallLLMConfig:
         """每个头的维度."""
         return self.d_model // self.n_heads
 
+    def engram_layer_ids(self) -> set[int] | None:
+        """Engram 层号：`engram_layers` 显式优先，否则按 `engram_every` 均匀插.
+
+        返回 None = 关闭（`engram_every=0` 且 `engram_layers` 为空）。
+        显式层号超出 `[0, n_layers)` 的项直接丢弃（配置拼错不静默改变其他层）。
+        """
+        txt = str(self.engram_layers or "").strip()
+        if txt:
+            ids = {int(p) for p in txt.split(",") if p.strip()}
+            return {i for i in ids if 0 <= i < self.n_layers} or None
+        if self.engram_every > 0:
+            return set(range(0, self.n_layers, self.engram_every))
+        return None
+
     @property
     def engram_order_list(self) -> list[int]:
-        """解析 `engram_orders`（"2,3" → [2, 3]），忽略空项."""
+        """解析 `engram_orders`（"2,3,4" → [2, 3, 4]），忽略空项."""
         out: list[int] = []
         for part in str(self.engram_orders).split(","):
             part = part.strip()
@@ -678,6 +694,8 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "kv_quant": ("", _norm_kv_quant),
     # 块主序 KV 缓存（#4 显存半边，依赖层内 SWA）；不改键，旧 ckpt 回退关
     "kv_block_cache": (False, _norm_bool),
+    # Engram 的表 + K/V 投影 FP8（V4.1 §2.4.2）；不改键，旧 ckpt 回退关（= 特性前不量化）
+    "engram_fp8": (False, _norm_bool),
 }
 
 

@@ -31,6 +31,9 @@ E2M1_CODES = torch.tensor(
     dtype=torch.float32)
 
 FP8_E4M3_MAX = 448.0
+# E4M3 最小正值（次正规 2^-9 = 0.001953125）。scale 的下界必须取它而不是 1e-8：
+# 1e-8 向下舍入到 E4M3 就是 **0**，于是"全零行"会算出 0/0 → NaN（见 pitfalls 51）。
+FP8_E4M3_MIN = 2.0 ** -9
 # 量化块大小（MXFP4：每 16 个通道一个 E4M3 scale）
 KV_QUANT_BLOCK = 16
 
@@ -89,7 +92,7 @@ def quantize_e2m1(
     # scale **向下**舍入到 E4M3（见 `_floor_to_e4m3`）：保证 amax/scale ≥ 6，
     # 于是最大码字 = 6、反量化最大值 = 6*scale，再量化得到同一个 scale（幂等）。
     scale_store = _floor_to_e4m3(
-        (amax / E2M1_MAX).clamp(min=1e-8, max=FP8_E4M3_MAX))
+        (amax / E2M1_MAX).clamp(min=FP8_E4M3_MIN, max=FP8_E4M3_MAX))
     scale = scale_store.float()
     codes = _nearest_code(blocks / scale)
     codes = codes.view(x.shape)
@@ -116,7 +119,7 @@ def quantize_fp8(
     # 同 e2m1：scale 向下舍入到 E4M3（幂等），amax/scale ≥ 1 由下面的 clamp 兜住
     scale = _floor_to_e4m3(
         blocks.abs().amax(dim=-1, keepdim=True).clamp(
-            min=1e-8, max=FP8_E4M3_MAX))
+            min=FP8_E4M3_MIN, max=FP8_E4M3_MAX))
     q = (blocks / scale.float()).clamp(-1.0, 1.0).to(torch.float8_e4m3fn)
     return q.view(x.shape), scale.squeeze(-1)
 

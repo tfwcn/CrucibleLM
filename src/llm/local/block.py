@@ -62,11 +62,11 @@ class HybridBlock(nn.Module):
         retro_heads: int = 8,
         hyper_streams: int = 0,
         use_engram: bool = False,
-        engram_orders: tuple[int, ...] | list[int] = (2, 3),
-        engram_heads: int = 2,
-        engram_d_mem: int = 64,
+        engram_orders: tuple[int, ...] | list[int] = (2, 3, 4),
+        engram_heads: int = 8,
+        engram_d_mem: int = 256,
         engram_table_size: int = 8191,
-        engram_conv: int = 4,
+        engram_fp8: bool = True,
         vocab_size: int = 8192,
         csa_mode: str = "full",
         compress_ratio: int = 1,
@@ -130,7 +130,7 @@ class HybridBlock(nn.Module):
         # Engram 条件记忆（默认 None；开后在注意力之前残差并联，恒等起点）
         self.engram: EngramMemory | None = (
             EngramMemory(d_model, vocab_size, engram_orders, engram_heads,
-                         engram_d_mem, engram_table_size, engram_conv, dropout)
+                         engram_d_mem, engram_table_size, engram_fp8, dropout)
             if use_engram else None
         )
 

@@ -20,8 +20,9 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
     use_retro = (config.retro_enabled and config.retro_every > 0
                  and layer_idx % config.retro_every == 0)
     use_hyper = config.hyper_streams >= 2
-    use_engram = (config.engram_every > 0
-                  and layer_idx % config.engram_every == 0)
+    # Engram 层：`engram_layers` 显式优先（论文只放第 1、14 层），否则按 every 均匀插
+    engram_ids = config.engram_layer_ids()
+    use_engram = bool(engram_ids) and layer_idx in engram_ids
     full = config.is_full_attn_layer(layer_idx)
     # CED（V4.1 §2.2）：解码器层的全局 KV 由编码器输出逐层投影，**恒为 Full**
     # （layer-dependent 投影本就逐层不同，借用会把它们合并回一份缓存，失去意义）
@@ -76,7 +77,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         engram_heads=config.engram_heads,
         engram_d_mem=config.engram_d_mem,
         engram_table_size=config.engram_table_size,
-        engram_conv=config.engram_conv,
+        engram_fp8=bool(getattr(config, "engram_fp8", True)),
         vocab_size=config.vocab_size,
         csa_mode=csa_mode,
         compress_ratio=config.compress_ratio_of(layer_idx),
@@ -431,11 +432,11 @@ class TinyLLM(nn.Module):
                 moe.update_router_bias()
 
     def _has_engram(self) -> bool:
-        """是否有 Engram 条件记忆层（engram_every>0）."""
+        """是否有 Engram 条件记忆层（`engram_layers` 显式或 `engram_every>0`）."""
         return any(getattr(layer, "engram", None) is not None for layer in self.layers)
 
     def _engram_lookback(self) -> int:
-        """Engram 解码所需的最小右对齐上下文长度（卷积感受野 + 最大 N-gram 阶）."""
+        """Engram 解码所需的最小右对齐上下文长度（最大 N-gram 阶 - 1；无卷积）."""
         best = 0
         for layer in self.layers:
             eng = getattr(layer, "engram", None)
@@ -1143,7 +1144,7 @@ class TinyLLM(nn.Module):
             sum(p.numel() for p in layer.hyper.parameters())
             for layer in self.layers
             if getattr(layer, "hyper", None) is not None)
-        # Engram：只有投影/卷积/归一参与计算，查表每 token 仅 gather 一行（d_mem），
+        # Engram：只有投影/归一参与计算，查表每 token 仅 gather 一行（各阶拼接 = d_out），
         # 巨大的哈希表不进"激活参数"
         engram_active = 0
         for layer in self.layers:
@@ -1152,7 +1153,7 @@ class TinyLLM(nn.Module):
                 continue
             table = sum(t.weight.numel() for t in eng.tables)
             engram_active += (sum(p.numel() for p in eng.parameters())
-                              - table + c.engram_d_mem)
+                              - table + eng.d_out)
         active = (
             self.embed.weight.numel()
             + per_layer_active * c.n_layers

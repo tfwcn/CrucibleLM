@@ -14,7 +14,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | DeepSeek-V4.1 | SwiGLU 预激活限幅 | `moe.py`：gate/up 对称 `clamp(±swiglu_limit)` 压激活离群值（`swiglu_limit`，**默认 10=开**，0=关） |
 | DeepSeek-V4.1 | 免辅助损失路由（sqrtsoftplus + noaux_tc） | `moe.py`：打分 `sqrt(softplus(z))`，按 `打分+逐专家偏置` 选 top-k，权重取原始打分归一化 ×`routed_scaling_factor`；偏置 sign 式按负载调价、不进梯度（`router_aux_free`，**默认开**，关=旧 softmax+aux loss） |
 | DeepSeek V3 / V4.1 | MTP 多 token 预测（深度 3） | `model.py:MTPHead`：第 1 级押 t+2（键兼容旧实现），更深级（`mtp.extra.*`）链式喂"下一 token 嵌入"押到 t+1+depth（V4.1 `num_nextn_predict_layers=3`）；推理只用第 1 级（`mtp_depth`，**默认 1**=旧口径，>1 改键需重训） |
-| DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：多头 n-gram 哈希 + 上下文门控 + 短因果卷积，早期层残差并联（默认关） |
+| DeepSeek Engram | 条件记忆：n-gram 哈希查表（与 MoE 并列的稀疏轴） | `engram.py`：阶 {2,3,4} × 8 头哈希 + 上下文门控，早期层残差并联；V4.1 口径=**无短卷积** + 表/K-V 投影 **FP8**（QAT，可打包成真 FP8 存储）+ 表走 **Sinkhorn** 更新（默认关） |
 | DeepSeek-V4.1 | CSA2 三模式（Full/Reindex/Reuse） | `mla.py`/`sparse_attn.py`：逐全注意力层静态分配——Full 自算自存 KV + 自选 Top-K；Reindex 借 main KV/indexer K、**自带 indexer Q 重选**；Reuse 直接复用最新 Top-K（`csa_modes`，空=旧 Full/Reuse 交替） |
 | DeepSeek-V4.1 | 分层稀疏 indexer | `sparse_attn.py`：学习式打分器选 Top-K 主 KV，先块级粗选候选池再池内 token 级 Top-K，并用蒸馏损失（`indexer_loss_coef`）训练打分器（`sparse_indexer`，**默认关**：新增 `w_iq`/`w_ik` 改键） |
 | DeepSeek-V4.1 | 3×3 pixel-unshuffle 视觉压缩 | `vision_compress.py`：`vision_unshuffle=3` 先按 3×3 重排降采样，视觉 token /9（默认 1=关） |
@@ -246,18 +246,22 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
 
 多条外挂能力，默认全关，逐个 flag 放开，互不依赖：
 
-- **Engram 条件记忆**（`--engram-every N --engram-orders 2,3 --engram-heads H
-  --engram-d-mem D --engram-table-size P --engram-conv K`）：与 MoE 并列的第二条稀疏轴。
-  每 N 层插一个 Engram，把局部 n-gram 经多头哈希查素数表取回记忆，用当前 hidden 门控后
-  残差加回（注意力之前）。`W_V`/卷积零初始化 → **恒等起点**，开开关不破坏已有权重。
-  只有投影/卷积/归一参与计算、表每 token 只 gather 一行（`d_mem`），故表再大也不涨激活
-  参数。注意卷积**放在门控之前**、作用在仅由 id 决定的 `V=W_V e` 上，换取解码**无跨步
-  状态**（否则要像线性层一样存卷积尾，`_decode_step` 得同步）；`_decode_step`/
-  `_decode_multi` 已同步接入，`prefill+逐 token 解码 == 全前向` 单测锁定。
-  `engram_table_size` 须素数、`engram_d_mem` 须被 阶数×头数 整除，否则启动报错。
+- **Engram 条件记忆**（`--engram-layers 1,7` 或 `--engram-every N` +
+  `--engram-orders 2,3,4 --engram-heads 8 --engram-d-mem 256 --engram-table-size P
+  [--no-engram-fp8]`）：与 MoE 并列的第二条稀疏轴。把局部 n-gram 经多头哈希查素数表
+  取回记忆，用当前 hidden 门控后残差加回（注意力之前）。**V4.1 口径**：阶 `{2,3,4}`、
+  每阶 8 头、每阶记忆维 `d_mem`（论文 2048 → 8 头 × 256）、**去掉短因果卷积**
+  （`lookback = max_order-1`，解码无跨步状态）、表与 K/V 投影 **FP8**（QAT：
+  fake-quant + STE；推理 `pack()` 成真 FP8 存储，约 1.06 B/通道）、表更新走
+  **Sinkhorn**（`--sinkhorn`，参数名 `...engram.tables.K.weight` 自动进该组）。
+  `W_V` 零初始化 → **恒等起点**，开开关不破坏已有权重。只有投影/归一参与计算、表每
+  token 只 gather 一行（各阶拼接 = `d_out`），故表再大也不涨激活参数。
+  `engram_layers` 显式给层号（论文只放少数早期层）时优先于 `engram_every`；
+  `engram_table_size` 须素数、`engram_d_mem` 须被头数整除，否则启动报错。
+  `_decode_step`/`_decode_multi` 已同步接入，`prefill+逐 token 解码 == 全前向` 单测锁定。
   **实测（本机 128M 续训，600/2500 步、表 8191/65521）：中性**——与基线 val_loss 差
   全程 ±0.002，既不涨点也不掉点（单遍 Web 文本无 n-gram 重现 → 表无可学目标）；
-  详见 `docs/details/engram.md` 与 pitfalls 第 21 条。
+  详见 `docs/details/engram.md` 与 pitfalls 第 21 条（另见 51：全零行的 FP8 NaN）。
 
 - **Product-Key 记忆层**（`--enable-memory --memory-every N --memory-slots M
   --memory-topk K`）：每 N 层插一个记忆层，把 hidden 投到 M 个 slot 上取 top-K 读出。
@@ -385,6 +389,7 @@ transformers 版本锁 4.5x（老师 modeling 与 v5 互斥，`load_teacher` 内
 | `ced_split`(0) / `ced_prefill_skip`(True) | CED 因果编码器-解码器（V4.1 §2.2）：前 N 层当编码器，其后层的全局 KV 不再由自己 hidden 产生，而由第 N 层输出 `H_enc` 用**逐层投影权重**投影（`C_l = H_enc W_l^KV`，rope 键同理）→ 推理预填充只需在前缀上算完编码器层，解码器层只跑最后 `2*swa_window` 个 token（`swa_window=0` 时只跑末位置，**逐位等价**）。**默认关**（解码器层 `w_dkv`/`w_kr` → `w_ced_*`，改键需重训；续训从 hparams 沿用）；要求解码器区间**全是全注意力层**（线性层递推状态不可投影，构建期早失败——base 的 1:3 hybrid 不满足）。解码器层恒 Full → `kv_cache_bytes` 会升（8192 ctx 实测 +38%，是换算力的代价）。详见 `docs/details/ced.md`、pitfalls 40/41/42 | `config.py`/`mla.py`/`sparse_attn.py`/`model.py` |
 | `kv_block_cache`(False) | 块主序主 KV 缓存（V4.1 #4 的显存半边）：`compress_ratios` 的 m>1 层把每 m 个 token 折成**一行**存（行数 `L→m+ceil(L/m)`，行值 = `Σ z_i⊙c_i/m`，rope 行 = 块尾未旋转键），近端（当前不足 m 个 token 的残块）由层内 SWA 承担 → 构建期强制 `swa_window>0` 且 `swa_window>=max(m)`。预填充与解码共用 `_block_add`（残块进**头部**暂存前缀、凑满一次池化+量化）→ 同权重下与逐 token 布局**逐位一致**（预填充/解码都是 0.0），跨残块单 token 解码 == 全前向（<1e-5）。与 `kv_quant` 叠加时量化作用在块均值上（预填充池化出口同步 `fake_quant`）。**默认关**（改缓存布局 + 依赖 SWA 组合；不改 `state_dict` 键，续训从 hparams 沿用）。注意**多 token 解码跨压缩块边界**会与全前向有差（列集合按步首位置定，pitfall 49）。详见 `docs/details/kv-block-cache.md`、pitfalls 47/48/49/50 | `config.py`/`block.py`/`sparse_attn.py`/`model.py`/`session_cache.py` |
 | `kv_quant`("") | KV 缓存量化（V4.1 §2.4.4）：`"fp4"` = 主 KV 用 **MXFP4**（E2M1 + 每 16 通道一个 E4M3 scale，4.5 bit/通道，**无**全局二级 scale）；`"fp8"` = E4M3（8.5 bit）。训练期在 `_kv_latent`/`_rope_key` 出口与 SWA 投影处做 fake-quant（STE）＝QAT，推理期同一数值，差别只在存储：`QuantBuffer` 打包（uint8 + E4M3 scale），读时反量化再算注意力（不需要 FP4 矩阵乘）。SWA 环联动用 **FP8**（对量化更敏感）。**默认关**（精度损失 + 改缓存布局；不改 state_dict 键，续训从 hparams 沿用）；实测 12 层/`swa_window=128`：8192 ctx 6.99→2.86 MiB（0.41x）、32768 ctx 21.99→7.08 MiB（0.32x）。同长度/同分块路径逐位一致；量化不连续，跨长度比较会跨码字边界（不是 bug）。详见 `docs/details/kv-cache-fp4.md`、pitfalls 45/46 | `config.py`/`kv_quant.py`/`mla.py`/`sparse_attn.py`/`model.py` |
+| `engram_fp8`(True) | Engram 的表 + K/V 投影走 FP8（V4.1 §2.4.2）：训练用 fake-quant + STE（QAT），推理 `pack()` 成真 FP8 存储（表约 1.06 B/通道，对照 bf16 主权重 0.53x），打包前后查表**逐位一致**；`pack()` 是快照，`train()` 下调用或读打包表都直接报错（先 `unpack()`）。**不改 `state_dict` 键**（只改数值精度）：新训练默认开，老 ckpt 由 hparams 回退 `False`（特性前从不量化）。注意 scale 下界必须取 E4M3 最小正值，写成 1e-8 会让全零行出 NaN（pitfall 51）。详见 `docs/details/engram.md`、pitfalls 51/52/53 | `config.py`/`engram.py`/`block.py`/`kv_quant.py`/`optim.py` |
 | `router_aux_free`(True) / `routed_scaling_factor`(1.5) / `router_bias_lr`(1e-3) / `norm_topk_prob`(True) | 免辅助损失路由（V4.1）：`sqrtsoftplus` 打分 + `noaux_tc`（按打分+偏置选 top-k）+ routed scaling；**默认开**（去掉 aux loss 的干扰梯度），关=旧 softmax + greedy + aux loss。偏置非持久化（续训归零自适应）。详见 `docs/details/router-aux-free.md` | `moe.py` |
 | `o_groups`(1) / `o_lora_rank`(0) | MLA 分组低秩输出投影（V4.1：8/1024）：按头分组、每组压到 `o_lora_rank` 再拼接升维。**默认关**（改 `state_dict` 键，旧 ckpt 无法直接载入）；开启需重训或 `scripts/migrate_model.py --o-groups G --o-lora-rank r`（SVD 迁移，近似）。详见 `docs/details/mla-grouped-output.md` | `mla.py`/`migrate.py` |
 | `sparse_indexer`(False) / `indexer_heads`(4) / `indexer_head_dim`(64) / `indexer_topk`(64) / `indexer_block`(8) / `indexer_pool_blocks`(32) / `indexer_loss_coef`(0.01) | 分层稀疏 indexer（V4.1：32 头/128 维/top-k 512/2048 块×8）：学习式 top-K 主 KV + 块级候选池，打分器用蒸馏损失训练（DSA：拟合主注意力分布，目标 detach；系数只缩放 indexer 学习步长，**0=不训**）。**默认关**（新增 `w_iq`/`w_ik` 改 `state_dict` 键，旧 ckpt 无法直接载入，需重训）；只影响长序列（`t > sparse_threshold`），短序列 dense 逐位不变。详见 `docs/details/sparse-indexer.md` | `sparse_attn.py` |

@@ -875,3 +875,70 @@ fp8 0.37、fp4 0.66；prompt 长度是 m 的倍数时差 1.5e-6。
 - 扩容是第一类状态破坏源：凡是"扩容后继续跑"的路径都要有一条端到端单测
   （本例用极小 `max_new_tokens` 强制扩容）。
 - 回归锁：`test_scratch_survives_growth`。
+
+## 51. 量化 scale 的下界不是 1e-8：E4M3 里它就是 **0**，全零行直接 NaN
+
+**现象**：给 Engram 换 FP8（`W_V` 零初始化 → 权重全零）后，一步训练 loss 变 `nan`；
+单独测 `fake_quant(zeros, "fp8")` 也返回 NaN，而 `fp4` 返回 0。
+
+**机制**：`quantize_fp8` 里 `scale = floor_to_e4m3(amax.clamp(min=1e-8, max=448))`。
+`amax=0` 时传入 1e-8，但 E4M3 的最小正值是 `2^-9 ≈ 0.00195`，向下舍入得到 **0**；
+随后 `blocks / 0` 在 `0/0` 处产生 NaN（`fp4` 走 `nearest_code(inf)` 恰好吃到最大码字，
+所以只是"静默出错"而不是 NaN）。
+
+**修复**：下界直接用 `FP8_E4M3_MIN = 2^-9`（`kv_quant.py`）。此时 scale 恒为正，
+零行量化成 0、反量化回 0，幂等性不变。这条对 KV 量化同样适用：某条 latent 全零
+（掩码/占位行、`QuantBuffer.zeros` 的未写槽）也能安静地读出 0 而不是 NaN。
+
+**教训**：
+- "防止除零"的常数必须**取自量化格式本身**（最小可表示正值），不能凭感觉写 1e-8；
+  浮点格式的次正规下限是格式属性，不是数值分析里的 epsilon。
+- 量化器的单测里必须有"全零输入"和"极小输入"两条：前者测 NaN，后者测下溢行为
+  （量化到 0 是允许的，NaN 不是）。
+- 回归锁：`tests/test_kv_quant.py::test_zero_rows_do_not_become_nan`、
+  `tests/test_engram.py::test_engram_identity_at_init`（零 `W_V` 端到端）。
+
+## 52. FP8 表的 `pack()` 是**快照**：训练期读它等于读旧表，主权重也不能丢
+
+**现象**：推理前把 Engram 表打包成真 FP8 存储（省内存），顺手继续训练——
+loss 不降，查表值永远停在打包那一刻。
+
+**机制**：打包只是把当时的主权重量化后存成 `uint8` 码字 + E4M3 scale，**不参与
+autograd**、不会被优化器更新；`forward` 若优先读打包缓冲，训练就等于在读冻结副本。
+反过来，若为了省内存把主权重删掉，就没法再训练（优化器状态也指向它）。
+
+**修复**：`EngramTable` 显式区分两态——`pack()` 在 `self.training` 下直接
+`RuntimeError`；已打包的 `forward` 在训练模式下也 `RuntimeError`（提示先 `unpack()`）。
+打包缓冲 `persistent=False`，不进 `state_dict`（键与未打包时一致），推理流水线是
+`load → pack() → generate`。
+
+**教训**：
+- 任何"量化快照 / 预计算缓存"都要带**模式门禁**，不能靠调用方自律；
+  错误状态必须大声失败，否则表现为"训练不动"这种最难查的症状。
+- 快照类缓冲默认 `persistent=False`：它可由主权重重建，进 checkpoint 只会让
+  `state_dict` 分叉、加载时更难对齐。
+- 回归锁：`test_pack_unpack_bitwise_and_saves_bytes`、`test_pack_is_inference_only`。
+
+## 53. Engram 的两处口径变更（`d_mem` 语义 + 删短卷积）都是**结构性**的，不能靠 `_ARCH_SWITCHES` 兜底
+
+**现象**：按旧参数（`engram_d_mem=64`、`engram_conv=4`、阶 2/3）起的 run，换到
+V4.1 口径（`d_mem` 每阶、无卷积、阶 2/3/4）后：参数量差`阶数`倍；旧 checkpoint 装载
+报 `unexpected key: ...engram.conv.weight`；且**续训时漏传 `--engram-*`** 会直接
+shape/键错。
+
+**机制**：`_ARCH_SWITCHES` 只登记"**改数值不改键**"的开关（如 `engram_fp8`：
+表与投影的量化与否）。`engram_d_mem`/`engram_orders`/`engram_heads`/`engram_layers`
+改的是**参数形状/存在性**，登记成"沿用 checkpoint"反而会造出与 ckpt 不匹配的模型；
+这类开关的正确行为是"必须显式给，给错就当场报错"。
+
+**修复（决定，不是 bug fix）**：
+- 保留"大声失败"：缺键/多键/shape 不匹配都报错，让用户显式对齐参数；
+- `engram_fp8` 进 `_ARCH_SWITCHES`，老 ckpt 回退 `False`（特性前从不量化 →
+  旧 run 的数值语义逐位不变）；
+- `engram_d_mem` 在注释与文档里明确写"**每阶**维度"，避免把论文的 2048 当成总维。
+
+**教训**：
+- 开关分两类：**同键改数值**（可来源对齐，登记 `_ARCH_SWITCHES`）与
+  **改形状/改存在性**（必须显式、失败要响）。别把后者塞进前者的自动沿用逻辑。
+- 语义变更（同一字段含义变了）比改名字更危险：字段名看不出来，注释/文档/单测
+  三处都要写清"每阶 vs 总维"，并在 `docs/details/*.md` 的参数表里标出来。
