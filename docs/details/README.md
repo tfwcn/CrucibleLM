@@ -48,6 +48,7 @@
 
 - [采样与生成](./sampling.md)
 - [结构化输出：约束解码](./structured-output.md)
+- [特殊 token 防注入：用户内容不许伪造轮次](./prompt-injection.md)
 - [推理加速：13→30.9 tok/s](./inference-acceleration.md)
 - [数据管线](./data-pipeline.md)
 - [存盘与续跑](./checkpoint.md)

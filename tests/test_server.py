@@ -181,6 +181,22 @@ def test_chat_response_format(tmp_path):
         server.shutdown()
 
 
+def test_chat_seed_reproducible(tmp_path):
+    """服务端 seed 透传：温度 > 0 时两次同 seed 请求输出一致."""
+    backend = _tiny_backend(tmp_path)
+    server, port = _serve_in_thread(backend)
+    payload = {"messages": [{"role": "user", "content": "你好"}],
+               "max_tokens": 6, "temperature": 1.0, "seed": 42}
+    try:
+        _, b1 = _post(port, "/v1/chat/completions", payload)
+        _, b2 = _post(port, "/v1/chat/completions", payload)
+        c1 = json.loads(b1)["choices"][0]["message"]["content"]
+        c2 = json.loads(b2)["choices"][0]["message"]["content"]
+        assert c1 == c2
+    finally:
+        server.shutdown()
+
+
 def test_apply_stop():
     """stop 截断：命中截断并改 finish，miss 保持 length."""
     text, finish = OpenAIServer._apply_stop("abcSTOPdef", ["STOP"])

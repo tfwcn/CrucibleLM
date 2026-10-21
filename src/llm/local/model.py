@@ -534,6 +534,7 @@ class TinyLLM(nn.Module):
         eos_id: int | None = None,
         repetition_penalty: float = 1.0,
         constraint: object = None,
+        seed: int | None = None,
     ) -> torch.Tensor:
         """自回归生成（增量 KV/状态缓存，线性层 O(1)/步）.
 
@@ -545,13 +546,18 @@ class TinyLLM(nn.Module):
         `mask_logits(logits)` / `accept(token_id)` / `finished`（见
         `structured.JsonGrammarConstraint`）。有约束时**禁用投机解码**
         （草稿器不感知语法，拒绝会退化成语义等价但更慢的路径），且只支持 B=1。
+
+        `seed`（可选）：确定性采样。给出后每次调用用独立 RNG（按行派生），
+        不受全局 `torch.manual_seed` 与 batch 组成影响——同一 prompt + seed
+        在任何 batch 里都得到逐位相同的输出（DeepInfer 的 deterministic
+        sampling 口径）。None = 沿用全局 RNG，与老行为一致。
         """
         was_training = self.training
         self.eval()
         try:
             return self._generate_inner(
                 input_ids, max_new_tokens, temperature, top_k, eos_id,
-                repetition_penalty, constraint)
+                repetition_penalty, constraint, seed)
         finally:
             if was_training:
                 self.train()
@@ -621,6 +627,7 @@ class TinyLLM(nn.Module):
         repetition_penalty: float = 1.0,
         past_ids: torch.Tensor | None = None,
         constraint: object = None,
+        generators: list | None = None,
     ) -> torch.Tensor:
         """按温度/top-k 采样下一步（贪心 temperature=0），返回 (b, 1) id.
 
@@ -631,6 +638,9 @@ class TinyLLM(nn.Module):
 
         constraint: 结构化输出约束，在重复惩罚之后、温度缩放之前掩码——
         惩罚只改数值、mask 决定"谁能被选中"，顺序不影响合法性。
+
+        generators: 每行独立的 `torch.Generator`（确定性采样用）；None 时用
+        全局 RNG。逐行采样保证结果与同 batch 的其他请求无关。
         """
         next_logits = self.lm_head(h_last)[:, -1, :].float()
         if repetition_penalty != 1.0 and past_ids is not None:
@@ -655,8 +665,31 @@ class TinyLLM(nn.Module):
                     torch.full_like(next_logits, float("-inf")),
                     next_logits,
                 )
-            return torch.multinomial(F.softmax(next_logits, dim=-1), 1)
+            probs = F.softmax(next_logits, dim=-1)
+            if generators is None:
+                return torch.multinomial(probs, 1)
+            rows = [torch.multinomial(probs[i:i + 1], 1, generator=generators[i])
+                    for i in range(probs.shape[0])]
+            return torch.cat(rows, dim=0)
         return next_logits.argmax(-1, keepdim=True)
+
+    @staticmethod
+    def _make_generators(seed: int | None, batch: int,
+                         device) -> list | None:
+        """按 `seed` 派生每行独立 RNG（行 i 用 seed+i）.
+
+        独立 RNG 是"批不变"的关键：同一请求放进任何 batch、任何位置，
+        消耗的随机数序列都相同，输出逐位一致。seed=None 时返回 None
+        （沿用全局 RNG，与老行为一致）。
+        """
+        if seed is None:
+            return None
+        gens = []
+        for i in range(batch):
+            g = torch.Generator(device=device)
+            g.manual_seed((int(seed) + i) % (2 ** 63))
+            gens.append(g)
+        return gens
 
     def _ced_prefill_q_off(self, n_tok: int) -> int:
         """CED 预填充里解码器段的**起始绝对位置**（跳算边界）.
@@ -975,6 +1008,7 @@ class TinyLLM(nn.Module):
         eos_id: int | None = None,
         repetition_penalty: float = 1.0,
         constraint: object = None,
+        seed: int | None = None,
     ) -> torch.Tensor:
         """自回归生成内循环（调用方 generate 已处理 eval 模式切换）.
 
@@ -991,11 +1025,14 @@ class TinyLLM(nn.Module):
             add = torch.tensor([ids], dtype=input_ids.dtype,
                                device=input_ids.device)
             return torch.cat([input_ids, add], dim=1)
+        generators = self._make_generators(
+            seed, input_ids.shape[0], input_ids.device)
         h, pasts = self._prefill(input_ids, max_new_tokens=max_new_tokens)
         cur = input_ids
         for _ in range(max_new_tokens):
             nxt = self._sample_next(h[:, -1:], temperature, top_k,
-                                    repetition_penalty, cur, constraint)
+                                    repetition_penalty, cur, constraint,
+                                    generators)
             if constraint is not None:
                 # 先推进自动机再判断终止：EOS 本身也要 accept（finished=True）
                 constraint.accept(int(nxt[0, 0]))
@@ -1018,11 +1055,12 @@ class TinyLLM(nn.Module):
         eos_id: int | None = None,
         repetition_penalty: float = 1.0,
         constraint: object = None,
+        seed: int | None = None,
     ):
         """逐 token 生成器（SSE 流式/OpenAI stream 用），逐个 yield 新 id（int）.
 
         与 generate() 同一 prefill+解码路径（数学一致，单测锁定），
-        生成后同样恢复 train/eval 状态。`constraint` 语义同 `generate`。
+        生成后同样恢复 train/eval 状态。`constraint` / `seed` 语义同 `generate`。
         """
         if constraint is not None and input_ids.shape[0] != 1:
             raise ValueError("约束解码只支持 batch=1（每序列需独立自动机）")
@@ -1033,13 +1071,16 @@ class TinyLLM(nn.Module):
                 yield from self._spec_stream(
                     input_ids, max_new_tokens, eos_id, repetition_penalty)
                 return
+            generators = self._make_generators(
+                seed, input_ids.shape[0], input_ids.device)
             h, pasts = self._prefill(input_ids, max_new_tokens=max_new_tokens)
             seen: list[torch.Tensor] = []
             for _ in range(max_new_tokens):
                 cur = (torch.cat([input_ids, *seen], dim=1) if seen
                        else input_ids)
                 nxt = self._sample_next(h[:, -1:], temperature, top_k,
-                                        repetition_penalty, cur, constraint)
+                                        repetition_penalty, cur, constraint,
+                                        generators)
                 if constraint is not None:
                     constraint.accept(int(nxt[0, 0]))
                 eids = self._engram_block_ids(cur, nxt)

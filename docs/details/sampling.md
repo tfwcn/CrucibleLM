@@ -42,6 +42,29 @@ logits = where(seen, where(logits < 0, logits*p, logits/p), logits)  # HF 语义
 nxt = argmax(logits) if temp == 0 else multinomial(softmax(logits/temp))
 ```
 
+## 确定性采样（`seed`，对标 DeepInfer deterministic sampling）
+
+默认路径用全局 RNG：`torch.manual_seed` 一变、batch 里多一条请求，同一条 prompt
+的采样结果就可能不同。线上评测/回放/缓存都讨厌这个不确定性。
+
+`generate(..., seed=N)` 改成**每行独立 RNG**：
+
+```python
+gens = [Generator(device).manual_seed(N + i) for i in range(batch)]
+probs = softmax(logits / temp)
+nxt = cat([multinomial(probs[i:i+1], 1, generator=gens[i]) for i in range(batch)])
+```
+
+- 行 `i` 只用自己的随机流 → 同一请求放进任何 batch、任何位置，输出逐位一致；
+- 不读全局 RNG → 调用前后 `manual_seed` 怎么变都不影响；
+- `seed=None` 走原路径（全局 RNG），与老行为逐位一致；
+- 贪心（`temperature=0`）本来就确定，seed 只影响采样路径。
+
+服务端对应 OpenAI 的 `seed` 字段；`stream` 与 `generate` 用同一 seed 时输出一致。
+真正的"批不变"还要求算子层归约顺序与 batch 无关（DeepInfer 改的是 kernel），
+本仓库在 PyTorch 上只保证**采样层**的批不变；batch 大小变化可能带来末位浮点差异，
+需要逐位复现时固定 batch 形状。
+
 ## 代价与坑
 
 - 贪心 + 无惩罚 = 循环 Fuji：sample 评测必须固定 prompt 集看复读率数字，

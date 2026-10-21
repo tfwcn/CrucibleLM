@@ -1301,3 +1301,34 @@ if mode == "num" and cur in _NUM_ACCEPT:
 
 先让数字结束、回到父级（对象 → `obj_comma`），再问父级是否 accepting。
 递归最多一层（父级只会是 `done` / `obj_comma` / `arr_comma`）。
+
+## 72. 确定性采样别只"开头 manual_seed"，要和 batch 解耦
+
+**现象**：同一个请求单独跑和放进 batch 里跑，`temperature>0` 时输出不同；
+`stream` 与 `generate` 对不上；线上回放复现不了。
+
+**机制**：`torch.multinomial` 默认消费**全局 RNG**。全局 RNG 的消耗量取决于
+前面跑过什么、batch 里有几行——同一请求的随机数序列被上下文污染。
+
+**做法**：
+- `generate(seed=N)` 为每行建独立 `torch.Generator`，行 `i` 用 `N+i`，
+  `multinomial(..., generator=gens[i])` 逐行采样；
+- `stream_tokens` 走同一套派生逻辑，否则两条路径对不上；
+- `seed=None` 保持走全局 RNG（老行为逐位不变），不要默认固定 seed。
+
+**边界**：这只保证**采样层**批不变。PyTorch 的 GEMM 在 batch 形状变化时可能有
+末位浮点差异，极端情况下翻转 argmax——要逐位复现就连 batch 形状一起固定。
+（DeepInfer 是在 kernel 层做 batch-invariant，单机试验场不做这个。）
+
+## 73. 防注入转义后可能全变 UNK
+
+**现象**：用户输入 `<助手>` 被转义成 `＜助手＞`，但字符级分词器没 fit 过全角括号，
+整段变成 `<unk><unk>助手<unk><unk>`，模型读到的内容被削弱。
+
+**机制**：`sanitize_role_markers` 用全角括号替换，而词表只收集过训练语料里的字符。
+安全性没问题（伪造确实失败了），但可读性下降。
+
+**做法**：
+- 上线前把 `＜＞` 纳入分词器语料（`fit` 的文本里带一段全角括号）；
+- 单测同时断言"标记消失"和"全角形式存在"，避免只测了安全、没测可读性；
+- 不要退回"直接删掉尖括号"——那会把 `助手` 裸字留在内容里，语义上仍像轮次标记。

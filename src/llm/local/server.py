@@ -98,8 +98,8 @@ class OpenAIServer:
         return Handler
 
     def _chat_params(self, req: dict) -> tuple[list[dict], int, float, int, float,
-                                               list[str], object, object]:
-        """解析通用参数（messages/max_tokens/temperature/top_k/repetition_penalty/stop/effort/response_format）."""
+                                               list[str], object, object, object]:
+        """解析通用参数（messages/max_tokens/temperature/top_k/repetition_penalty/stop/effort/response_format/seed）."""
         messages = req.get("messages") or []
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
@@ -115,8 +115,11 @@ class OpenAIServer:
         effort = req.get("reasoning_effort", req.get("effort"))
         # 结构化输出（OpenAI 兼容）：None/{"type":"text"} = 不约束
         response_format = req.get("response_format")
+        # 确定性采样：同一 seed 的输出可复现（与 batch 组成无关）
+        seed = req.get("seed")
+        seed = int(seed) if seed is not None else None
         return (messages, max_tokens, temperature, top_k, repetition_penalty,
-                stop, effort, response_format)
+                stop, effort, response_format, seed)
 
     @staticmethod
     def _apply_stop(text: str, stop: list[str]) -> tuple[str, str]:
@@ -128,8 +131,8 @@ class OpenAIServer:
 
     def handle_chat(self, handler: BaseHTTPRequestHandler, req: dict) -> None:
         """处理 chat 请求（stream=true 走 SSE 真增量）."""
-        (messages, max_tokens, temperature, top_k,
-         repetition_penalty, stop, effort, response_format) = self._chat_params(req)
+        (messages, max_tokens, temperature, top_k, repetition_penalty,
+         stop, effort, response_format, seed) = self._chat_params(req)
         # 努力档先校验（非法值给 400 而不是让 ValueError 冒成 500）
         from src.llm.local.effort import resolve_effort
         from src.llm.local.structured import JsonSchemaError
@@ -155,7 +158,8 @@ class OpenAIServer:
                                          temperature=temperature, top_k=top_k,
                                          repetition_penalty=repetition_penalty,
                                          effort=effort,
-                                         response_format=response_format)
+                                         response_format=response_format,
+                                         seed=seed)
             content, finish = self._apply_stop(resp["content"] or "", stop)
             # stop 未命中时 `_apply_stop` 统一给 length；这里以约束/生成本身的
             # 结束原因优先（约束解码自然闭合 = stop，被 max_tokens 截断 = length）
@@ -188,7 +192,8 @@ class OpenAIServer:
                                                  temperature=temperature, top_k=top_k,
                                                  repetition_penalty=repetition_penalty,
                                                  effort=effort,
-                                                 response_format=response_format):
+                                                 response_format=response_format,
+                                                 seed=seed):
                     chunk = dict(prefix)
                     chunk["choices"] = [{"index": 0,
                                          "delta": {"content": piece},

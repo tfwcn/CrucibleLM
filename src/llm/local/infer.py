@@ -104,6 +104,22 @@ def extend_vocab_and_model(
     return len(fresh), True
 
 
+_ROLE_MARKERS = ("<系统>", "<用户>", "<助手>")
+
+
+def sanitize_role_markers(text: str) -> str:
+    """转义文本里的角色标记，防止用户内容伪造对话轮次.
+
+    模板用 `<用户>` / `<助手>` 分隔轮次；若用户输入原样携带 `<助手>`，
+    模型看到的就是一个"提前开始的助手轮"，等于提示注入。
+    字符级分词器没有"特殊 token id"可拦，只能在拼模板前把标记的尖括号
+    换成全角（`＜助手＞`），语义仍是同一句话，但不再匹配模板标记。
+    """
+    for marker in _ROLE_MARKERS:
+        text = text.replace(marker, marker.replace("<", "＜").replace(">", "＞"))
+    return text
+
+
 class LocalChatBackend:
     """本地模型 chat 封装：messages -> 生成回复（OpenAI 兼容的返回形状）."""
 
@@ -131,7 +147,7 @@ class LocalChatBackend:
         parts = []
         for m in messages:
             role = role_cn.get(m.get("role", "user"), m.get("role", "user"))
-            content = m.get("content") or ""
+            content = sanitize_role_markers(m.get("content") or "")
             parts.append(f"<{role}>\n{content}")
         prompt = "\n".join(parts) + "\n<助手>\n"
         ids = self.tokenizer.encode(prompt)
@@ -183,6 +199,7 @@ class LocalChatBackend:
         repetition_penalty: float = 1.0,
         effort: object = None,
         response_format: object = None,
+        seed: int | None = None,
     ) -> dict:
         """对话生成，返回 {"content","reasoning","tool_calls","finish_reason"}.
 
@@ -190,6 +207,7 @@ class LocalChatBackend:
         `response_format`：结构化输出（`{"type":"json_object"}` 或
         `{"type":"json_schema",...}`）；约束解码保证输出是合法 JSON，
         未在 max_new_tokens 内闭合时 `finish_reason="length"`。
+        `seed`：确定性采样（同一 prompt + seed 逐位可复现，与 batch 组成无关）。
         """
         input_ids, _ = self._prepare_ids(messages, max_new_tokens, effort)
         constraint = self._make_constraint(response_format)
@@ -199,6 +217,7 @@ class LocalChatBackend:
             repetition_penalty=repetition_penalty,
             eos_id=SimpleTokenizer.EOS,
             constraint=constraint,
+            seed=seed,
         )
         new_ids = gen[0].tolist()[len(input_ids[0]):]
         done = constraint is None or bool(constraint.finished)
@@ -218,11 +237,12 @@ class LocalChatBackend:
         repetition_penalty: float = 1.0,
         effort: object = None,
         response_format: object = None,
+        seed: int | None = None,
     ):
         """流式生成，逐块 yield 文本（SSE 用；字符级分词保证增量解码精确）.
 
         `effort` 语义同 `chat`；`response_format` 同样生效（流式也走约束，
-        下游拿到的是逐字符的合法 JSON 前缀）。
+        下游拿到的是逐字符的合法 JSON 前缀）；`seed` 语义同 `chat`。
         """
         input_ids, _ = self._prepare_ids(messages, max_new_tokens, effort)
         constraint = self._make_constraint(response_format)
@@ -232,7 +252,8 @@ class LocalChatBackend:
                 temperature=temperature, top_k=top_k,
                 repetition_penalty=repetition_penalty,
                 eos_id=SimpleTokenizer.EOS,
-                constraint=constraint):
+                constraint=constraint,
+                seed=seed):
             ch = inv.get(tid)
             if ch:  # 特殊 token（BOS/EOS/UNK）跳过不吐
                 yield ch
