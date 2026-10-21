@@ -98,8 +98,8 @@ class OpenAIServer:
         return Handler
 
     def _chat_params(self, req: dict) -> tuple[list[dict], int, float, int, float,
-                                               list[str], object]:
-        """解析通用参数（messages/max_tokens/temperature/top_k/repetition_penalty/stop/effort）."""
+                                               list[str], object, object]:
+        """解析通用参数（messages/max_tokens/temperature/top_k/repetition_penalty/stop/effort/response_format）."""
         messages = req.get("messages") or []
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
@@ -113,7 +113,10 @@ class OpenAIServer:
         # 推理努力档（V4.1 §5.1.4）：`reasoning_effort` 与 `effort` 等价，
         # 接受 1–100 整数或 low/high/max；缺省 None = 不注入指令（老客户端不变）
         effort = req.get("reasoning_effort", req.get("effort"))
-        return messages, max_tokens, temperature, top_k, repetition_penalty, stop, effort
+        # 结构化输出（OpenAI 兼容）：None/{"type":"text"} = 不约束
+        response_format = req.get("response_format")
+        return (messages, max_tokens, temperature, top_k, repetition_penalty,
+                stop, effort, response_format)
 
     @staticmethod
     def _apply_stop(text: str, stop: list[str]) -> tuple[str, str]:
@@ -124,15 +127,23 @@ class OpenAIServer:
         return text, "length"
 
     def handle_chat(self, handler: BaseHTTPRequestHandler, req: dict) -> None:
-        """处理 chat 请求（stream=true 走 SSE 真增量）。"""
+        """处理 chat 请求（stream=true 走 SSE 真增量）."""
         (messages, max_tokens, temperature, top_k,
-         repetition_penalty, stop, effort) = self._chat_params(req)
+         repetition_penalty, stop, effort, response_format) = self._chat_params(req)
         # 努力档先校验（非法值给 400 而不是让 ValueError 冒成 500）
         from src.llm.local.effort import resolve_effort
+        from src.llm.local.structured import JsonSchemaError
 
         try:
             effort = resolve_effort(effort)
         except ValueError as exc:
+            handler._send_json(400, {"error": {  # noqa: SLF001 - 同类内部调用
+                "message": str(exc), "type": "invalid_request_error"}})
+            return
+        # schema / 词表覆盖度在写 SSE 头之前校验：否则 400 只能在流中间发生
+        try:
+            self.backend.validate_response_format(response_format)
+        except JsonSchemaError as exc:
             handler._send_json(400, {"error": {  # noqa: SLF001 - 同类内部调用
                 "message": str(exc), "type": "invalid_request_error"}})
             return
@@ -143,8 +154,13 @@ class OpenAIServer:
                 resp = self.backend.chat(messages, max_new_tokens=max_tokens,
                                          temperature=temperature, top_k=top_k,
                                          repetition_penalty=repetition_penalty,
-                                         effort=effort)
+                                         effort=effort,
+                                         response_format=response_format)
             content, finish = self._apply_stop(resp["content"] or "", stop)
+            # stop 未命中时 `_apply_stop` 统一给 length；这里以约束/生成本身的
+            # 结束原因优先（约束解码自然闭合 = stop，被 max_tokens 截断 = length）
+            if finish == "length" and resp.get("finish_reason") == "stop":
+                finish = "stop"
             handler._send_json(200, {  # noqa: SLF001 - 同类内部调用
                 "id": f"chatcmpl-{int(time.time() * 1000)}",
                 "object": "chat.completion", "created": int(time.time()),
@@ -171,7 +187,8 @@ class OpenAIServer:
                 for piece in self.backend.stream(messages, max_new_tokens=max_tokens,
                                                  temperature=temperature, top_k=top_k,
                                                  repetition_penalty=repetition_penalty,
-                                                 effort=effort):
+                                                 effort=effort,
+                                                 response_format=response_format):
                     chunk = dict(prefix)
                     chunk["choices"] = [{"index": 0,
                                          "delta": {"content": piece},

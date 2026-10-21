@@ -47,6 +47,7 @@
 ## 推理与数据
 
 - [采样与生成](./sampling.md)
+- [结构化输出：约束解码](./structured-output.md)
 - [推理加速：13→30.9 tok/s](./inference-acceleration.md)
 - [数据管线](./data-pipeline.md)
 - [存盘与续跑](./checkpoint.md)

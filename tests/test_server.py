@@ -20,7 +20,8 @@ def _tiny_backend(tmp_path):
     torch.manual_seed(0)
     m = TinyLLM(tiny_test_config())
     tok = SimpleTokenizer(256)
-    tok.fit(["你好世界", "今天天气不错", "hello world test"])
+    tok.fit(["你好世界", "今天天气不错", "hello world test",
+             '{}[]":,.-+0123456789truefalsn ok go '])
     m.eval()
     prefix = str(tmp_path / "model")
     torch.save(m.state_dict(), prefix + ".pt")
@@ -146,6 +147,36 @@ def test_openai_endpoints(tmp_path):
         code, body = _post(port, "/v1/completions",
                            {"prompt": "你好", "max_tokens": 8}, key="secret")
         assert code == 200 and "text" in json.loads(body)["choices"][0]
+    finally:
+        server.shutdown()
+
+
+def test_chat_response_format(tmp_path):
+    """结构化输出端到端：合法 schema 出可解析 JSON，非法 schema 回 400."""
+    backend = _tiny_backend(tmp_path)
+    server, port = _serve_in_thread(backend)
+    schema = {"type": "json_schema", "json_schema": {"schema": {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+    }}}
+    try:
+        code, body = _post(port, "/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "你好"}],
+            "max_tokens": 16, "response_format": schema})
+        data = json.loads(body)
+        assert code == 200
+        assert json.loads(data["choices"][0]["message"]["content"])["ok"] in (True, False)
+        assert data["choices"][0]["finish_reason"] == "stop"
+
+        # 不支持的组合 schema：400（且不会先吐 SSE 头）
+        with pytest.raises(Exception) as exc:
+            _post(port, "/v1/chat/completions", {
+                "messages": [{"role": "user", "content": "你好"}],
+                "max_tokens": 8,
+                "response_format": {"type": "json_schema", "json_schema": {
+                    "schema": {"anyOf": [{"type": "string"}]}}}})
+        assert "400" in str(exc.value)
     finally:
         server.shutdown()
 

@@ -24,6 +24,7 @@ seq2048/micro_batch4）可从零训练——RTX 3080 Laptop 16G 实测峰值 **�
 | Qwen3-Next | Hybrid 注意力（全/线性交替） | `block.py`：每 4 层 1 层 MLA，其余 `GatedDeltaLite` 线性层 |
 | Qwen3 系 | QK-Norm、短卷积 | MLA/线性层均有 RMSNorm；线性层 K/V 加 depthwise 短卷积 |
 | DeepSeek-V4.1 | **可控推理努力（b ∈ [1,100]）** | `effort.py`：系统提示前置 `Reasoning Effort: {b} (range 1–100; ...)`（**幂等**注入）；训练侧 **同 `(prompt,b)` 子组**均值中心化（跨档不比较，否则优势函数会奖励"更长"）+ 长度惩罚 `r_len=−min(C_max, k(b)·ℓ/L_norm)`，`k(b)=k0·exp(−(b−b_min)/τ)`、`τ=λ·Δb`（指数惩罚 ⇔ 最优长度对 b 仿射，附录 C eq.16）；部署三档 `low/high/max = 50/75/100`，中间值插值。`effort=None` 时 prompt **逐位等于**老路径 | `effort.py`/`infer.py`/`server.py`/`scripts/effort_probe.py` |
+| DeepInfer | **结构化输出（JSON Schema 约束解码）** | `structured.py`：schema → **字符级增量自动机**（不可变状态），每步把非法 token 的 logits 置 `-inf`；支持 object/array/string/enum/const/number/integer/boolean/null/任意 JSON，未支持模式**显式报错**；生成紧凑 JSON。接入 `generate/stream_tokens`（`constraint=`），服务端 `response_format`（OpenAI 兼容），有约束时禁用投机解码、仅 `B=1`。不依赖 `xgrammar`，纯 Python | `structured.py`/`model.py`/`infer.py`/`server.py` |
 | DeepSeek-V4.1 | **YaRN NTK-by-parts + 1M 上下文路线** | `rope.py`：按波长分三段——高频维度**不动**（短距离分辨率）、低频维度 **÷s**（插值）、中间线性斜坡；`mscale=0.1·ln s+1` 折进 cos/sin（= q、k 各 ×√mscale）；`yarn_scale=1` **逐位等于**标准 RoPE。1M 预设 `longctx_1m_config()`（8K→1M = `yarn_scale=128`，`yarn_scaling_factor` 上界放宽到 512）；`longctx.py` 启动自检：**64K 起训必须有稀疏注意力**（V4.1 不做 dense 预热，违规直接报错）、长于训练长度要配 YaRN、`yarn_scale` 与比例对不上要警告、≥256K 无 SWA 要警告 | `rope.py`/`longctx.py` |
 
 ## 默认配置（`config.py:SmallLLMConfig`）
@@ -56,6 +57,16 @@ tok = SimpleTokenizer(8192)
 tok.fit(corpus)
 backend = LocalChatBackend(model.cpu(), tok)
 print(backend.chat([{"role": "user", "content": "你好"}])["content"])
+
+# 4. 结构化输出（约束解码，保证合法 JSON）
+resp = backend.chat(
+    [{"role": "user", "content": "提取字段"}],
+    response_format={"type": "json_schema", "json_schema": {"schema": {
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+    }}},
+)
 ```
 
 16G 配方见 `config.py:RECIPE_16G`（bf16 / seq2048 / micro_batch4 / grad_accum8 /

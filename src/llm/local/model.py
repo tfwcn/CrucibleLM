@@ -533,19 +533,25 @@ class TinyLLM(nn.Module):
         top_k: int = 0,
         eos_id: int | None = None,
         repetition_penalty: float = 1.0,
+        constraint: object = None,
     ) -> torch.Tensor:
         """自回归生成（增量 KV/状态缓存，线性层 O(1)/步）.
 
         temperature=0 为贪心；>0 时按温度采样（可配 top-k 截断）。
         生成后恢复之前的 train/eval 状态：训练循环中穿插采样若把模型
         永久留在 eval 模式，梯度检查点会被静默关闭，显存随即爆炸。
+
+        `constraint`（可选）：结构化输出的约束对象，须实现
+        `mask_logits(logits)` / `accept(token_id)` / `finished`（见
+        `structured.JsonGrammarConstraint`）。有约束时**禁用投机解码**
+        （草稿器不感知语法，拒绝会退化成语义等价但更慢的路径），且只支持 B=1。
         """
         was_training = self.training
         self.eval()
         try:
             return self._generate_inner(
                 input_ids, max_new_tokens, temperature, top_k, eos_id,
-                repetition_penalty)
+                repetition_penalty, constraint)
         finally:
             if was_training:
                 self.train()
@@ -614,6 +620,7 @@ class TinyLLM(nn.Module):
         top_k: int,
         repetition_penalty: float = 1.0,
         past_ids: torch.Tensor | None = None,
+        constraint: object = None,
     ) -> torch.Tensor:
         """按温度/top-k 采样下一步（贪心 temperature=0），返回 (b, 1) id.
 
@@ -621,6 +628,9 @@ class TinyLLM(nn.Module):
         负值乘以惩罚（=1.0 关闭，逐位等价旧行为）；past_ids 为 (b, T) 上下文
         （含已生成），None 时不惩罚。专治贪心在高频 token（模板 `<`、
         markdown `####`）上的循环吸引子。
+
+        constraint: 结构化输出约束，在重复惩罚之后、温度缩放之前掩码——
+        惩罚只改数值、mask 决定"谁能被选中"，顺序不影响合法性。
         """
         next_logits = self.lm_head(h_last)[:, -1, :].float()
         if repetition_penalty != 1.0 and past_ids is not None:
@@ -634,6 +644,8 @@ class TinyLLM(nn.Module):
                             next_logits / repetition_penalty),
                 next_logits,
             )
+        if constraint is not None:
+            next_logits = constraint.mask_logits(next_logits)
         if temperature > 0:
             next_logits = next_logits / max(temperature, 1e-6)
             if top_k > 0:
@@ -962,13 +974,16 @@ class TinyLLM(nn.Module):
         top_k: int = 0,
         eos_id: int | None = None,
         repetition_penalty: float = 1.0,
+        constraint: object = None,
     ) -> torch.Tensor:
         """自回归生成内循环（调用方 generate 已处理 eval 模式切换）.
 
         temperature=0 为贪心；>0 时按温度采样（可配 top-k 截断）。
         与 stream_tokens 同一基元（数学一致，单测锁定）。
         """
-        if self._spec_eligible(input_ids, temperature):
+        if constraint is not None and input_ids.shape[0] != 1:
+            raise ValueError("约束解码只支持 batch=1（每序列需独立自动机）")
+        if constraint is None and self._spec_eligible(input_ids, temperature):
             ids = list(self._spec_stream(
                 input_ids, max_new_tokens, eos_id, repetition_penalty))
             if not ids:
@@ -980,7 +995,12 @@ class TinyLLM(nn.Module):
         cur = input_ids
         for _ in range(max_new_tokens):
             nxt = self._sample_next(h[:, -1:], temperature, top_k,
-                                    repetition_penalty, cur)
+                                    repetition_penalty, cur, constraint)
+            if constraint is not None:
+                # 先推进自动机再判断终止：EOS 本身也要 accept（finished=True）
+                constraint.accept(int(nxt[0, 0]))
+                if constraint.finished:
+                    break
             eids = self._engram_block_ids(cur, nxt)
             cur = torch.cat([cur, nxt], dim=1)
             if eos_id is not None and bool((nxt == eos_id).all()):
@@ -997,16 +1017,19 @@ class TinyLLM(nn.Module):
         top_k: int = 0,
         eos_id: int | None = None,
         repetition_penalty: float = 1.0,
+        constraint: object = None,
     ):
         """逐 token 生成器（SSE 流式/OpenAI stream 用），逐个 yield 新 id（int）.
 
         与 generate() 同一 prefill+解码路径（数学一致，单测锁定），
-        生成后同样恢复 train/eval 状态。
+        生成后同样恢复 train/eval 状态。`constraint` 语义同 `generate`。
         """
+        if constraint is not None and input_ids.shape[0] != 1:
+            raise ValueError("约束解码只支持 batch=1（每序列需独立自动机）")
         was_training = self.training
         self.eval()
         try:
-            if self._spec_eligible(input_ids, temperature):
+            if constraint is None and self._spec_eligible(input_ids, temperature):
                 yield from self._spec_stream(
                     input_ids, max_new_tokens, eos_id, repetition_penalty)
                 return
@@ -1016,9 +1039,13 @@ class TinyLLM(nn.Module):
                 cur = (torch.cat([input_ids, *seen], dim=1) if seen
                        else input_ids)
                 nxt = self._sample_next(h[:, -1:], temperature, top_k,
-                                        repetition_penalty, cur)
+                                        repetition_penalty, cur, constraint)
+                if constraint is not None:
+                    constraint.accept(int(nxt[0, 0]))
                 eids = self._engram_block_ids(cur, nxt)
                 yield int(nxt[0, 0])
+                if constraint is not None and constraint.finished:
+                    break
                 if eos_id is not None and bool((nxt == eos_id).all()):
                     break
                 seen.append(nxt)

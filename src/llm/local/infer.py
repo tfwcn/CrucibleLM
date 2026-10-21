@@ -143,6 +143,36 @@ class LocalChatBackend:
         device = next(self.model.parameters()).device
         return input_ids.to(device), device
 
+    def _make_constraint(self, response_format: object):
+        """`response_format` → 约束对象（None=不约束）.
+
+        只支持单序列；schema 不合法时抛 `JsonSchemaError`（服务端转 400）。
+        """
+        from src.llm.local.structured import (
+            JsonGrammar,
+            JsonGrammarConstraint,
+            parse_response_format,
+        )
+
+        schema = parse_response_format(response_format)
+        if schema is None:
+            return None
+        # 词表以模型 logits 宽度为准：分词器字符表可能短于模型容量
+        # （未训练的空行不可解码，被空串挡在 mask 外）
+        vocab = int(self.model.config.vocab_size)
+        tokens = [""] * vocab
+        for i, ch in enumerate(self.tokenizer._chars[:max(0, vocab - 4)]):
+            tokens[i + 4] = ch
+        constraint = JsonGrammarConstraint(
+            JsonGrammar(schema), tokens, SimpleTokenizer.EOS,
+            vocab_size=vocab)
+        constraint.check_available()
+        return constraint
+
+    def validate_response_format(self, response_format: object) -> None:
+        """提前校验 `response_format`（服务端在写 SSE 头之前调，好回 400）."""
+        self._make_constraint(response_format)
+
     @torch.no_grad()
     def chat(
         self,
@@ -152,24 +182,31 @@ class LocalChatBackend:
         top_k: int = 0,
         repetition_penalty: float = 1.0,
         effort: object = None,
+        response_format: object = None,
     ) -> dict:
         """对话生成，返回 {"content","reasoning","tool_calls","finish_reason"}.
 
         `effort`：推理努力档（1–100 / low / high / max）；None = 不注入指令。
+        `response_format`：结构化输出（`{"type":"json_object"}` 或
+        `{"type":"json_schema",...}`）；约束解码保证输出是合法 JSON，
+        未在 max_new_tokens 内闭合时 `finish_reason="length"`。
         """
         input_ids, _ = self._prepare_ids(messages, max_new_tokens, effort)
+        constraint = self._make_constraint(response_format)
         gen = self.model.generate(
             input_ids, max_new_tokens=max_new_tokens,
             temperature=temperature, top_k=top_k,
             repetition_penalty=repetition_penalty,
             eos_id=SimpleTokenizer.EOS,
+            constraint=constraint,
         )
         new_ids = gen[0].tolist()[len(input_ids[0]):]
+        done = constraint is None or bool(constraint.finished)
         return {
             "content": self.tokenizer.decode(new_ids),
             "reasoning": None,
             "tool_calls": None,
-            "finish_reason": "stop",
+            "finish_reason": "stop" if done else "length",
         }
 
     def stream(
@@ -180,18 +217,22 @@ class LocalChatBackend:
         top_k: int = 0,
         repetition_penalty: float = 1.0,
         effort: object = None,
+        response_format: object = None,
     ):
         """流式生成，逐块 yield 文本（SSE 用；字符级分词保证增量解码精确）.
 
-        `effort` 语义同 `chat`。
+        `effort` 语义同 `chat`；`response_format` 同样生效（流式也走约束，
+        下游拿到的是逐字符的合法 JSON 前缀）。
         """
         input_ids, _ = self._prepare_ids(messages, max_new_tokens, effort)
+        constraint = self._make_constraint(response_format)
         inv = {i + 4: ch for i, ch in enumerate(self.tokenizer._chars)}
         for tid in self.model.stream_tokens(
                 input_ids, max_new_tokens=max_new_tokens,
                 temperature=temperature, top_k=top_k,
                 repetition_penalty=repetition_penalty,
-                eos_id=SimpleTokenizer.EOS):
+                eos_id=SimpleTokenizer.EOS,
+                constraint=constraint):
             ch = inv.get(tid)
             if ch:  # 特殊 token（BOS/EOS/UNK）跳过不吐
                 yield ch

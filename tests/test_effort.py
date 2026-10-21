@@ -276,9 +276,11 @@ def test_server_params_parse_effort(tmp_path):
     backend, _ = _backend()
     srv = OpenAIServer(backend)
     out = srv._chat_params({"messages": [], "reasoning_effort": "max"})
-    assert out[-1] == "max"
-    assert srv._chat_params({"messages": [], "effort": 60})[-1] == 60
-    assert srv._chat_params({"messages": []})[-1] is None
+    assert out[6] == "max"
+    assert srv._chat_params({"messages": [], "effort": 60})[6] == 60
+    assert srv._chat_params({"messages": []})[6] is None
+    # response_format 是第 8 项（新增在末尾，保持旧索引稳定）
+    assert srv._chat_params({"messages": []})[7] is None
 
 
 def test_server_rejects_bad_effort_with_400(tmp_path):

@@ -1231,3 +1231,73 @@ compared"。
 - 新增"只有某开关打开才打印"的启动日志时，**至少用该开关跑一次 1 步冒烟**；
 - 更稳的做法：把这类启动日志抽成纯函数（`format_arch_report(config, arch_src)`）
   并单测，CLI 只负责调用——本次已按此方向记录，后续重构时落地。
+
+## 67. 约束解码里 EOS 不 `accept`，`finished` 永远是 False
+
+**现象**：手动循环里 `if tid == EOS: break`，结果 `constraint.finished` 一直是
+`False`，调用方据此把 `finish_reason` 判成 `length`。
+
+**机制**：`finished` 不是"采样到了 EOS"这个动作的副产品，而是 `accept(EOS)`
+里显式置位的。生成循环必须**先 accept、再判断**：
+
+```python
+constraint.accept(int(nxt[0, 0]))
+if constraint.finished:
+    break
+```
+
+单测里模拟生成的 helper 也要遵守同一条，否则测的是假的终止路径。
+
+## 68. 逗号后直接 `}`：尾逗号不是"少写一个键"，是非法 JSON
+
+**现象**：`{"a":1,}` 被自动机接受，`json.loads` 却报错。
+
+**机制**：`obj_key` 状态同时承担"对象开头"和"逗号之后"两个位置。前者允许
+`}`（空对象），后者不允许（尾逗号）。只用一个 `in_key` 布尔量区分不出来。
+
+**做法**：`obj_key` 的 data 增加 `allow_close`——对象开头 `True`、吃过逗号
+`False`。`allowed()` 与 `step()` 必须都检查它（只改一处会导致 mask 与推进不一致，
+采样出一个 `step()` 拒绝的 token 后直接抛 RuntimeError）。
+
+## 69. 重复键会让贪心生成无限循环
+
+**现象**：测试里对"required 两个属性"的 schema 做贪心生成，输出变成
+`{"a":1,"a":1,"a":1,...}` 直到 `max_tokens`。
+
+**机制**：键位置只按 `properties` 的前缀匹配，不管这个键是否已经写过。模型一旦
+偏爱某个键，就会一直追加；`obj_comma` 的 `,` 又永远允许。
+
+**做法**：`done_keys` 里已有的键从候选里剔除；并且 `obj_comma` 的 `,` 只在
+"还有没写过的键"时允许（`_has_new_key`）。写满后只能 `}`。
+
+## 70. 字符级词表缺 JSON 结构字符 → 无合法 token
+
+**现象**：用 `fit(["你好世界"])` 的分词器做约束解码，第一步就
+`RuntimeError: 约束解码无法继续：当前状态没有任何合法 token`。
+
+**机制**：自动机要求 `{`、`"`、`:`、数字等字符，但词表里根本没有这些 token。
+mask 全 `-inf` 时继续采样会得到 NaN（`argmax` 全相等取 0，或 softmax 全 0）。
+
+**做法**：
+- 不要"兜底放行 EOS"——那会生成空串，看起来成功、实际不可用；
+- 在写 SSE 头之前调 `validate_response_format()`（内部 `check_available()`），
+  词表不覆盖直接回 **400**；
+- 真做结构化输出时，字符级分词器的语料必须包含 JSON 语法字符。
+
+## 71. 数字"停在中途"仍然合法，`accepting` 要递归看父级
+
+**现象**：`{"a":1` 被判定为 accepting（可以出 EOS），生成的 JSON 缺 `}`。
+
+**机制**：`1` 读完后状态停在 `num`（下一个字符可能是 `.`/`e`），
+但 `json.loads("1")` 已经合法。只看 `mode=="done"` 会漏掉这种情况；
+只看"数字 DFA 可接受"又会把**对象内部**的数字误判为完整文档。
+
+**做法**：
+
+```python
+if mode == "num" and cur in _NUM_ACCEPT:
+    return self.accepting(self._finish_value(state))
+```
+
+先让数字结束、回到父级（对象 → `obj_comma`），再问父级是否 accepting。
+递归最多一层（父级只会是 `done` / `obj_comma` / `arr_comma`）。
