@@ -72,6 +72,10 @@ V4.1 相对原版 Engram 的两处修改，本项目都对齐：
   由单测锁定（fp8 开/关都测）；
 - **容量**：`count_params` 把巨大的哈希表计入总参数，但"激活参数"只算投影/归一 +
   每 token 查回的 `d_out` 行（与 MoE 的激活口径一致）。
+- **宿主表**（`engram_host`，默认关）：表主副本留 CPU，前向只搬命中行、反向只回传
+  命中行梯度，更新走行稀疏 Adagrad。显存与表规模解耦，代价是每步 PCIe + CPU gather
+  （4096 token prefill ≈ 1.1 ms）。基准数据、选型与实现细节见
+  `docs/details/host-resident-memory.md`（pitfalls 74/75/76/77）。
 
 ## 从想法到代码
 

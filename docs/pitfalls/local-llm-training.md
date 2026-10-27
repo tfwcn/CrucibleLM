@@ -1332,3 +1332,60 @@ if mode == "num" and cur in _NUM_ACCEPT:
 - 上线前把 `＜＞` 纳入分词器语料（`fit` 的文本里带一段全角括号）；
 - 单测同时断言"标记消失"和"全角形式存在"，避免只测了安全、没测可读性；
 - 不要退回"直接删掉尖括号"——那会把 `助手` 裸字留在内容里，语义上仍像轮次标记。
+
+## 74. `index_select` 的反向会物化**全表**梯度——"表留 CPU"必须自定义 Function
+
+**现象**：把 Engram 表放到 CPU、前向只取命中行，看着很省；一跑训练显存/内存暴涨，
+或者每步耗时翻好几倍，`p.grad` 是一整张表的形状。
+
+**机制**：`F.embedding` / `Tensor.index_select` 的 autograd 反向会先
+`zeros_like(input)` 再 `index_add` 散射回去。表有 1M 行就是每步一次 128 MB 的
+零初始化 + 散射（16M 行 = 2 GB），"只查 1% 的行"完全没体现出来。
+更隐蔽的是：优化器照常工作，数值也对，只有时间和内存告诉你它其实搬了全表。
+
+**做法**：
+- 宿主表用自定义 `autograd.Function`：forward 里 `weight.detach().index_select(...)`
+  （不走 autograd），backward 只把 `(idx, grad_rows)` 追加进旁路队列，返回 `None`；
+- 优化器单独实现 `SparseRowAdagrad`，从队列消费命中行（一步内同一行先求和）；
+- 单测同时断言 `weight.grad is None` 与 `_grad_sink` 的索引等于命中索引——
+  只测 loss 是测不出来这个坑的。
+
+## 75. 逐表 `.to("cpu")`：一次前向 24 次同步
+
+**现象**：宿主表版本前向比预期慢一大截，profile 里全是 `cudaStreamSynchronize`。
+
+**机制**：`tensor.to("cpu")` 是阻塞拷贝。Engram 默认 3 阶 × 8 头 = 24 张表，
+每张表各搬一次索引，就是 24 次同步（每次都要等 GPU 队列排空）。
+哈希本身只依赖 token id，完全没必要在 GPU 上算。
+
+**做法**：
+- 每层把 `ids` 一次性搬到 CPU，24 张表的哈希全在 CPU 算（整数运算，CPU/GPU 逐位一致）；
+- `lookup_host` 里断言索引确实在 CPU，别让「某次忘了搬」悄悄退化成 24 次同步。
+
+## 76. `model.to(bf16)` 不会转换宿主表——输出 dtype 要显式对齐
+
+**现象**：`model.to("cuda")` 后前向报 `expected scalar type BFloat16 but found Float`
+（或反过来），栈指到 Engram 的 `w_v` 线性层。
+
+**机制**：为了让主权重留在 CPU，`EngramTable._apply` 对宿主表直接 `return self`，
+于是 `model.to(dtype=bf16)` 也不会把表转成 bf16。表本身没问题（fp32 更准），
+但取出来的行如果原样送进 bf16 主干的线性层就 dtype 不匹配。
+
+**做法**：
+- 宿主表主权重固定 fp32，输出时按**主干**的 `device/dtype` 转换：
+  `lookup(idx, device, dtype)` 的 `device/dtype` 从同模块的 `w_v.weight` 取；
+- 单测在 `to("cuda")` 之后跑一次前向，同时断言"表在 CPU"和"logits 在 cuda"。
+
+## 77. 容器里 `/proc/self/io` 可能不存在；O_DIRECT 读稀疏文件会测出假快
+
+**现象**：基准脚本里 `read_bytes` 恒为 None；或者随机读 IOPS 好得离谱（几十万）。
+
+**机制**：部分容器把 `/proc/self/io` 裁掉了（`read_bytes` 只统计真正落盘的读量，
+是判断"页缓存有没有兜住"的关键）。另外稀疏文件的洞在 ext4 上读起来不产生 I/O，
+`fallocate` 出来的文件测随机读会得到内存级数字。
+
+**做法**：
+- 读量改用 `/sys/block/<dev>/stat` 第 3 列（读扇区数，512 B/扇区）；
+- 基准文件必须**真写数据**（写 1 MiB 随机块循环），别用 `truncate`/稀疏文件；
+- 冷热对比用 `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` 只丢**本文件**的页缓存，
+  不要动全局 `drop_caches`（会干扰同机其他进程）。

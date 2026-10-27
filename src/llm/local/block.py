@@ -73,6 +73,7 @@ class HybridBlock(nn.Module):
         engram_d_mem: int = 256,
         engram_table_size: int = 8191,
         engram_fp8: bool = True,
+        engram_host: bool = False,
         vocab_size: int = 8192,
         csa_mode: str = "full",
         compress_ratio: int = 1,
@@ -141,7 +142,8 @@ class HybridBlock(nn.Module):
         # Engram 条件记忆（默认 None；开后在注意力之前残差并联，恒等起点）
         self.engram: EngramMemory | None = (
             EngramMemory(d_model, vocab_size, engram_orders, engram_heads,
-                         engram_d_mem, engram_table_size, engram_fp8, dropout)
+                         engram_d_mem, engram_table_size, engram_fp8, dropout,
+                         host=engram_host)
             if use_engram else None
         )
 

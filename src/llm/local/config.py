@@ -235,6 +235,10 @@ class SmallLLMConfig:
     engram_table_size: int = 8191
     # 表 + K/V 投影走 FP8（QAT：fake-quant + STE；推理可 pack() 成真 FP8 存储）
     engram_fp8: bool = True
+    # **宿主表**：表主权重留 CPU（只把命中行搬上算力设备），训练走行稀疏 Adagrad。
+    # 默认关（opt-in）：它会改优化器分组（续训须删 optim.pt），且吞吐受 PCIe/CPU 限制；
+    # 收益是"表再大也不占显存"，见 docs/details/host-resident-memory.md
+    engram_host: bool = False
 
     # ===== 投机解码（推理加速，默认关；见 spec_decode.py / docs/details/speculative-decoding.md）=====
     # 关闭时生成路径逐位不变（单测锁定）
@@ -752,6 +756,9 @@ _ARCH_SWITCHES: dict[str, tuple[object, object]] = {
     "kv_block_cache": (False, _norm_bool),
     # Engram 的表 + K/V 投影 FP8（V4.1 §2.4.2）；不改键，旧 ckpt 回退关（= 特性前不量化）
     "engram_fp8": (False, _norm_bool),
+    # Engram 宿主表（表留 CPU）：不改键、不改前向数学，但改优化器分组；
+    # 从 hparams 沿用，避免续训时静默把表搬回显存（旧 ckpt 回退 False=特性前全在卡上）
+    "engram_host": (False, _norm_bool),
     # Single-Pass mHC / Mega-mHC 数据流（V4.1 §2.4.1）：不改键，旧 ckpt 回退关
     # （= eq.2 多趟语义，训练结果逐位可复现）
     "hc_single_pass": (False, _norm_bool),

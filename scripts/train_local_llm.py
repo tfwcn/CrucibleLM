@@ -164,6 +164,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--engram-fp8", action=argparse.BooleanOptionalAction,
                    default=None,
                    help="Engram 表 + K/V 投影走 FP8（QAT；默认开，--no-engram-fp8 关）")
+    p.add_argument("--engram-host", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Engram 表留 CPU（只搬命中行上卡，行稀疏 Adagrad 更新）："
+                        "表再大也不占显存，代价是 PCIe/CPU 开销（默认关）")
+    p.add_argument("--engram-host-lr", type=float, default=0.03,
+                   help="宿主表行稀疏 Adagrad 的学习率（Adagrad 口径，比 Adam 大 10~100 倍）")
     p.add_argument("--csa-reuse-every", type=int, default=None,
                    help="CSA2 跨层 KV 复用：每 N 个全注意力层留 1 个 Full"
                         "（1=关；不传时新训练取架构默认=2，续训/迁移沿用 checkpoint，"
@@ -886,6 +892,9 @@ def main(argv=None) -> int:
         config.engram_heads = args.engram_heads
         config.engram_d_mem = args.engram_d_mem
         config.engram_table_size = args.engram_table_size
+        # 未显式给 --engram-host 时交给 resolve_arch_switches（config-json/checkpoint/默认）
+        if args.engram_host is not None:
+            config.engram_host = bool(args.engram_host)
         if not is_prime(config.engram_table_size):
             raise SystemExit(
                 f"--engram-table-size 须为素数，当前 {config.engram_table_size}"
@@ -905,6 +914,12 @@ def main(argv=None) -> int:
     from src.llm.local.config import _ARCH_SWITCHES
     for field in _ARCH_SWITCHES:
         setattr(args, field, getattr(config, field))
+    if config.engram_host:
+        print("Engram 表留 CPU（行稀疏 Adagrad）：主权重不占显存，"
+              "续训需与训练时一致（否则删 optim.pt）", flush=True)
+    if arch_src.get("engram_host") == "conservative":
+        print("Engram 宿主表：checkpoint 无该记录，按关闭处理（表全在显存）",
+              flush=True)
     # indexer 超参（不是架构开关：键名不变但**改形状**，装错会大声报 shape 错，
     # 故允许 CLI 直接覆盖；显式传入才生效，None=沿用默认/checkpoint）
     apply_indexer_overrides(args, config)
@@ -1128,13 +1143,16 @@ def main(argv=None) -> int:
             model, muon_lr=args.muon_lr, adam_lr=args.lr,
             head_wise=args.muon_head_wise, n_heads=model.config.n_heads,
             sinkhorn=args.sinkhorn, sinkhorn_lr_scale=args.sinkhorn_lr_scale,
-            sinkhorn_steps=args.sinkhorn_steps)
+            sinkhorn_steps=args.sinkhorn_steps,
+            host_lr=args.engram_host_lr)
         _gs = getattr(optim, "group_sizes", {})
         print(f"优化器：Muon+AdamW（muon_lr={args.muon_lr}，adam_lr={args.lr}）"
               f"分组 {_gs}"
               + ("｜head-wise Muon 已开（Q/K 按头分块）" if args.muon_head_wise else "")
               + (f"｜Sinkhorn 已开（γ={args.sinkhorn_lr_scale}，K={args.sinkhorn_steps}）"
-                 if args.sinkhorn else ""), flush=True)
+                 if args.sinkhorn else "")
+              + ("｜宿主表走行稀疏 Adagrad" if getattr(optim, "host_opt", None) else ""),
+              flush=True)
     elif args.sinkhorn or args.muon_head_wise:
         raise SystemExit(
             "--sinkhorn / --muon-head-wise 需要 --optimizer muon（AdamW 只有一组，无从分组）")

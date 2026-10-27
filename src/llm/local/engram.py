@@ -78,6 +78,33 @@ def hash_ngrams(gram: torch.Tensor, table_size: int, seed: int) -> torch.Tensor:
     return h % int(table_size)
 
 
+class _HostGather(torch.autograd.Function):
+    """宿主表取行：前向 CPU 随机 gather + H2D，反向只回传**命中行**的梯度.
+
+    为什么自定义：`index_select` 的反向会 `zeros_like(weight)` 再散射，等于每步
+    物化一整张表的梯度（1M×32 就是 128 MB）。宿主表的意义正是"不物化"，
+    所以反向只把命中行的梯度塞进旁路队列 `sink`，交给行稀疏更新器消费。
+    """
+
+    @staticmethod
+    def forward(ctx, idx: torch.Tensor, weight: torch.Tensor, sink: list,
+                device, dtype) -> torch.Tensor:
+        ctx.save_for_backward(idx)
+        ctx.sink = sink
+        flat = idx.reshape(-1)          # index_select 要求一维索引
+        rows = weight.detach().index_select(0, flat)   # CPU 侧随机 gather（内存命中）
+        # 只搬命中行：rows 还在 CPU，`to()` 才产生那一次 H2D
+        return rows.to(device=device, dtype=dtype).view(*idx.shape, rows.shape[1])
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        idx, = ctx.saved_tensors
+        g = grad_out.detach().to("cpu", torch.float32)  # D2H：只回传命中行
+        ctx.sink.append((idx.reshape(-1).detach(), g.reshape(-1, g.shape[-1])))
+        # weight/device/dtype 不求导；梯度走旁路队列，不落到 .grad（避免全表梯度）
+        return None, None, None, None, None
+
+
 class EngramTable(nn.Module):
     """一张 n-gram 哈希表：FP8 查找（QAT）+ 可打包成真 FP8 存储（推理期）.
 
@@ -88,13 +115,19 @@ class EngramTable(nn.Module):
     - **已打包**（`pack()`，仅推理）：权重压成 `uint8` 码字 + E4M3 scale，
       前向从打包存储取行再反量化；数值与 fake-quant 路径**逐位相同**（量化-
       反量化幂等，见 pitfalls 45）。打包是**快照**，训练中禁止（会读到旧表）。
+
+    **宿主表**（`host=True`）：主权重永远留 CPU（`_apply` 不搬），前向只把命中行
+    搬上算力设备，反向只回传命中行梯度到旁路队列。这是"记忆不占显存"的实现，
+    判据是"每步只有 <1% 的行被更新"——稠密权重做不到，查表可以。
     """
 
-    def __init__(self, rows: int, cols: int, fp8: bool = True):
+    def __init__(self, rows: int, cols: int, fp8: bool = True,
+                 host: bool = False):
         super().__init__()
         self.rows = int(rows)
         self.cols = int(cols)
         self.fp8 = bool(fp8)
+        self.host = bool(host)
         if self.fp8:
             assert self.cols % _QBLOCK == 0, (
                 f"FP8 表的每头维度须被 {_QBLOCK} 整除，当前 {self.cols}")
@@ -102,6 +135,18 @@ class EngramTable(nn.Module):
         # 打包后的真 FP8 存储（uint8 视图）；None = 未打包。transient（不进 state_dict）
         self.register_buffer("w8", None, persistent=False)
         self.register_buffer("s8", None, persistent=False)
+        # 宿主表的行稀疏梯度旁路（(idx, grad_rows) 列表；不参与 state_dict）
+        self._grad_sink: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def _apply(self, fn, recurse: bool = True):
+        """宿主表不跟随 `model.to()` 搬设备——它的主权重本来就是"冷端".
+
+        `model.to(bf16/cuda)` 只对**普通**参数生效；宿主表的 dtype 由
+        `lookup_host(device, dtype)` 的输出转换决定（与 GPU 路径同 dtype）。
+        """
+        if not self.host:
+            return super()._apply(fn, recurse)
+        return self
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         """查表：`idx (...)` → `(..., cols)`（FP8 精度）."""
@@ -113,6 +158,42 @@ class EngramTable(nn.Module):
             return self._lookup_packed(idx)
         rows = F.embedding(idx, self.weight)
         return fake_quant(rows, "fp8") if self.fp8 else rows
+
+    def lookup(self, idx: torch.Tensor, device, dtype) -> torch.Tensor:
+        """统一查表入口：宿主表走"取命中行 + 上卡"，普通表走原路径.
+
+        `device/dtype` 是**主干**（非表）所在设备与精度；宿主表按它转出结果，
+        这样 `model.to(bf16/cuda)` 之后两边数值口径一致。
+        """
+        if not self.host:
+            return self.forward(idx)
+        return self.lookup_host(idx, device, dtype)
+
+    def lookup_host(self, idx: torch.Tensor, device, dtype) -> torch.Tensor:
+        """宿主表取行：`idx` 须已在 CPU（省掉逐表 D2H 同步）.
+
+        已打包 → 走 FP8 存储（1.06 B/通道）的 uint8 取行；
+        未打包 → 走主权重 gather（训练可回传梯度）。
+        """
+        if idx.device.type != "cpu":
+            raise ValueError("宿主表的索引须先在 CPU 上算好（见 EngramMemory._embed）")
+        if self.w8 is not None:
+            if self.training:
+                raise RuntimeError(
+                    "Engram 表已打包成 FP8 存储（快照）：训练会读到旧表，"
+                    "先 `unpack()` 再训练")
+            return self._lookup_host_packed(idx, device, dtype)
+        rows = _HostGather.apply(idx, self.weight, self._grad_sink, device, dtype)
+        return fake_quant(rows, "fp8") if self.fp8 else rows
+
+    def _lookup_host_packed(self, idx: torch.Tensor, device, dtype) -> torch.Tensor:
+        """宿主表 + 已打包：CPU 取 uint8 码字/scale → 上卡反量化（与未打包逐位一致）."""
+        flat = idx.reshape(-1)
+        q = self.w8.index_select(0, flat).to(device).view(torch.float8_e4m3fn)
+        s = self.s8.index_select(0, flat).to(device).view(torch.float8_e4m3fn)
+        q = q.view(*idx.shape, self.cols)
+        s = s.view(*idx.shape, self.cols // _QBLOCK)
+        return dequantize_fp8(q, s, _QBLOCK).to(dtype)
 
     def _lookup_packed(self, idx: torch.Tensor) -> torch.Tensor:
         """从打包存储取行并反量化（与 fake-quant 路径逐位相同）."""
@@ -162,6 +243,7 @@ class EngramMemory(nn.Module):
         table_size: int = 8191,
         fp8: bool = True,
         dropout: float = 0.0,
+        host: bool = False,
     ):
         super().__init__()
         self.orders = [int(o) for o in orders]
@@ -186,12 +268,14 @@ class EngramMemory(nn.Module):
                 f"FP8 投影要求拼接维 {self.d_out} 被 {_QBLOCK} 整除")
         # 每 (阶, 头) 一张素数大小的表；各头 seed 不同 → 同一 n-gram 多头分散
         # （论文用"互异素数"进一步打散，这里同素数 + 异 seed 已足够分散）
+        self.host = bool(host)  # 表留 CPU（记忆不占显存），见 EngramTable
         self.tables = nn.ModuleList()
         self.seeds: list[int] = []
         for o in self.orders:
             for k in range(self.n_heads):
                 self.tables.append(
-                    EngramTable(self.table_size, self.d_head, self.fp8))
+                    EngramTable(self.table_size, self.d_head, self.fp8,
+                                host=self.host))
                 self.seeds.append((o * 1009 + k * 97 + 13) & _MASK31)
         # 上下文门控：hidden 作 Q，记忆作 K/V（RMSNorm 稳定梯度）
         self.w_k = nn.Linear(self.d_out, d_model, bias=False)
@@ -231,14 +315,23 @@ class EngramMemory(nn.Module):
         return torch.stack([ctx[:, i:i + t] for i in range(n)], dim=-1)
 
     def _embed(self, ids: torch.Tensor, tv: int) -> torch.Tensor:
-        """为末 `tv` 位取回多头 n-gram 记忆并拼接： `(b,L)` → `(b,tv,d_out)`."""
+        """为末 `tv` 位取回多头 n-gram 记忆并拼接： `(b,L)` → `(b,tv,d_out)`.
+
+        宿主表时一次性把 `ids` 搬到 CPU 再算全部哈希——每表一次 D2H 会让
+        24 张表=24 次同步，集中成 1 次即可（整数哈希在 CPU/GPU 上逐位一致）。
+        """
         embeds: list[torch.Tensor] = []
         gi = 0
+        device = self.w_v.weight.device
+        dtype = self.w_v.weight.dtype
+        ctx_ids = ids.detach().to("cpu") if self.host else ids
         for o in self.orders:
-            gram = self._grams_last(ids, o, tv)  # (b,tv,o)
+            gram = self._grams_last(ctx_ids, o, tv)  # (b,tv,o)
             for _ in range(self.n_heads):
                 idx = hash_ngrams(gram, self.table_size, self.seeds[gi])
-                embeds.append(self.tables[gi](idx))
+                table = self.tables[gi]
+                embeds.append(table.lookup(idx, device, dtype) if self.host
+                              else table(idx))
                 gi += 1
         return torch.cat(embeds, dim=-1)
 
@@ -273,3 +366,7 @@ class EngramMemory(nn.Module):
     def nbytes(self) -> int:
         """所有表的实际存储字节数（打包后约 1.06 B/通道）."""
         return sum(t.nbytes() for t in self.tables)
+
+    def host_params(self) -> list[nn.Parameter]:
+        """宿主表的主权重列表（行稀疏更新器按此接管；空 = 全在算力设备）."""
+        return [t.weight for t in self.tables] if self.host else []

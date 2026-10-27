@@ -227,6 +227,88 @@ class SinkhornAdamLike(torch.optim.Optimizer):
         return loss
 
 
+class SparseRowAdagrad:
+    """宿主表的**行稀疏** Adagrad（FBGEMM/TorchRec 同款思路）：只更新命中行.
+
+    为什么不是 Sinkhorn：Sinkhorn 每步对**全表**做 22 趟行列归一化，
+    1M×32 的表在 CPU 上要几百 ms —— 省下的显存又还回去了。行稀疏更新的代价
+    只与"本步命中行数"有关（每步 <1%），与表大小无关。
+
+    梯度来源不是 `p.grad`（那会物化全表），而是 `EngramTable._grad_sink`
+    里的 `(idx, grad_rows)` 旁路队列。多个 micro-batch 的条目先按行去重累加，
+    再做一次 Adagrad 更新——与"先累梯度再 step"等价，但不占全表内存。
+
+    状态：每张表惰性分配一份 `float32` 累加器（= 1× 表大小），首次 step 才分配。
+    """
+
+    def __init__(self, tables: list, lr: float = 0.03, eps: float = 1e-10):
+        self.tables = list(tables)
+        self.lr = float(lr)
+        self.eps = float(eps)
+        self.state: dict[int, torch.Tensor] = {}  # id(weight) → 平方梯度累加器
+
+    def zero_grad(self) -> None:
+        """丢弃尚未消费的行梯度（与 `zero_grad` 语义对齐，防跨步残留）."""
+        for t in self.tables:
+            t._grad_sink.clear()
+
+    def pending_rows(self) -> int:
+        """旁路队列里待更新的行数（日志/单测用）."""
+        return sum(int(i.numel()) for t in self.tables for i, _ in t._grad_sink)
+
+    @torch.no_grad()
+    def step(self) -> None:
+        """对每张宿主表做一次行稀疏 Adagrad 更新."""
+        for t in self.tables:
+            sink = t._grad_sink
+            if not sink:
+                continue
+            cols = t.cols
+            idx = torch.cat([i.reshape(-1) for i, _ in sink])
+            grad = torch.cat([g.reshape(-1, cols) for _, g in sink]).float()
+            # 同一行在一个 step 内可能被多次命中：先求和（= 梯度累加）
+            uniq, inv = torch.unique(idx, return_inverse=True)
+            acc = torch.zeros(uniq.numel(), cols, dtype=torch.float32)
+            acc.index_add_(0, inv, grad)
+
+            key = id(t.weight)
+            if key not in self.state:
+                self.state[key] = torch.zeros_like(t.weight, dtype=torch.float32)
+            g2 = self.state[key]
+            g2_rows = g2.index_select(0, uniq) + acc * acc
+            # Adagrad：Δ = lr · g / (√Σg² + ε)
+            upd = acc / (g2_rows.sqrt() + self.eps)
+            rows = t.weight.data.index_select(0, uniq).float()
+            t.weight.data.index_copy_(0, uniq, (rows - self.lr * upd).to(t.weight.dtype))
+            g2.index_copy_(0, uniq, g2_rows)
+            sink.clear()
+
+    def state_bytes(self) -> int:
+        """行稀疏更新器当前占用的 host 字节数（日志/文档用）."""
+        return sum(x.numel() * x.element_size() for x in self.state.values())
+
+    def state_dict(self) -> dict:
+        """存盘：按表序存累加器（权重顺序在 model.pt 里，不重复存键名）."""
+        return {
+            "lr": self.lr, "eps": self.eps,
+            "acc": [self.state.get(id(t.weight)) for t in self.tables],
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """恢复（表数不一致属预期错误：宿主表集合变了就该新开动量）."""
+        acc = state.get("acc", [])
+        if len(acc) != len(self.tables):
+            raise RuntimeError(
+                f"宿主表数量与存盘不一致（{len(self.tables)} vs {len(acc)}）："
+                "改了 engram 表结构请删掉 optim.pt 后重跑")
+        self.lr = float(state.get("lr", self.lr))
+        self.eps = float(state.get("eps", self.eps))
+        self.state = {}
+        for t, a in zip(self.tables, acc):
+            if a is not None:
+                self.state[id(t.weight)] = a.to(torch.float32)
+
+
 class CombinedOptimizer:
     """Muon（2D 隐藏权重）+ AdamW（其余）的联合优化器.
 
@@ -250,15 +332,22 @@ class CombinedOptimizer:
         sinkhorn: bool = False,
         sinkhorn_lr_scale: float = 0.18,
         sinkhorn_steps: int = 11,
+        host_lr: float = 0.03,
     ):
         muon_params: list = []      # 普通 Muon（2D 隐藏权重）
         head_params: list = []      # head-wise Muon（Q/K 上投影，按头分块）
         sink_params: list = []      # Sinkhorn（embedding / lm_head / Engram 表）
         adam_params: list = []      # 其余（norm/bias/1D）
+        # 宿主表（Engram 表留 CPU）：走行稀疏 Adagrad，绝不进 Adam/Muon 组
+        # （进组会试图 materialize 全表梯度，正是要避免的东西）
+        host_tables = self._host_tables(model)
+        host_ids = {id(t.weight) for t in host_tables}
         # Q/K 上投影的名字（每头一段连续行）；论文：head-wise Muon for Q and K
         head_names = ("w_uq", "w_qr", "w_uk")
         for name, p in model.named_parameters():
             if not p.requires_grad:
+                continue
+            if id(p) in host_ids:
                 continue
             # token×特征大矩阵：token embedding / 预测头 / Engram 表
             # （Engram 表的参数名形如 `layers.N.engram.tables.K.weight`）
@@ -299,6 +388,8 @@ class CombinedOptimizer:
             adam_params, lr=adam_lr, betas=(0.9, 0.95), weight_decay=0.1,
             fused=is_cuda and torch.cuda.is_available(),
         )
+        self.host_opt = (SparseRowAdagrad(host_tables, lr=host_lr)
+                         if host_tables else None)
         # 直接引用内部组字典（lr 调度就地写，浅拷贝会断开关联）
         self.param_groups: list = []
         for g in self.muon.param_groups:
@@ -319,15 +410,26 @@ class CombinedOptimizer:
         self.group_sizes = {
             "muon": len(muon_params), "muon_head_wise": len(head_params),
             "sinkhorn": len(sink_params), "adam": len(adam_params),
+            "host": len(host_tables),
         }
 
+    @staticmethod
+    def _host_tables(model: torch.nn.Module) -> list:
+        """取出模型里所有宿主 Engram 表（`host=True` 的 EngramTable）."""
+        from src.llm.local.engram import EngramTable
+
+        return [m for m in model.modules()
+                if isinstance(m, EngramTable) and m.host]
+
     def zero_grad(self, set_to_none: bool = True) -> None:
-        """清零所有组梯度."""
+        """清零所有组梯度（宿主表的旁路队列一并丢弃）."""
         self.muon.zero_grad(set_to_none=set_to_none)
         if self.head_wise_muon is not None:
             self.head_wise_muon.zero_grad(set_to_none=set_to_none)
         if self.sinkhorn_opt is not None:
             self.sinkhorn_opt.zero_grad(set_to_none=set_to_none)
+        if self.host_opt is not None:
+            self.host_opt.zero_grad()
         self.adam.zero_grad(set_to_none=set_to_none)
 
     def step(self) -> None:
@@ -337,6 +439,8 @@ class CombinedOptimizer:
             self.head_wise_muon.step()
         if self.sinkhorn_opt is not None:
             self.sinkhorn_opt.step()
+        if self.host_opt is not None:
+            self.host_opt.step()
         self.adam.step()
 
     def state_dict(self) -> dict:
@@ -349,6 +453,9 @@ class CombinedOptimizer:
         if self.sinkhorn_opt is not None:
             out["sinkhorn"] = self.sinkhorn_opt.state_dict()
             out["kind"] = out["kind"].replace("+adamw", "+sinkhorn+adamw")
+        if self.host_opt is not None:
+            out["host"] = self.host_opt.state_dict()
+            out["kind"] = out["kind"].replace("+adamw", "+host+adamw")
         return out
 
     def load_state_dict(self, state: dict) -> None:
@@ -356,21 +463,28 @@ class CombinedOptimizer:
         kind = state.get("kind")
         want_sink = self.sinkhorn_opt is not None
         want_head = self.head_wise_muon is not None
+        want_host = self.host_opt is not None
         has_sink = "sinkhorn" in state
         has_head = "head_wise_muon" in state
+        has_host = "host" in state
         if kind not in ("muon+adamw", "muon+headwise+adamw",
-                        "muon+sinkhorn+adamw", "muon+headwise+sinkhorn+adamw"):
+                        "muon+sinkhorn+adamw", "muon+headwise+sinkhorn+adamw",
+                        "muon+host+adamw", "muon+headwise+host+adamw",
+                        "muon+sinkhorn+host+adamw",
+                        "muon+headwise+sinkhorn+host+adamw"):
             raise RuntimeError(
                 "该 optim.pt 不是 Muon 存盘，切换优化器请删掉 optim.pt 后重跑（权重不受影响）")
-        if want_sink != has_sink or want_head != has_head:
+        if want_sink != has_sink or want_head != has_head or want_host != has_host:
             raise RuntimeError(
-                "优化器分组与存盘不一致（head_wise/sinkhorn 开关变了）："
+                "优化器分组与存盘不一致（head_wise/sinkhorn/host 开关变了）："
                 "请删掉 optim.pt 后重跑（权重不受影响）")
         self.muon.load_state_dict(state["muon"])
         if has_head:
             self.head_wise_muon.load_state_dict(state["head_wise_muon"])
         if has_sink:
             self.sinkhorn_opt.load_state_dict(state["sinkhorn"])
+        if has_host:
+            self.host_opt.load_state_dict(state["host"])
         self.adam.load_state_dict(state["adam"])
 
 
@@ -383,13 +497,17 @@ def build_hybrid_optimizer(
     sinkhorn: bool = False,
     sinkhorn_lr_scale: float = 0.18,
     sinkhorn_steps: int = 11,
+    host_lr: float = 0.03,
 ) -> CombinedOptimizer:
-    """构建 Muon(+head-wise)+Sinkhorn+AdamW 联合优化器.
+    """构建 Muon(+head-wise)+Sinkhorn+AdamW+行稀疏Adagrad 联合优化器.
 
     `head_wise`：Q/K 上投影按头分块正交化（V4.1）；`sinkhorn`：embedding /
-    lm_head / Engram 表用动量 + Sinkhorn 平衡（V4.1，省 Adam 的状态）。
+    lm_head / Engram 表用动量 + Sinkhorn 平衡（V4.1，省 Adam 的状态）；
+    `host_lr`：宿主 Engram 表走**行稀疏 Adagrad**（Adagrad 口径的经验值，
+    与 Adam 的 lr 不可直接比，量级通常大 10~100 倍）。
     """
     return CombinedOptimizer(
         model, muon_lr=muon_lr, adam_lr=adam_lr, head_wise=head_wise,
         n_heads=n_heads, sinkhorn=sinkhorn,
-        sinkhorn_lr_scale=sinkhorn_lr_scale, sinkhorn_steps=sinkhorn_steps)
+        sinkhorn_lr_scale=sinkhorn_lr_scale, sinkhorn_steps=sinkhorn_steps,
+        host_lr=host_lr)

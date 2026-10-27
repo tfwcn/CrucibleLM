@@ -84,6 +84,7 @@ def build_block(config: SmallLLMConfig, layer_idx: int) -> HybridBlock:
         engram_d_mem=config.engram_d_mem,
         engram_table_size=config.engram_table_size,
         engram_fp8=bool(getattr(config, "engram_fp8", True)),
+        engram_host=bool(getattr(config, "engram_host", False)),
         vocab_size=config.vocab_size,
         csa_mode=csa_mode,
         compress_ratio=config.compress_ratio_of(layer_idx),
