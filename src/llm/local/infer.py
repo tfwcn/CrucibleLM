@@ -18,6 +18,12 @@ class SimpleTokenizer:
     保留 4 个特殊 token：<pad>=0, <bos>=1, <eos>=2, <unk>=3，
     其余按字符序映射到 4..vocab_size-1。
     扩词规则：只允许末尾追加，旧 id 永不移位（已训权重逐行兼容的前提）。
+
+    **追加式子词**（`docs/details/subword-vocab.md`）：`_chars` 存的是「表面串」，
+    既可以是单个字符，也可以是 `"the"` / `"\":"` 这样的多字符子词。存在多字符项时
+    `encode` 自动改用**最长匹配**；不存在时走原来的逐字符路径（逐位一致）。
+    检测靠 `_sync_meta()` 的长度指纹，所以外部直接改 `_chars` / `_ids` 的旧脚本
+    仍然正确：它们没有多字符项 → `_multi=False` → 老路径。
     """
 
     PAD, BOS, EOS, UNK = 0, 1, 2, 3
@@ -26,6 +32,26 @@ class SimpleTokenizer:
         self.vocab_size = vocab_size
         self._chars: list[str] = []
         self._ids: dict[str, int] = {}
+        # 多字符 token 缓存：`(len(_chars), len(_ids))` 变了就重建
+        # （脚本里 `tok._chars = json.load(...)` 后自动生效，无需再调任何方法）
+        self._meta_key: tuple[int, int] | None = None
+        self._max_len: int = 1
+        self._multi: bool = False
+
+    def _sync_meta(self) -> None:
+        """按长度指纹重建「是否含多字符 token / 最长几字符」."""
+        key = (len(self._chars), len(self._ids))
+        if key == self._meta_key:
+            return
+        self._meta_key = key
+        self._max_len = 1
+        self._multi = False
+        for s in self._chars:
+            n = len(s)
+            if n > 1:            # 空串/单字符不算；空串绝不能进匹配循环
+                self._multi = True
+                if n > self._max_len:
+                    self._max_len = n
 
     def fit(self, texts: list[str]) -> None:
         """从语料收集字符表（按频次排序，截断到 vocab 上限）."""
@@ -35,16 +61,39 @@ class SimpleTokenizer:
         budget = self.vocab_size - 4
         self._chars = [ch for ch, _ in cnt.most_common(budget)]
         self._ids = {ch: i + 4 for i, ch in enumerate(self._chars)}
+        self._meta_key = None
 
     def encode(self, text: str, add_bos: bool = True) -> list[int]:
-        """编码为 id 序列."""
-        ids = [self._ids.get(ch, self.UNK) for ch in text]
+        """编码为 id 序列（有多字符 token 时按最长匹配切）."""
+        self._sync_meta()
+        if self._multi:
+            ids: list[int] = []
+            i, n = 0, len(text)
+            max_len = self._max_len
+            while i < n:
+                take = 0
+                tid = -1
+                for length in range(min(max_len, n - i), 1, -1):
+                    hit = self._ids.get(text[i:i + length])
+                    if hit is not None:
+                        tid, take = hit, length
+                        break
+                if take == 0:
+                    # 退到单字符；不在表里则 UNK（与老行为一致）
+                    ids.append(self._ids.get(text[i], self.UNK))
+                    i += 1
+                else:
+                    ids.append(tid)
+                    i += take
+        else:
+            ids = [self._ids.get(ch, self.UNK) for ch in text]
         return [self.BOS] + ids if add_bos else ids
 
     def decode(self, ids: list[int]) -> str:
-        """解码为文本（跳过特殊 token）."""
+        """解码为文本（跳过特殊 token；多字符 token 直接拼表面串）."""
         inv = {i + 4: ch for i, ch in enumerate(self._chars)}
         return "".join(inv[i] for i in ids if i in inv)
+
 
 
 def extend_vocab_and_model(
@@ -53,8 +102,10 @@ def extend_vocab_and_model(
     new_chars: list[str],
     init_std: float = 0.02,
 ) -> tuple[int, bool]:
-    """追加字符并落位 embedding（旧 id 稳定，旧行原样保留）.
+    """追加表面串并落位 embedding（旧 id 稳定，旧行原样保留）.
 
+    `new_chars` 可以是单字符，也可以是 `"the"` / `"\\":"` 这样的多字符子词
+    （见 `docs/details/subword-vocab.md`）；分词器按 `_chars` 自动切到最长匹配。
     两条路：容量内（常见）复用空行并重初始化（旧 random 值经 decay 已漂移），
     形状全不变，优化器照常续；超限才扩行（tied 重绑），优化器需新开。
     返回 (新增数, 是否扩行）。

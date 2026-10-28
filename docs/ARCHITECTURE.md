@@ -172,8 +172,15 @@ $LLMPY scripts/train_local_llm.py --phase sft --preset base \
 $LLMPY scripts/train_local_llm.py --phase pretrain --preset base \
     --seq-len 2048 --batch 4 --accum 8 --grad-ckpt \
     --resume --vocab data/llm-ckpt/vocab.json \
-    --ckpt-dir data/llm-ckpt --max-steps 20000
+    --holdout-file data/holdout-pretrain.json \
+    --ckpt-dir data/llm-ckpt --max-steps 10000
 ```
+
+> ⚠️ 想延长训练（改 `--max-steps`）不要直接复用同一个 `--ckpt-dir`：
+> cosine 会被重算，等于把走了一半的退火拉回高位。`--resume` 检测到
+> 配方变化会**直接中止**（pitfall 78）。真要在原地续，加 `--force-resume`
+> 并在文档里单独标注这段曲线；更推荐换新 `--ckpt-dir`、沿用同一个
+> `--holdout-file` 起一轮新 run。
 
 产出：`model.pt`（权重）+ `optim.pt` + `latest.json`（step/tokens）+
 `vocab.json`（分词表）+ `train.log`（JSONL 训练曲线），可直接
@@ -358,6 +365,23 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   日志记 `replay`（本步是否命中）与 `replay_size`。
 - **巩固期**（`--consolidate-steps N --consolidate-replay 0.4`）：新分布开头 N 步
   回放加码 + lr 钳制在起始值（warmup 不升），换分布/切 Ultra 时开。
+- **续训配方守卫**（`--force-resume`）：`--resume` 时比对上次 `hparams.json` 的
+  `CRITICAL_KEYS`（max_steps/lr/warmup/seq_len/batch/accum/data/local_path/
+  pretrain_mix/sft_mix/phase/vocab/subword_vocab），不一致**直接中止**（退出码 2）并
+  给出三种修法；`optim.pt` 缺失/不兼容同样算不一致（`load_ckpt` 写
+  `meta["optim_loaded"]`）。旧 ckpt 缺字段则跳过该项，不误报。**默认拦**，
+  确需原地改配方才加 `--force-resume`。见 `src/llm/local/resume.py`、pitfall 78。
+- **固定评测集**（`--holdout-file data/holdout-<阶段>.json`）：首次运行把当前
+  holdout 落盘（带 `phase` 标记：pretrain 存 `str`、sft 存 `(prompt,response)` 对），
+  之后一律复用 → 跨 run 的 `val_loss` 可比。训练流的跳过逻辑不变（仍跳当前语料流
+  的前 N 篇）。**默认关**（空=每次按语料头现切，换语料即不可比，见 pitfall 79）。
+- **追加式子词表**（`--subword-vocab data/subwords-sft-tool.json`）：`build_subwords.py`
+  挖出的高频子词**追加到词表末尾**，旧 id 不移位 → 旧权重可直接续训；`encode` 自动切
+  最长匹配。实测（2000 子词 / `nmax=5` / 掺 12% 工具样例）：工具 schema 2.21x、
+  `tool_calls` 2.06x、结果信封 3.67x、合计 **2.20x**，`embed` 行数不变
+  （`resized=False`，优化器照常续）。**默认关**（空=纯字符级，行为逐位不变）；
+  开启会改 token 切法，必须配 `--force-resume`。见 `docs/details/subword-vocab.md`、
+  pitfall 80。
 三者默认全关，500 步 A/B（同数据同种子，eval 低 ≥0.1 且 aux 不飘）赢了再开。
 
 ## 容量利用率：零休眠结论（`scripts/scan_dormancy.py`）

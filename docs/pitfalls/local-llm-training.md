@@ -1389,3 +1389,72 @@ if mode == "num" and cur in _NUM_ACCEPT:
 - 基准文件必须**真写数据**（写 1 MiB 随机块循环），别用 `truncate`/稀疏文件；
 - 冷热对比用 `posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)` 只丢**本文件**的页缓存，
   不要动全局 `drop_caches`（会干扰同机其他进程）。
+
+## 78. 重启时静默改 `max_steps`/`lr`/语料，会伪造出「模型退化」
+
+**现象**：`data/llm-ckpt/train.log` 里 val_loss 从 4.182（step 3200）一步跳到
+4.650（step 3400），之后再没回到 4.6 以下；5400 步又从 4.599 跳到 7.198。
+看曲线像"训崩了"，但模型权重其实没坏。
+
+**机制**（三个独立陷阱，叠在同一份日志里）：
+
+1. **cosine 曲线被重算**：`lr_schedule(step, max_steps, ...)` 用**当前** `max_steps`
+   算进度。step 3210 那次重启把 `max_steps` 从 10000 改成 14000，
+   lr 从 2.39e-4 抬到 2.67e-4，**而且此后不再沿原计划衰减**——等于把走了一半的
+   退火拉回高位重走。
+2. **动量丢失被降级成警告**：`load_ckpt` 遇到不兼容的 `optim.pt` 只打印一行
+   "动量新开"，然后照常跑。Adam 一阶/二阶矩归零后，lr=2.67e-4 的更新等效退化成
+   sign-SGD 大步长，一步就能把 loss 从 3.92 打到 6.03（日志 step 3210 实测）。
+3. **换语料 = 换考卷**：`collect_holdout` 的评测集是"当前混合流的前 256 篇"，
+   `--local-path` 一改 holdout 就换人。step 5310 把 `data/hq-zh` 换成
+   `data/hq-zh:3,data/ultra-zh:1`，val_loss 的 7.198 与新考卷配套，
+   和之前的 4.599 **根本不可比**；后面 4600 步降到 5.01 的"进步"同理。
+
+**做法**：
+- `src/llm/local/resume.py` 在 `--resume` 时比对上次 `hparams.json` 的
+  `CRITICAL_KEYS`（max_steps/lr/warmup/seq_len/batch/accum/data/local_path/
+  pretrain_mix/sft_mix/phase/vocab/subword_vocab），不一致直接 `SystemExit(2)`；
+- `load_ckpt` 把优化器是否真的载入写进 `meta["optim_loaded"]`，没载入也算不一致；
+- 确实要改配方：加 `--force-resume`，并在日志/文档里把这段曲线**单独标注**；
+  更推荐用新的 `--ckpt-dir` 起一轮新 run（曲线干净、可复现）。
+- 旧 ckpt 的 `hparams.json` 缺字段时**跳过该项**，不误报。
+
+## 79. holdout 跟着语料走，跨 run 的 `val_loss` 不可直比
+
+**现象**：换了数据配比之后 val_loss 突变 2.6 个点，或者两次 run 的 val 一个 4.18
+一个 5.01，拿去比较得出"模型退化了"的错误结论。
+
+**机制**：`collect_holdout` 对多目录混合取「混合流的前 `HOLDOUT_DOCS=256` 篇」，
+对单目录取「文件前 256 篇的一半」。评测集由**当前语料顺序**决定，语料一变就变。
+
+**做法**：
+- 用 `--holdout-file data/holdout-<阶段>.json`：首次运行把当前 holdout 落盘
+  （带 `phase` 标记，pretrain 存 `str`、sft 存 `(prompt, response)` 对），
+  之后的 run 一律复用 → val_loss 终于可比；
+- 训练流的跳过逻辑**没有改**：仍然跳过"当前语料流的前 N 篇"。只要保存的就是
+  首次那份（同源同顺序），评测文档不会漏进训练集；换语料后想要干净的可比性，
+  应该**新开一个 ckpt_dir 并沿用同一个 holdout 文件**（评测集固定，训练集变了，
+  这正是 mid-training 想测的东西）；
+- 不要指望旧 run 的曲线能和新 holdout 拼在一起——那只能重跑。
+
+## 80. 字符级分词器下，`nmax` 太小的子词挖掘等于白挖
+
+**现象**：跑 `build_subwords.py --nmax 4`，中文压缩比 1.45x 看着不错，
+但工具调用探针只从 535 降到 378（1.42x），`"arguments"`/`"toolbox"` 这种
+关键标识符一个都没进词表。
+
+**机制**：`nmax` 是「最多几个字符拼成一个 token」。`arguments` 有 9 个字符，
+`nmax=4` 时**物理上不可能**被选中，只能挖出 `argu`/`gume`/`nts"` 这种碎片
+（碎片反而抢走了本该给整词的位置）。而 `nmax` 调太大也有坑：统计时每
+`keep×3` 个候选就按频次剪枝，长 n-gram 频次天然低，会被高频短串挤出去——
+实测 `nmax=8` 反而比 `nmax=5` 更差（2.01x vs 2.20x）。
+
+**做法**：
+- 默认 `nmax=5`（实测甜点：覆盖 JSON 键名与英文词根）；
+- 要更长就同步放大 `--keep`（默认 400k），并接受统计时间线性上涨；
+- **挖掘语料决定投资方向**：只从中文百科挖，工具文本压不动。用
+  `--boost-file` 掺入工具调用样例（`--boost-frac 0.12` 实测足够），
+  且加权文本必须**插进流里**而不是追加在末尾——`--total-chars` 到了就截断，
+  追加在末尾的加权文本一行都统计不到（第一版就是这个 bug）；
+- 子词表装满 `vocab_size-4` 后，`extend_vocab` 会扩行 → 优化器必须新开。
+  挖矿脚本先算余量，训练脚本在 `resized=True` 时明确警告。

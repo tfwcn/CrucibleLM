@@ -248,8 +248,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--warmup", type=int, default=50, help="warmup 步数")
     p.add_argument("--ckpt-dir", default="data/llm-ckpt", help=" checkpoint 目录")
     p.add_argument("--resume", action="store_true", help="从 ckpt-dir/latest 继续")
+    p.add_argument("--force-resume", action="store_true",
+                   help="续训时允许配方与上次不同（max_steps/lr/语料等；默认报错，"
+                        "因为会重算 LR 曲线、换掉 holdout，让曲线不可比）")
     p.add_argument("--eval-every", type=int, default=100, help="评测间隔（0=关闭）")
     p.add_argument("--eval-batches", type=int, default=10, help="每次评测批数")
+    p.add_argument("--holdout-file", default="",
+                   help="固定评测集 JSON（首次自动落盘、之后复用；空=每次按语料头现切，"
+                        "换语料后 val_loss 不可比）")
     p.add_argument("--sample-every", type=int, default=200, help="生成采样间隔（0=关闭）")
     p.add_argument("--save-every", type=int, default=100, help="存盘间隔")
     p.add_argument("--keep-last", type=int, default=20,
@@ -272,6 +278,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="HF 镜像源（默认读 HF_ENDPOINT 环境变量；"
                    "国内直连超时请传 https://hf-mirror.com，代码内生效不依赖 shell 传递）")
     p.add_argument("--vocab", default="", help="复用已有 vocab.json（默认拟合新表）")
+    p.add_argument("--subword-vocab", default="",
+                   help="追加式子词表 JSON（scripts/build_subwords.py 产物）。只往词表"
+                        "末尾追加，旧 id 不移位 → 旧权重可直接续；空=纯字符级（默认，"
+                        "行为与旧版逐位一致）")
     p.add_argument("--sft-init", default="", help="SFT 起始权重（model.pt，默认随机初始化）")
     p.add_argument("--init-checkpoint", default="",
                    help="迁移/换架构后的起始权重（model.pt，按行续接；与 --resume 同用时只取 step 计数，权重与动量都从此处新开）")
@@ -430,6 +440,30 @@ def load_tokenizer(args: argparse.Namespace, config: SmallLLMConfig,
 
 
 def collect_holdout(args: argparse.Namespace, data_cursor: int = 0) -> tuple[list, object]:
+    """收集评测文档并返回 (评测文本, 训练文本流）.
+
+    `--holdout-file` 非空时走固定评测集：首次运行把当前 holdout 落盘，
+    之后的 run 一律复用（跨 run 的 val_loss 才可比）。详见
+    `src/llm/local/holdout.py` 的模块说明。
+    """
+    holdout, stream = _collect_holdout_impl(args, data_cursor)
+    path = getattr(args, "holdout_file", "") or ""
+    if not path:
+        return holdout, stream
+    from src.llm.local.holdout import load_holdout, save_holdout
+
+    saved = load_holdout(path, args.phase)
+    if saved is not None:
+        print(f"固定评测集已复用：{path}（{len(saved)} 篇，"
+              f"跨 run 的 val_loss 可直比）", flush=True)
+        return saved, stream
+    save_holdout(path, holdout, args.phase)
+    print(f"固定评测集已落盘：{path}（{len(holdout)} 篇，后续 run 复用）",
+          flush=True)
+    return holdout, stream
+
+
+def _collect_holdout_impl(args: argparse.Namespace, data_cursor: int = 0) -> tuple[list, object]:
     """收集评测文档并返回 (评测文本, 训练文本流）.
 
     HF 流式：先取前 N 个文档做评测+分词拟合，训练流跳过它们；
@@ -726,10 +760,12 @@ def load_ckpt(ckpt_dir: Path, model: TinyLLM, optim=None,
         print(f"权重形状变化，按行续接旧权重：{e}", flush=True)
         load_weights_overlap(model, ckpt_dir / "model.pt", map_location)
     meta = json.loads((ckpt_dir / "latest.json").read_text(encoding="utf-8"))
+    meta["optim_loaded"] = False
     if optim is not None and (ckpt_dir / "optim.pt").exists():
         try:
             optim.load_state_dict(
                 torch.load(ckpt_dir / "optim.pt", map_location=map_location))
+            meta["optim_loaded"] = True
         except (RuntimeError, KeyError, ValueError) as e:
             print(f"警告：优化器状态不兼容（{e}），动量新开，权重照常恢复", flush=True)
     return meta
@@ -1136,6 +1172,30 @@ def main(argv=None) -> int:
                   flush=True)
         else:
             print("扩词：未发现缺字，词表不变", flush=True)
+    # 追加式子词（可选）：与扩词同样在优化器之前做；只往末尾追加，
+    # 旧 embedding 行原样保留（可续训，但新 token 的 embedding 是随机的，
+    # 需要一段重新适配期 —— 属 warm restart，不算无损）。见
+    # docs/details/subword-vocab.md。
+    subword_added = 0
+    if args.subword_vocab:
+        from src.llm.local.infer import extend_vocab_and_model
+
+        try:
+            items = json.loads(
+                Path(args.subword_vocab).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"--subword-vocab 读取失败：{e}") from e
+        if not isinstance(items, list) or not all(
+                isinstance(s, str) and s for s in items):
+            raise SystemExit("--subword-vocab 必须是「非空字符串列表」的 JSON")
+        subword_added, sub_resized = extend_vocab_and_model(tok, model, items)
+        tok._sync_meta()          # 刷新最长匹配长度（encode 首次调用前也要对）
+        print(f"子词表：追加 {subword_added} 个（词表 {len(tok._chars)} 项，"
+              f"{'超限扩行，动量新开' if sub_resized else '复用空行，优化器照常续'}），"
+              f"最长 {tok._max_len} 字符", flush=True)
+        if sub_resized:
+            print("警告：子词超出 embedding 容量，已扩行 —— 本轮优化器状态必须新开，"
+                  "请勿用 --resume 续旧动量", flush=True)
     if args.optimizer == "muon":
         from src.llm.local.optim import build_hybrid_optimizer
 
@@ -1169,9 +1229,11 @@ def main(argv=None) -> int:
         load_weights_overlap(model, args.init_checkpoint, map_location=device)
         print(f"迁移权重已加载：{args.init_checkpoint}", flush=True)
     if args.resume:
+        optim_ok = True
         if (ckpt_dir / "latest.json").exists() and not args.init_checkpoint:
             meta = load_ckpt(ckpt_dir, model, optim, map_location=device)
             start_step, tokens_seen = meta["step"], meta.get("tokens_seen", 0)
+            optim_ok = bool(meta.get("optim_loaded", False))
             print(f"已恢复：step={start_step}，tokens={tokens_seen}", flush=True)
         elif (ckpt_dir / "latest.json").exists():
             meta = json.loads((ckpt_dir / "latest.json").read_text(encoding="utf-8"))
@@ -1181,6 +1243,23 @@ def main(argv=None) -> int:
         else:
             # 防呆：无 checkpoint 时 --resume 等价于从零开始，明确告知避免误解
             print(f"警告：{ckpt_dir} 下无 latest.json，--resume 无效，将从零开始训练",
+                  flush=True)
+            optim_ok = True
+        # 配方一致性守卫：重启静默改 max_steps/lr/语料，是 train.log 里
+        # 「val 4.18→4.65」和「4.60→7.19」两处假退化的真凶（详见
+        # docs/pitfalls/local-llm-training.md 第 78 条与 src/llm/local/resume.py）。
+        # 必须在 dump_hparams 覆盖 hparams.json 之前读旧值。
+        from src.llm.local.resume import diff_resume, format_block, load_prev_hparams
+
+        prev_hp = load_prev_hparams(ckpt_dir)
+        diffs = diff_resume(prev_hp, args) if prev_hp else []
+        # --init-checkpoint 本来就要新开动量，不算异常
+        lost = start_step > 0 and not args.init_checkpoint and not optim_ok
+        if diffs or lost:
+            print(format_block(diffs, lost), flush=True)
+            if not args.force_resume:
+                raise SystemExit(2)
+            print("警告：--force-resume 已放行，本次曲线需单独标注、不与历史段合并",
                   flush=True)
     (ckpt_dir / "vocab.json").write_text(
         json.dumps(tok._chars, ensure_ascii=False), encoding="utf-8")
