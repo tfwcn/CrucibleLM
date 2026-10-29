@@ -389,6 +389,10 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   推理侧 `chat` 传 `tools` 才启用：注入目录 + 默认 `CALL_SCHEMA` 约束解码 + 候选校验
   （幻觉 path 当「没调用」），**不传 `tools` 行为逐位不变**。样本长度决定 `seq_len`
   下限：1 024 时丢 1.7%、**1 536 起零丢弃**（`pack_pairs` 对超长 prompt 静默跳过）。
+  配套 `--sft-epochs N`（默认 1）：主 SFT 流重复 N 遍，第 2 遍起同样跳过评测对
+  （防 val 泄漏）。`interleave_weighted` 是「一遍内按权重轮询、耗尽即移出」，
+  只调权重不调遍数等于没混（工具流一遍就没了）。实测一遍 2.43M token，
+  5 工具 : 1 中文 × 3 遍 ≈ 11M token / 680 步。
   见 `docs/details/tool-call-data.md`、pitfall 82。
 以上默认关的项（固定评测集 / 子词表 / 工具调用）先做 500 步 A/B（同数据同种子，
 eval 低 ≥0.1 且 aux 不飘）赢了再开。

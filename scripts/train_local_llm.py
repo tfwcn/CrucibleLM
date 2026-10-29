@@ -261,6 +261,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="只保留最近 N 个版本快照（<=0 全保留；每个约 1.3GB）")
     p.add_argument("--data", choices=["hf", "local"], default="hf", help="语料来源")
     p.add_argument("--local-path", default="", help="本地语料目录（--data local 时必填；多目录混合逗号分隔，可带权重如 a:3,b:1）")
+    p.add_argument("--sft-epochs", type=int, default=1,
+                   help="本地 SFT 语料重复遍数（默认 1；工具调用这类几千条的小语料"
+                        "需要 2~4 遍，第 2 遍起自动跳过评测对防泄漏）")
     p.add_argument("--pretrain-mix", default="hq:1",
                    help="HF 预训练混合配比，如 hq:1,ultrafineweb:2（可选 hq/fineweb2/ultrafineweb）")
     p.add_argument("--pretrain-min-score", type=float, default=0.0,
@@ -483,8 +486,10 @@ def _collect_holdout_impl(args: argparse.Namespace, data_cursor: int = 0) -> tup
         from src.llm.local.data import parse_local_mix as _plm2
 
         sdirs = _plm2(args.local_path)
+        epochs = max(1, int(getattr(args, "sft_epochs", 1) or 1))
 
-        def _local_pairs():
+        def _pairs_once():
+            """跑一遍语料（多目录按权重轮询）."""
             if len(sdirs) == 1:
                 yield from _pairs_of(sdirs[0][0])
                 return
@@ -492,6 +497,21 @@ def _collect_holdout_impl(args: argparse.Namespace, data_cursor: int = 0) -> tup
 
             yield from _ilw2([_pairs_of(p) for p, _ in sdirs],
                              [w for _, w in sdirs])
+
+        def _local_pairs():
+            """`--sft-epochs N` 跑 N 遍；第 2 遍起同样跳过评测对（防 val 泄漏）.
+
+            工具调用这类只有几千条的小语料，一遍远远不够学（3.6M token）；
+            而混训时若只靠权重，主流一遍就耗尽、之后全是被稀释的语料
+            （见 docs/details/tool-call-data.md）。循环遍数把「学几遍」和
+            「混多少」解耦：`--sft-epochs 3 --local-path tool:9,zh:1`。
+            """
+            yield from _pairs_once()  # 第 1 遍：上游负责 take(holdout) + 跳过 cursor
+            for _ in range(epochs - 1):
+                it = _pairs_once()
+                # 每一遍都跳掉同一批评测对，否则第二遍 val 就见过了
+                _skip(it, len(pairs))
+                yield from it
 
         sft_pairs = _local_pairs()
         pairs = list(_take(sft_pairs, HOLDOUT_DOCS))

@@ -1526,3 +1526,31 @@ if len(p_ids) + len(o_ids) + 1 > target:      # target = seq_len + 1
 - `step=0` + 「数据流耗尽」是这类问题的固定信号，先怀疑 `seq_len` 再怀疑路径；
 - 需要「样本超长就报警」时，在 `pack_pairs` 的 `continue` 前加计数并在训练日志里
   打一行 `drop_long=N`（当前未实现，靠上表人工核对）。
+
+## 83. 小语料只调权重没用：`interleave_weighted` 是「一遍内轮询」
+
+**现象**：工具 SFT 只有 6 021 条，担心被 38 万条中文语料淹没，于是写
+`--local-path data/sft-tool:50,data/sft-zh:1`——以为整体配比是 50:1。
+结果训练跑了几百步后工具 loss 不再下降，采样也调不出工具了。
+
+**机制**：`interleave_weighted` 是**一遍流**的轮询：
+
+```python
+pattern = [0]*50 + [1]        # 展开一轮模式
+while any(alive):
+    idx = pattern[pos % len(pattern)]
+    ...
+    except StopIteration: alive[idx] = False   # 耗尽 → 移出轮转
+```
+
+工具流 6 021 条耗尽后 `alive[0]=False`，轮转里只剩 zh，`while any(alive)`
+继续跑——**后半程全是中文语料**，"50:1" 只在开头那 6 021 条里成立。
+这也解释了「前几百步工具 loss 降、后面回升」的曲线。
+
+**做法**：
+- 用 `--sft-epochs N`（`scripts/train_local_llm.py`）把主 SFT 流跑 N 遍：
+  每一遍重新开流、且**都跳过评测对**（第 2 遍若不跳，val 就见过答案了）；
+- 配比 = 权重（一遍内）× 遍数（语料量），两者都要看：
+  `--local-path tool:5,zh:1 --sft-epochs 3` = 工具 66% token、共 11M；
+- 数据量级差两个数量级时，**先跑纯小语料组**当对照，量清楚「到底遗忘了多少」
+  再决定要不要混——混训本身也要烧一半算力。

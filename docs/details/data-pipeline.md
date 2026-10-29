@@ -32,6 +32,9 @@
 - **多目录混合**：`--local-path "a:3,b:1"` 按权重轮询；SFT 掺 pretrain 回放
   是 batch 级混（`interleave_batches`，主流耗尽即停，回放不计 cursor）——
   混 block 会脏 batch（PackedBatcher 按首元素定形状），这是血泪分界线；
+- **多遍**：`--sft-epochs N` 把主 SFT 流跑 N 遍（第 2 遍起跳评测对）。
+  加权轮询只在**一遍内**生效、耗尽即移出，小语料只调权重会在一遍后变成
+  纯大语料（见 pitfall 83）；
 - **断点续流**：`data_cursor` 精确到文档（多目录各记各的消费数），
   存盘扣 `RESUME_SLACK_DOCS=1024` 在途余量（宁可少量重见、不丢数据）。
 

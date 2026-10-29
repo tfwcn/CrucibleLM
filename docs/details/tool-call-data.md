@@ -139,11 +139,37 @@ to_openai_tool_calls()  内部形态 → OpenAI tool_calls
 - **格式由约束保证，内容只能靠 SFT**：未 SFT 的 `data/llm-sft7` 在 `CALL_SCHEMA`
   约束下输出的是 `{"path":"","arguments":{"arguments":"",",":",",…` 这种垃圾循环
   （合法 JSON、无意义内容）。所以「加约束」不等于「会调工具」，两者都要做。
-- **混训配比是下一个坑**：`data/sft-zh` 38 万行、`data/sft-belle` 42 万行，工具数据
-  只有 6 021 行。按 1:1 轮询工具只占 0.8%，等于没学。要么高权重
-  （`--local-path data/sft-tool:50,data/sft-zh:1`，注意 `interleave_weighted`
-  是「权重展开一轮 + 耗尽的源移出轮转」，工具侧先耗尽就结束），要么分阶段
-  （先纯工具 SFT 再混训防遗忘）。**尚未定论，先按分阶段跑**。
+- **混训配比（`--sft-epochs` + 权重）**：`data/sft-zh` 38 万行、`data/sft-belle`
+  42 万行，工具数据只有 6 021 行。按 1:1 轮询工具只占 0.8%，等于没学。
+
+  注意 `interleave_weighted` 的语义是「**一遍**流按权重轮询，耗尽的源移出」：
+  工具流 6 021 条一轮就没了，之后全是被稀释的语料——所以**光调权重没用**，
+  必须配合遍数：
+
+  ```
+  --local-path data/sft-tool:5,data/sft-zh:1 --sft-epochs 3
+  ```
+
+  一遍的长度由「工具流耗尽」决定：工具 6 021 条 + zh 约 1 204 条。3 遍 =
+  工具 3×2.43M + zh 3×1.27M ≈ **11.1M token**（子词表口径），
+  `batch 4 × seq 2048 × accum 2` ≈ **680 步**、约 25 分钟。
+
+  推荐起始配方（先跑这个，再动别的）：
+
+  | 项 | 值 | 理由 |
+  |---|---|---|
+  | `--sft-init` | `data/llm-sft7/best/model.pt` | 已有中文对话能力，别从零学格式 |
+  | `--subword-vocab` | `data/subwords-sft-tool.json` | 工具文本 2.20x 压缩，等价上下文翻倍 |
+  | `--local-path` | `data/sft-tool:5,data/sft-zh:1` | 工具占 66% token，zh 3.8M 做防遗忘 |
+  | `--sft-epochs` | 3 | 2.43M × 3 ≈ 7.3M 工具 token |
+  | `--seq-len` | 2048 | 1 536 起零丢弃，2048 留余量 |
+  | `--batch/--accum` | 4 / 2 | 16.4k token/步，约 680 步（步数太少学不动新行为） |
+  | `--lr` | 5e-5（`--warmup 30`） | 比 sft7 的 1e-5 高：要学**新行为**，不是微调风格 |
+  | `--holdout-file` | `data/holdout-sft-tool.json` | 固定评测集，跨 run 才能比 |
+
+  对照组：`--local-path data/sft-tool --sft-epochs 3`（纯工具，7.3M token），
+  用来量「混 zh 到底救回了多少对话能力」——**先跑纯工具组**，如果中文对话
+  明显退化，再上 5:1；不退化就别浪费算力。
 - 真实轨迹只有 9 条可用，是**数据本身的限制**（11 条 user 消息），不是抽取 bug。
   提高真实占比只能靠后续积累会话，不要重复采样假装多样性。
 - 子词表必须用工具样本来挖：`--boost-file` 掺 12% 工具文本才有 2.20x，

@@ -43,6 +43,8 @@ CRITICAL_KEYS: tuple[str, ...] = (
     "accum",
     "data",
     "local_path",
+    # 语料重复遍数改了 = 同一批样本见到的次数变了，曲线不可比
+    "sft_epochs",
     "pretrain_mix",
     "sft_mix",
     # 分词器换了 = 同一段文本切出不同 id 序列，等价换语言；必须显式放行

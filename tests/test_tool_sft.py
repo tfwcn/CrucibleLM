@@ -388,3 +388,64 @@ def test_fill_args_come_from_request_context(tmp_path):
         if isinstance(path, str) and path and path in user:
             checked += 1
     assert checked > 30, f"能校验的样本太少（{checked}），随机化可能出了问题"
+
+
+# ---------------------------------------------------------------- 多轮 SFT
+def _write_dialogs(root: Path, n: int) -> None:
+    """写 n 条最简对话（user/assistant），供多轮遍数测试用."""
+    root.mkdir(parents=True, exist_ok=True)
+    rows = [{"messages": [
+        {"role": "user", "content": f"第{i}个问题"},
+        {"role": "assistant", "content": f"第{i}个回答"},
+    ]} for i in range(n)]
+    text = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows)
+    (root / "a.jsonl").write_text(text + "\n", encoding="utf-8")
+
+
+def test_sft_epochs_repeat_and_skip_holdout(tmp_path):
+    """`--sft-epochs` 跑 N 遍，且第 2 遍起仍跳过评测对（否则 val 见过答案）.
+
+    holdout 是流的前 `HOLDOUT_DOCS=256` 条。只跑一遍时训练流只剩 300-256=44 条；
+    跑两遍应得 88 条，且第二遍里**不能**出现评测对（prompt 与 holdout 不重叠）。
+    """
+    from types import SimpleNamespace
+
+    from train_local_llm import _collect_holdout_impl
+
+    root = tmp_path / "dialogs"
+    _write_dialogs(root, 300)
+
+    def run(epochs: int):
+        args = SimpleNamespace(data="local", phase="sft",
+                              local_path=str(root), sft_epochs=epochs)
+        return _collect_holdout_impl(args)
+
+    holdout1, stream1 = run(1)
+    pairs1 = list(stream1)
+    assert len(holdout1) == 256
+    assert len(pairs1) == 300 - 256
+
+    holdout2, stream2 = run(2)
+    pairs2 = list(stream2)
+    assert holdout1 == holdout2  # 评测集不随遍数变
+    assert len(pairs2) == 2 * (300 - 256)
+
+    # 第二遍的内容与第一遍相同（同一批样本再学一遍）
+    assert pairs2[:len(pairs1)] == pairs1
+    assert pairs2[len(pairs1):] == pairs1
+    # 评测对的 prompt 一条都不许出现在训练流里
+    held = {p for p, _ in holdout1}
+    assert all(p not in held for p, _ in pairs2)
+
+
+def test_sft_epochs_default_is_one(tmp_path):
+    """不传 `--sft-epochs` 时行为与旧版一致（只跑一遍）."""
+    from types import SimpleNamespace
+
+    from train_local_llm import _collect_holdout_impl
+
+    root = tmp_path / "dialogs"
+    _write_dialogs(root, 300)
+    args = SimpleNamespace(data="local", phase="sft", local_path=str(root))
+    holdout, stream = _collect_holdout_impl(args)
+    assert len(list(stream)) == 300 - len(holdout)
