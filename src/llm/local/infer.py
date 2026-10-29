@@ -240,6 +240,86 @@ class LocalChatBackend:
         """提前校验 `response_format`（服务端在写 SSE 头之前调，好回 400）."""
         self._make_constraint(response_format)
 
+    def _inject_tools(self, messages: list[dict], tools: list[dict],
+                      target: str = "") -> list[dict]:
+        """把工具声明渲染成系统提示，替换（或插入）system 消息.
+
+        渲染走 `toolcall.render_system` —— 与 `scripts/synth_tool_sft.py`
+        造数据时**同一份实现**，保证训练/推理逐字节一致（这是工具调用最容易
+        静默坏掉的地方，详见 `src/llm/local/toolcall.py` 模块说明）。
+
+        原 system 内容直接当 `persona` 槽用：训练数据的 system 段就是这个形状
+        （persona + 目录 + 规则），所以用户自定义的开场白能自然融进去；
+        没传 system 时用 `DEFAULT_PERSONA`。
+        """
+        from src.llm.local.toolcall import (
+            DEFAULT_PERSONA,
+            normalize_tools,
+            render_catalog,
+            render_params,
+            render_system,
+        )
+
+        normalized = normalize_tools(tools)
+        idx = next((i for i, m in enumerate(messages)
+                    if (m.get("role") or "") == "system"), None)
+        persona = ((messages[idx].get("content") if idx is not None else "")
+                   or DEFAULT_PERSONA).strip()
+        params = ""
+        if target:
+            hit = next((t for t in normalized if t["path"] == target), None)
+            if hit is not None:
+                params = render_params(hit)
+        text = render_system(persona, render_catalog(normalized, exclude=target),
+                            params)
+        out = [dict(m) for m in messages]
+        if idx is None:
+            out.insert(0, {"role": "system", "content": text})
+        else:
+            out[idx] = {"role": "system", "content": text}
+        return out
+
+    def _tool_response_format(self, tools: list[dict], target: str,
+                              response_format: object) -> object:
+        """工具调用默认走约束解码（只保证「两个字段的 JSON」，path 合法性后判）."""
+        if not tools or response_format is not None:
+            return response_format
+        from src.llm.local.toolcall import CALL_SCHEMA
+
+        return {"type": "json_schema",
+                "json_schema": {"name": "tool_call", "schema": CALL_SCHEMA}}
+
+    def _parse_tool_output(self, text: str, tools: list[dict]) -> dict | None:
+        """解析模型输出；路径不在候选里时当作没调用（返回 None）.
+
+        候选校验必须在这里做：模型完全可能拼出一个 schema 里不存在的路径，
+        那是幻觉，不能交给工具执行（真实运行时会直接报「工具不存在」）。
+
+        路径匹配按「精确 → 唯一末段名」两级：训练数据的 path 是
+        `分组/工具名`（如 `workspace/shell_exec`），而 OpenAI `tools` 声明里
+        只有 `name`（`shell_exec`）。返回的 path 统一用**调用方提供的那份**，
+        这样上层不用再做一次映射。
+        """
+        from src.llm.local.toolcall import normalize_tools, parse_tool_call
+
+        call = parse_tool_call(text)
+        if call is None or not call["path"]:
+            return None
+        normalized = normalize_tools(tools)
+        if not normalized:
+            return call
+        want = call["path"]
+        hit = next((t for t in normalized if t["path"] == want), None)
+        if hit is None:
+            # 末段名唯一时放行（`workspace/shell_exec` ↔ `shell_exec`）
+            tail = want.split("/")[-1]
+            same = [t for t in normalized if t["path"].split("/")[-1] == tail]
+            if len(same) == 1:
+                hit = same[0]
+        if hit is None:
+            return None
+        return {"path": hit["path"], "arguments": call["arguments"]}
+
     @torch.no_grad()
     def chat(
         self,
@@ -251,6 +331,8 @@ class LocalChatBackend:
         effort: object = None,
         response_format: object = None,
         seed: int | None = None,
+        tools: list[dict] | None = None,
+        tool_target: str = "",
     ) -> dict:
         """对话生成，返回 {"content","reasoning","tool_calls","finish_reason"}.
 
@@ -259,7 +341,21 @@ class LocalChatBackend:
         `{"type":"json_schema",...}`）；约束解码保证输出是合法 JSON，
         未在 max_new_tokens 内闭合时 `finish_reason="length"`。
         `seed`：确定性采样（同一 prompt + seed 逐位可复现，与 batch 组成无关）。
+
+        `tools`：工具声明（OpenAI `{"type":"function",...}` 或本仓库 schema
+        条目都行）。非空时把工具目录渲染进系统提示，默认加 `CALL_SCHEMA`
+        约束解码，输出解析成 OpenAI `tool_calls`：
+        - 模型给了非空 path 且在候选里 → `tool_calls` 有值、`content` 为空；
+        - path 为空（「都做不了」）或不在候选里（幻觉）→ `tool_calls=None`，
+          `content` 保留原文（前端能看出模型说了什么）；
+        - `arguments` 为空对象 → SELECT，调用方补 `tool_target` 再来一轮拿参数。
+        `tool_target`：非空时渲染 FILL 形态（把该工具的完整参数表附进提示），
+        用来实现「先选工具、再填参数」两步（见 `toolcall.py`）。
         """
+        if tools:
+            messages = self._inject_tools(messages, tools, tool_target)
+            response_format = self._tool_response_format(tools, tool_target,
+                                                         response_format)
         input_ids, _ = self._prepare_ids(messages, max_new_tokens, effort)
         constraint = self._make_constraint(response_format)
         gen = self.model.generate(
@@ -272,11 +368,20 @@ class LocalChatBackend:
         )
         new_ids = gen[0].tolist()[len(input_ids[0]):]
         done = constraint is None or bool(constraint.finished)
+        text = self.tokenizer.decode(new_ids)
+        tool_calls = None
+        if tools:
+            from src.llm.local.toolcall import to_openai_tool_calls
+
+            call = self._parse_tool_output(text, tools)
+            if call is not None:
+                tool_calls = to_openai_tool_calls(call["path"], call["arguments"])
         return {
-            "content": self.tokenizer.decode(new_ids),
+            "content": "" if tool_calls else text,
             "reasoning": None,
-            "tool_calls": None,
-            "finish_reason": "stop" if done else "length",
+            "tool_calls": tool_calls,
+            "finish_reason": "tool_calls" if tool_calls else (
+                "stop" if done else "length"),
         }
 
     def stream(
@@ -289,12 +394,21 @@ class LocalChatBackend:
         effort: object = None,
         response_format: object = None,
         seed: int | None = None,
+        tools: list[dict] | None = None,
+        tool_target: str = "",
     ):
         """流式生成，逐块 yield 文本（SSE 用；字符级分词保证增量解码精确）.
 
         `effort` 语义同 `chat`；`response_format` 同样生效（流式也走约束，
-        下游拿到的是逐字符的合法 JSON 前缀）；`seed` 语义同 `chat`。
+        下游拿到的是逐字符的合法 JSON 前缀）；`seed` 语义同 `chat`；
+        `tools`/`tool_target` 只做提示注入与约束（同 `chat`），但**不解析**
+        `tool_calls` —— 流式没法在吐字节的同时给出结构化结果，调用方攒完
+        全文用 `toolcall.parse_tool_call` 自己解析。
         """
+        if tools:
+            messages = self._inject_tools(messages, tools, tool_target)
+            response_format = self._tool_response_format(tools, tool_target,
+                                                         response_format)
         input_ids, _ = self._prepare_ids(messages, max_new_tokens, effort)
         constraint = self._make_constraint(response_format)
         inv = {i + 4: ch for i, ch in enumerate(self.tokenizer._chars)}

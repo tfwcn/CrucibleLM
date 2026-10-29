@@ -382,7 +382,16 @@ Muon 偏好大 batch，小 batch 下不如 AdamW 稳。
   （`resized=False`，优化器照常续）。**默认关**（空=纯字符级，行为逐位不变）；
   开启会改 token 切法，必须配 `--force-resume`。见 `docs/details/subword-vocab.md`、
   pitfall 80。
-三者默认全关，500 步 A/B（同数据同种子，eval 低 ≥0.1 且 aux 不飘）赢了再开。
+- **工具调用 SFT**（`scripts/synth_tool_sft.py` → `chat(tools=, tool_target=)`）：
+  合成「选工具（SELECT）/ 填参数（FILL）/ 都做不了（空 path）」三段样本，输出统一为
+  一行紧凑 JSON `{"path":"分组/工具","arguments":{...}}`。渲染与解析只有一份实现
+  （`src/llm/local/toolcall.py`），训练与推理共用（防止 prompt 漂移，pitfall 81）。
+  推理侧 `chat` 传 `tools` 才启用：注入目录 + 默认 `CALL_SCHEMA` 约束解码 + 候选校验
+  （幻觉 path 当「没调用」），**不传 `tools` 行为逐位不变**。样本长度决定 `seq_len`
+  下限：1 024 时丢 1.7%、**1 536 起零丢弃**（`pack_pairs` 对超长 prompt 静默跳过）。
+  见 `docs/details/tool-call-data.md`、pitfall 82。
+以上默认关的项（固定评测集 / 子词表 / 工具调用）先做 500 步 A/B（同数据同种子，
+eval 低 ≥0.1 且 aux 不飘）赢了再开。
 
 ## 容量利用率：零休眠结论（`scripts/scan_dormancy.py`）
 

@@ -1458,3 +1458,71 @@ if mode == "num" and cur in _NUM_ACCEPT:
   追加在末尾的加权文本一行都统计不到（第一版就是这个 bug）；
 - 子词表装满 `vocab_size-4` 后，`extend_vocab` 会扩行 → 优化器必须新开。
   挖矿脚本先算余量，训练脚本在 `resized=True` 时明确警告。
+
+## 81. SFT 模板少一个 `\n<助手>\n`：loss 照降，采样全歪
+
+**现象**：用 `messages` 形态的多轮数据做 SFT，训练 loss 正常下降、`val_loss` 比
+Belle 语料还低，但采样出来的回复前言不搭后语，或者模型开始自言自语
+（自己续写 `<用户>` / `<助手>` 轮次）。
+
+**机制**：SFT 有**两条并行的模板路径**，只要差一个字节就是分布漂移：
+
+| 路径 | 拼接方式 | 尾部 |
+|---|---|---|
+| 推理 `_prepare_ids` | `<系统>\n…\n<用户>\n…` + `"\n<助手>\n"` | 有 `\n<助手>\n` |
+| 训练 `SFT_PROMPT` | `<用户>\n{instruction}{input}\n<助手>\n` | 有 `\n<助手>\n` |
+| 训练 `convo_to_pairs` | `"\n".join(context)` | **原本没有** ← bug |
+
+`convo_to_pairs` 生成 prompt 时只拼了上下文，没补尾部标记。训练时模型学的是
+「用户内容结束，紧接着就写回复」；推理时输入多了一行 `<助手>`，模型没见过这种
+收尾，只能按最接近的续写继续——于是开始自己写下一轮。
+
+最要命的是**它不会报错**：数据合法、shape 正确、loss 曲线漂亮，只有线下采样能发现。
+
+**做法**：
+- `convo_to_pairs` 统一 `prompt + "\n<助手>\n"`（与 `SFT_PROMPT`、`_prepare_ids` 逐字节一致）；
+- **测试锁死**：`tests/test_tool_sft.py` 里有一条端到端断言，把同一段 messages 分别走
+  `iter_local_sft_pairs` 和 `_prepare_ids`，要求 prompt 完全相同（含多轮第 2 轮）；
+- 加新数据形态（`messages` / 工具调用 / 未来别的格式）时，先问一句：**它最终会变成
+  哪条模板？** 不要在渲染层各写一份。
+
+## 82. `seq_len` 比样本短，`pack_pairs` 静默丢样本
+
+**现象**：换了新数据（工具调用 SFT）跑训练，日志只有
+
+```
+本地 SFT 语料 data/sft-tool：评测 256 对
+分词器拟合完成（252 字符）
+数据流耗尽，提前结束
+训练结束：step=0
+```
+
+看起来像路径写错 / 数据没读到，但文件确实在那儿、评测对也读到了 256 条。
+
+**机制**：`pack_pairs` 对**单个样本**的处理是
+
+```python
+if len(p_ids) + len(o_ids) + 1 > target:      # target = seq_len + 1
+    keep = target - len(p_ids) - 2
+    if keep <= 0:                              # prompt 本身就装不下 → continue
+        continue                               # ← 没有任何日志
+    o_ids = o_ids[:keep] + [eos_id]            # 输出被截断（也不报）
+```
+
+工具调用样本的 prompt 中位数 515 字符、最长 1 332（字符级分词 ≈ token 数），
+`seq_len=256` 时**每一条**都 `keep <= 0`，于是全部丢弃、step 停在 0。
+
+实测丢弃比例（6 021 条工具 SFT）：
+
+| `seq_len` | 丢弃 | 输出截断 |
+|---|---|---|
+| 512 | 51.3% | 15.2% |
+| 1 024 | 1.7% | 1.5% |
+| 1 536 | 0% | 0% |
+
+**做法**：
+- 换数据集先量长度分布（`python -c` 读 jsonl 求中位/P90/max），再定 `seq_len`；
+  工具调用类数据用 **2 048**；
+- `step=0` + 「数据流耗尽」是这类问题的固定信号，先怀疑 `seq_len` 再怀疑路径；
+- 需要「样本超长就报警」时，在 `pack_pairs` 的 `continue` 前加计数并在训练日志里
+  打一行 `drop_long=N`（当前未实现，靠上表人工核对）。

@@ -51,6 +51,8 @@
 - [特殊 token 防注入：用户内容不许伪造轮次](./prompt-injection.md)
 - [推理加速：13→30.9 tok/s](./inference-acceleration.md)
 - [数据管线](./data-pipeline.md)
+- [追加式子词表：不动旧权重，把上下文翻一倍](./subword-vocab.md)
+- [工具调用数据：先选工具，再填参数](./tool-call-data.md)
 - [存盘与续跑](./checkpoint.md)
 
 ## 推理加速扩展（默认全关）

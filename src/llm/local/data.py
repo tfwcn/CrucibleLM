@@ -345,6 +345,10 @@ def convo_to_pairs(messages: list[dict]) -> list[tuple[str, str]]:
 
     system/user/tool/observation 进上下文（打中文 role 标签），空 content 跳过；
     prompt 为空的不出对（无条件续写不适合 SFT）。
+
+    assistant 消息若**没有文本但带 `tool_calls`**（真实轨迹里很常见：模型只发
+    调用、不解释），把 `function.arguments` 序列化成一行的 content 参与训练，
+    否则这一轮调用会被整轮丢掉。
     """
     role_tag = {"system": "系统", "user": "用户", "tool": "工具",
                 "observation": "观察", "assistant": "助手"}
@@ -357,16 +361,48 @@ def convo_to_pairs(messages: list[dict]) -> list[tuple[str, str]]:
         if not isinstance(content, str):
             content = "" if content is None else str(content)
         content = content.strip()
+        if not content and role == "assistant":
+            content = _tool_calls_to_text(m.get("tool_calls"))
         if not content:
             continue
         if role == "assistant":
             prompt = "\n".join(context)
             if prompt:
-                pairs.append((prompt, content))
+                # 尾部必须补 `<助手>\n`：推理端 `_prepare_ids` 就是这么收尾的
+                # （`SFT_PROMPT` 也带）。少了它，训练时模型学的是"紧接用户内容
+                # 写回复"，推理时却看到多一行标记，分布对不上——见 pitfall 81。
+                pairs.append((prompt + "\n<助手>\n", content))
             context.append(f"<助手>\n{content}")
         else:
             context.append(f"<{role_tag.get(role, role)}>\n{content}")
     return pairs
+
+
+def _tool_calls_to_text(calls: object) -> str:
+    """把 OpenAI 风格的 `tool_calls` 折成一行可训练的 JSON（无内容时用）.
+
+    只取第一个调用的 `function.arguments`：本项目一个 assistant 轮只发一个调用，
+    多调用本来就不支持；参数是 JSON 字符串时压缩成紧凑形式，坏 JSON 原样保留
+    （训练数据宁可粗糙，也不要静默丢样本）。
+    """
+    if not isinstance(calls, list) or not calls:
+        return ""
+    first = calls[0] if isinstance(calls[0], dict) else {}
+    fn = first.get("function") or {}
+    raw = fn.get("arguments")
+    if isinstance(raw, dict):
+        try:
+            return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return str(raw)
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return json.dumps(json.loads(text), ensure_ascii=False,
+                          separators=(",", ":"))
+    except (TypeError, ValueError):
+        return text
 
 
 def iter_hf_sft(
@@ -435,11 +471,8 @@ def iter_hf_sft_mix(
     yield from interleave_weighted(streams, weights)
 
 
-def iter_local_sft(root: str | Path) -> Iterator[tuple[str, str, str]]:
-    """遍历本地 Belle 格式 SFT 文件（.jsonl/.csv，instruction/input/output 列）.
-
-    无网回退 / 魔搭落盘用；字段缺失的行跳过。
-    """
+def iter_local_sft_objects(root: str | Path) -> Iterator[dict]:
+    """逐行读本地 SFT 文件成 dict（.jsonl/.csv 统一口径，坏行跳过）."""
     import csv as _csv
 
     root = Path(root)
@@ -452,10 +485,7 @@ def iter_local_sft(root: str | Path) -> Iterator[tuple[str, str, str]]:
         if path.suffix.lower() == ".csv":
             with open(path, encoding="utf-8", errors="ignore", newline="") as f:
                 for row in _csv.DictReader(f):
-                    instruction = (row.get("instruction") or "").strip()
-                    output = (row.get("output") or "").strip()
-                    if instruction and output:
-                        yield instruction, row.get("input") or "", output
+                    yield row
         else:
             with open(path, encoding="utf-8", errors="ignore") as f:
                 for line in f:
@@ -466,10 +496,44 @@ def iter_local_sft(root: str | Path) -> Iterator[tuple[str, str, str]]:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    instruction = (obj.get("instruction") or "").strip()
-                    output = (obj.get("output") or "").strip()
-                    if instruction and output:
-                        yield instruction, obj.get("input") or "", output
+                    if isinstance(obj, dict):
+                        yield obj
+
+
+def iter_local_sft(root: str | Path) -> Iterator[tuple[str, str, str]]:
+    """遍历本地 Belle 格式 SFT 文件（.jsonl/.csv，instruction/input/output 列）.
+
+    无网回退 / 魔搭落盘用；字段缺失的行跳过。
+    需要「已成型 prompt」的下游（含 messages 格式）请用 `iter_local_sft_pairs`。
+    """
+    for obj in iter_local_sft_objects(root):
+        instruction = (obj.get("instruction") or "").strip()
+        output = (obj.get("output") or "").strip()
+        if instruction and output:
+            yield instruction, obj.get("input") or "", output
+
+
+def iter_local_sft_pairs(root: str | Path) -> Iterator[tuple[str, str]]:
+    """本地 SFT → 已成型 (prompt, response) 对（模板与推理端严格一致）.
+
+    与 `iter_local_sft` 的差别：支持 `messages` 格式的 jsonl，走
+    `convo_to_pairs` 打 `<系统>/<用户>/<助手>/<工具>` 标签，**不套**
+    `SFT_PROMPT` —— 于是训练时的 prompt 与 `LocalChatBackend._prepare_ids`
+    拼出来的字符串逐字节相同。工具调用这类「系统提示里带工具目录」的数据
+    必须走这条路，否则系统提示会被塞进 `<用户>` 里，角色语义错位。
+
+    没有 `messages` 字段时退回 Belle 三字段并套 `SFT_PROMPT`（与旧行为一致）。
+    """
+    for obj in iter_local_sft_objects(root):
+        msgs = obj.get("messages")
+        if isinstance(msgs, list) and msgs:
+            yield from convo_to_pairs(msgs)
+            continue
+        instruction = (obj.get("instruction") or "").strip()
+        output = (obj.get("output") or "").strip()
+        if instruction and output:
+            yield (SFT_PROMPT.format(instruction=instruction,
+                                     input=obj.get("input") or ""), output)
 
 
 def iter_local_texts(root: str | Path) -> Iterator[str]:

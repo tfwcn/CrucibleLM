@@ -46,7 +46,6 @@ from src.llm.local.data import (
     iter_hf_pretrain_mix,
     iter_hf_sft,
     iter_hf_sft_mix,
-    iter_local_sft,
     iter_local_texts,
     pack_pairs,
     pack_pretrain,
@@ -477,24 +476,22 @@ def _collect_holdout_impl(args: argparse.Namespace, data_cursor: int = 0) -> tup
     from src.llm.local.data import skip_items as _skip
 
     if args.data == "local" and args.phase == "sft":
-        # 本地 SFT（Belle 格式 jsonl/csv，多目录逗号分隔，可带权重）；
-        # triple 在此套模板转对，与 HF 路径的 pairs 口径一致
-        from src.llm.local.data import SFT_PROMPT as _TPL
+        # 本地 SFT（Belle 三字段或 messages 格式，多目录逗号分隔，可带权重）；
+        # 统一走 iter_local_sft_pairs：messages 走 <系统>/<用户>/<助手> 标签，
+        # 与推理端 _prepare_ids 逐字节一致（工具调用数据必须这样，见 data.py）
+        from src.llm.local.data import iter_local_sft_pairs as _pairs_of
         from src.llm.local.data import parse_local_mix as _plm2
 
         sdirs = _plm2(args.local_path)
 
         def _local_pairs():
             if len(sdirs) == 1:
-                raw = iter_local_sft(sdirs[0][0])
-            else:
-                from src.llm.local.data import interleave_weighted as _ilw2
+                yield from _pairs_of(sdirs[0][0])
+                return
+            from src.llm.local.data import interleave_weighted as _ilw2
 
-                raw = _ilw2([iter_local_sft(p) for p, _ in sdirs],
-                            [w for _, w in sdirs])
-            for instruction, inp, output in raw:
-                yield (_TPL.format(instruction=instruction, input=inp or ""),
-                       output)
+            yield from _ilw2([_pairs_of(p) for p, _ in sdirs],
+                             [w for _, w in sdirs])
 
         sft_pairs = _local_pairs()
         pairs = list(_take(sft_pairs, HOLDOUT_DOCS))
@@ -568,14 +565,14 @@ def collect_diag_holdouts(args, per_dir: int = 64) -> dict[str, list]:
         return {}
     from pathlib import Path as _Path
 
-    from src.llm.local.data import SFT_PROMPT as _TPL
-    from src.llm.local.data import iter_local_sft, parse_local_mix as _plm3
+    from src.llm.local.data import iter_local_sft_pairs as _pairs_of
+    from src.llm.local.data import parse_local_mix as _plm3
 
     out: dict[str, list] = {}
     for path, _ in _plm3(args.local_path):
         pairs = []
-        for ins, inp, o in iter_local_sft(path):
-            pairs.append((_TPL.format(instruction=ins, input=inp or ""), o))
+        for prompt, response in _pairs_of(path):
+            pairs.append((prompt, response))
             if len(pairs) >= per_dir:
                 break
         if pairs:
@@ -604,12 +601,13 @@ def collect_missing(args, tok) -> list[str]:
 
     if args.phase == "sft":
         if args.data == "local":
+            from src.llm.local.data import iter_local_sft_pairs as _pairs_of
             from src.llm.local.data import parse_local_mix as _plm
 
             def local_sft_texts():
                 for p, _ in _plm(args.local_path):
-                    for instruction, inp, output in iter_local_sft(p):
-                        yield instruction + (inp or "") + output
+                    for prompt, response in _pairs_of(p):
+                        yield prompt + response
 
             feed(local_sft_texts(), args.extend_scan_docs)
         else:
